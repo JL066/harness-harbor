@@ -1,0 +1,52 @@
+# Python
+.venv/
+.venv-legacy/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Job runtime records — must never be committed
+.jobs/
+
+# Control-plane runtime state
+.control/
+
+# Logs
+*.log
+daemon-test.*
+
+# Test caches
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Diagnostic / one-off scripts (keep source files, not temp probes)
+_*.py
+_*_repro.py
+
+# Local configuration and secrets (commit examples only)
+.env
+.env.*
+!.env.example
+*.local.ps1
+
+# Additional runtime/editor/scratch artifacts
+*.log.*
+_*.ps1
+.idea/
+.vscode/
+*.tmp
+*.bak
+scratch/
