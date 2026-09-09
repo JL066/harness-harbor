@@ -1,4 +1,4 @@
-"""Tests for ChatGPT Harbor multi-harness worker pool daemon scheduler (codex_job_daemon.py)."""
+"""Tests for Harness Harbor multi-harness worker pool daemon (codex_job_daemon.py)."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""ChatGPT Harbor — a local agent control plane for ChatGPT."""
+"""Harness Harbor — a local harness control plane for upstream supervisors."""
 
 from __future__ import annotations
 
@@ -14,10 +14,16 @@ import tempfile
 import threading
 import time
 import uuid
+import copy
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
-from typing import Any, Iterator, Literal
+from typing import Any, Iterator, Literal, Mapping
+from urllib.parse import urlsplit
+
+from harness_process_adapter import default_process_activity_adapter
+from harness_telemetry import HarnessTelemetryProvider
+from runtime_queue import QueueRoot, queue_root_matches, resolve_queue_root
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -57,19 +63,101 @@ def _is_pid_alive(pid: int) -> bool:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-JOBS_DIR = PROJECT_ROOT / ".jobs"
+QUEUE_ROOT: QueueRoot = resolve_queue_root(PROJECT_ROOT)
+JOBS_DIR = QUEUE_ROOT.path
 CONTROL_DIR = PROJECT_ROOT / ".control"
 PROJECTS_FILE = CONTROL_DIR / "projects.json"
 BACKUPS_DIR = CONTROL_DIR / "backups"
 
 CODEX_EXE = Path(os.environ.get("HARBOR_CODEX_EXE") or shutil.which("codex") or ("codex.exe" if os.name == "nt" else "codex"))
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
+CODEX_ROUTES = frozenset({"current", "official", "custom", "official_then_custom"})
+CODEX_CUSTOM_BASE_URL_ENV = "HARBOR_CODEX_CUSTOM_BASE_URL"
+CODEX_CUSTOM_API_KEY_ENV = "HARBOR_CODEX_CUSTOM_API_KEY"
+CODEX_CUSTOM_MODEL_ENV = "HARBOR_CODEX_CUSTOM_MODEL"
+CODEX_CUSTOM_PROVIDER_ID = "harbor_custom"
+CODEX_CUSTOM_PROVIDER_NAME = "Harbor Custom"
+CODEX_CUSTOM_WIRE_API = "responses"
+CODEX_ROUTE_FAILURES = frozenset({"subscription_quota_exhausted"})
+_CODEX_SECRET_DIAGNOSTIC_PATTERNS = (
+    re.compile(r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth(?:entication)?[_-]?token|password|secret)\b\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}\b"),
+)
 MINIMAX_EXE = Path(os.environ.get("HARBOR_MINIMAX_EXE") or shutil.which("minimax") or ("minimax.exe" if os.name == "nt" else "minimax"))
 MINIMAX_CLI_EXE = Path(os.environ.get("HARBOR_MINIMAX_CLI_EXE") or shutil.which("mcode") or ("mcode.cmd" if os.name == "nt" else "mcode"))
 MINIMAX_CONFIG = Path(os.environ.get("HARBOR_MINIMAX_CONFIG") or Path.home() / ".minimax-code" / "config.json")
 AGY_EXE = Path(os.environ.get("HARBOR_AGY_EXE") or shutil.which("agy") or ("agy.exe" if os.name == "nt" else "agy"))
 AGY_DEFAULT_PRINT_TIMEOUT = "5m"
 AGY_EFFORTS = {"low", "medium", "high"}
+AGY_DANGEROUS_PERMISSIONS_ENV = "HARBOR_AGY_DANGEROUSLY_SKIP_PERMISSIONS"
+AGY_PROBE_CACHE_TTL_SECONDS = 15.0
+AGY_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+AGY_PROBE_BLOCKER_RE = re.compile(r"\b(?:error|fatal|unauthori[sz]ed|forbidden|sign\s*in|required|timed?\s*out|failed)\b", re.I)
+# Stderr is a diagnostic channel, so its model-row parser must be narrower
+# than the historical stdout parser.  A model id emitted by AGY has a
+# provider/model shape (for example ``gemini-3.8-flash-high`` or
+# ``openai/gpt-oss-120b-medium``); a bare diagnostic word must not become a
+# model merely because it happens to match AGY_MODEL_ID_RE.
+AGY_STDERR_MODEL_ID_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9]*(?:[-/][A-Za-z0-9][A-Za-z0-9._/-]*)+$"
+)
+AGY_MODELS_BLOCKER_RE = re.compile(
+    r"(?:"
+    r"(?:^|\n)\s*(?:\[\s*(?:error|fatal|exception)\s*\]|(?:error|fatal|exception)\b)|"
+    r"\b(?:please\s+(?:sign|log)\s*in|sign\s*in\s+(?:required|needed|to\b)|"
+    r"login\s+(?:required|needed|to\b)|not\s+(?:signed|logged)\s*in|"
+    r"unauthori[sz]ed|forbidden)\b|"
+    r"\b(?:auth(?:entication|orization)?|credential|token|api[_\s-]*key)s?\s+"
+    r"(?:failed|failure|error|required|invalid|missing|expired)\b|"
+    r"\b(?:failed|invalid|missing|expired)\s+"
+    r"(?:auth(?:entication|orization)?|credentials?|tokens?|api[_\s-]*keys?)\b|"
+    r"\b(?:failed|unable)\s+to\s+(?:connect|fetch|reach|resolve)\b|"
+    r"\bconnection\s+(?:failed|refused|reset|error|closed|timed?\s*out)\b|"
+    r"\b(?:network|proxy|dns)\s+(?:error|failure|unreachable|unavailable|timeout|timed?\s*out|failed)\b|"
+    r"\b(?:timed\s+out|timeout\s+(?:exceeded|error|occurred))\b|"
+    # Generic / library-level error diagnostics such as ``Unexpected error
+    # occurred`` or ``An error was thrown`` carry no recoverable signal
+    # about a valid model catalogue — they must fail closed regardless of
+    # any catalogue AGY may have emitted on stdout.
+    r"\b(?:unexpected|an?|internal|unknown|critical|fatal|generic|some)\s+"
+    r"error\s+(?:occurred|happened|was\s+thrown|has\s+occurred|encountered|raised)\b|"
+    r"\berror\s+(?:occurred|happened|was\s+thrown|has\s+occurred|encountered|raised)\b|"
+    # DNS / hostname resolution failures invalidate any catalogue emitted
+    # in the same probe, even when stdout already contains one.
+    r"\b(?:dns|host|hostname|server|domain(?:\s+name)?)\s+"
+    r"resolution\s+(?:failed|failure|error|timeout|timed?\s*out)\b"
+    r")",
+    re.IGNORECASE,
+)
+AGY_INFO_OR_BANNER_RE = re.compile(
+    r"^(?:"
+    r"fetching\s+available\s+models\.{0,3}|"
+    r"available\s+models:?|"
+    r"models?:?(?:\s+description)?|"
+    r"(?:id|name|model)\s+description|"
+    r"[-=*_\s]+|"
+    r"\[\s*(?:info|notice|debug|log|warn|warning|tip|hint)\s*\].*|"
+    r"(?:info|notice|debug|log|warn|warning|tip|hint|note)\s*[:\-].*|"
+    r"(?:total(?:\s+available)?\s+models?|count)\s*[:=]?\s*\d+.*|"
+    r"\d+\s+models?\s+(?:found|available).*|"
+    r"(?:using|loaded)\s+(?:config|profile|endpoint|credentials?).*|"
+    r"(?:checking|syncing|updating)\s+.*"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def agy_dangerous_permissions_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """Return whether AGY's dangerous permission bypass was explicitly enabled.
+
+    The public default is deliberately off. Unknown values are treated as off
+    so a typo cannot silently enable the bypass.
+    """
+    env = os.environ if environ is None else environ
+    return env.get(AGY_DANGEROUS_PERMISSIONS_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
 
 SANDBOXES = {"read-only", "workspace-write"}
 MAX_TEXT_BYTES = 200_000
@@ -106,6 +194,145 @@ BINARY_EXTENSIONS = {
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def codex_custom_route_config(
+    environ: Mapping[str, str] | None = None,
+    *,
+    include_secret: bool = False,
+) -> dict[str, str]:
+    """Return the validated, generic process-local custom provider settings."""
+    env = os.environ if environ is None else environ
+    base_url = env.get(CODEX_CUSTOM_BASE_URL_ENV, "").strip()
+    api_key = env.get(CODEX_CUSTOM_API_KEY_ENV, "").strip()
+    if not base_url or not api_key:
+        raise ValueError(
+            "custom route requires HARBOR_CODEX_CUSTOM_BASE_URL and "
+            "HARBOR_CODEX_CUSTOM_API_KEY"
+        )
+    if any(ord(char) < 0x20 or char.isspace() for char in base_url) or any(
+        ord(char) < 0x20 for char in api_key
+    ):
+        raise ValueError("custom route configuration contains invalid control characters")
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("HARBOR_CODEX_CUSTOM_BASE_URL must be an http(s) URL without credentials or query data")
+    config = {
+        "provider_id": CODEX_CUSTOM_PROVIDER_ID,
+        "provider_name": CODEX_CUSTOM_PROVIDER_NAME,
+        "base_url": base_url,
+        "wire_api": CODEX_CUSTOM_WIRE_API,
+        "env_key": CODEX_CUSTOM_API_KEY_ENV,
+    }
+    default_model = env.get(CODEX_CUSTOM_MODEL_ENV, "").strip()
+    if default_model:
+        config["default_model"] = default_model
+    if include_secret:
+        config["api_key"] = api_key
+    return config
+
+
+def codex_route_attempts(route: str) -> list[str]:
+    """Return the ordered route attempts for a validated request."""
+    if route == "official_then_custom":
+        return ["official", "custom"]
+    if route in CODEX_ROUTES:
+        return [route]
+    raise ValueError(f"unsupported Codex route: {route}")
+
+
+def validate_codex_route(route: str) -> list[str]:
+    """Validate route names and all configuration needed by their attempts."""
+    routes = codex_route_attempts(route)
+    for attempt_route in routes:
+        if attempt_route == "custom":
+            codex_custom_route_config()
+    return routes
+
+
+def is_official_quota_exhausted(text: str) -> bool:
+    """Recognize only explicit OpenAI/Codex subscription usage exhaustion."""
+    lower = (text or "").lower()
+    if not lower or re.search(r"\b429\b|rate[- ]limit|too\s+many\s+requests|retry[- ]after", lower):
+        return False
+    if not re.search(r"\b(?:openai|codex)\b", lower):
+        return False
+    exhaustion = (
+        r"\b(?:subscription\s+)?(?:quota|usage(?:\s+limit)?|plan\s+limit|subscription\s+limit)\b"
+        r"[^\n]{0,80}\b(?:exhausted|exceeded|reached|depleted|used\s+up)\b"
+        r"|\b(?:exhausted|exceeded|depleted|used\s+up)\b[^\n]{0,80}"
+        r"\b(?:quota|usage(?:\s+limit)?|plan\s+limit|subscription\s+limit)\b"
+    )
+    return bool(re.search(exhaustion, lower))
+
+
+def classify_codex_route_failure(result: subprocess.CompletedProcess) -> str | None:
+    """Classify only failures safe for the v0.1 official-to-custom fallback."""
+    if result.returncode == 0:
+        return None
+    text = "\n".join(
+        value for value in (result.stdout, result.stderr) if isinstance(value, str)
+    )
+    return "subscription_quota_exhausted" if is_official_quota_exhausted(text) else None
+
+
+def sanitize_codex_diagnostic(
+    value: object,
+    limit: int = 4000,
+    *,
+    redact_values: tuple[str, ...] = (),
+) -> str:
+    """Bound Codex diagnostics and redact common credential-shaped values."""
+    text = value[-limit:].strip() if isinstance(value, str) else ""
+    for index, sensitive_value in enumerate(redact_values):
+        if sensitive_value:
+            replacement = "[REDACTED_BASE_URL]" if index == 0 else "[REDACTED]"
+            text = text.replace(sensitive_value, replacement)
+    for pattern in _CODEX_SECRET_DIAGNOSTIC_PATTERNS:
+        text = pattern.sub(
+            lambda match: (
+                f"{match.group(1)}[REDACTED]"
+                if match.lastindex else "[REDACTED]"
+            ),
+            text,
+        )
+    return text
+
+
+def sanitize_codex_argv(argv: list[str], route: str = "current") -> list[str]:
+    """Return a persisted-safe representation of a Codex command."""
+    redact_values: tuple[str, ...] = ()
+    if route == "custom":
+        try:
+            redact_values = (codex_custom_route_config()["base_url"],)
+        except ValueError:
+            pass
+    return [sanitize_codex_diagnostic(value, redact_values=redact_values) for value in argv]
+
+
+def codex_route_redaction_values(route: str) -> tuple[str, ...]:
+    """Return transient custom route values that must not reach observability."""
+    if route != "custom":
+        return ()
+    config = codex_custom_route_config(include_secret=True)
+    return (config["base_url"], config["api_key"])
+
+
+def codex_process_environment(route: str) -> dict[str, str] | None:
+    """Build a child-only environment for a custom Codex route."""
+    if route != "custom":
+        return None
+    config = codex_custom_route_config(include_secret=True)
+    child_env = os.environ.copy()
+    child_env[config["env_key"]] = config["api_key"]
+    return child_env
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +496,7 @@ def run_safe_subprocess(
     *,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
+    input: bytes | None = None,
     timeout: float | None = None,
     max_output_bytes: int = MAX_SUBPROCESS_OUTPUT_BYTES,
 ) -> subprocess.CompletedProcess:
@@ -291,32 +519,59 @@ def run_safe_subprocess(
     """
     if not isinstance(argv, list) or not argv or any(not isinstance(a, str) for a in argv):
         raise ValueError("argv must be a list of non-empty strings")
+    if input is not None and not isinstance(input, bytes):
+        raise ValueError("input must be bytes or None")
 
     popen_kwargs = _make_safe_popen_kwargs(env=env, cwd=cwd)
+    if input is not None:
+        popen_kwargs["stdin"] = subprocess.PIPE
     proc = subprocess.Popen(argv, **popen_kwargs)
 
-    stdout_bytes = b""
-    stderr_bytes = b""
+    stdout_bytes = bytearray()
+    stderr_bytes = bytearray()
+    def _drain(stream, target):
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    return
+                if len(target) < max_output_bytes:
+                    target.extend(chunk[: max_output_bytes - len(target)])
+        except (OSError, ValueError):
+            return
+    stdout_stream = getattr(proc, "stdout", None)
+    stderr_stream = getattr(proc, "stderr", None)
+    out_thread = threading.Thread(target=_drain, args=(stdout_stream, stdout_bytes), daemon=True)
+    err_thread = threading.Thread(target=_drain, args=(stderr_stream, stderr_bytes), daemon=True)
+    out_thread.start(); err_thread.start()
+    if input is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(input)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
     try:
         try:
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             _escalate_terminate(proc, list(argv))
-            try:
-                stdout_bytes, stderr_bytes = proc.communicate(timeout=0.5)
-            except (subprocess.TimeoutExpired, OSError, ValueError):
-                stdout_bytes = b""
-                stderr_bytes = b""
     finally:
         # Defensive final reap; safe to call even after a clean return.
         try:
             if proc.poll() is None:
                 _escalate_terminate(proc, list(argv))
-                try:
-                    proc.communicate(timeout=0.5)
-                except Exception:
-                    pass
+                proc.wait(timeout=0.5)
         except Exception:
+            pass
+    out_thread.join(timeout=1.0)
+    err_thread.join(timeout=1.0)
+    for stream in (stdout_stream, stderr_stream):
+        try:
+            if stream is not None and not stream.closed:
+                stream.close()
+        except (OSError, ValueError):
             pass
 
     def _decode_truncate(data: bytes) -> str:
@@ -329,8 +584,8 @@ def run_safe_subprocess(
     return subprocess.CompletedProcess(
         args=list(argv),
         returncode=proc.returncode if proc.returncode is not None else -1,
-        stdout=_decode_truncate(stdout_bytes),
-        stderr=_decode_truncate(stderr_bytes),
+        stdout=_decode_truncate(bytes(stdout_bytes)),
+        stderr=_decode_truncate(bytes(stderr_bytes)),
     )
 
 
@@ -928,7 +1183,7 @@ def _minimax_cli_status() -> dict:
     return base
 
 
-def _run_agy_probe(command: list[str]) -> subprocess.CompletedProcess:
+def _run_agy_probe(command: list[str], *, cwd: str | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Run an agy CLI probe command via the safe subprocess helper.
 
     Probes are short-lived (``--version``, ``--help``, ``models``) but they
@@ -939,11 +1194,136 @@ def _run_agy_probe(command: list[str]) -> subprocess.CompletedProcess:
         raise ValueError("command must be a non-empty list")
     return run_safe_subprocess(
         command,
-        cwd=None,
-        env=None,
+        cwd=cwd,
+        env=env,
         timeout=5.0,
         max_output_bytes=MAX_SUBPROCESS_OUTPUT_BYTES,
     )
+
+
+def _parse_agy_models(result: subprocess.CompletedProcess) -> tuple[list[str], bool]:
+    """Parse a model probe without treating banners or diagnostics as models."""
+    text = _probe_text(result)
+    if result.returncode != 0 or AGY_PROBE_BLOCKER_RE.search(text):
+        return [], False
+    models: list[str] = []
+    for line in text.splitlines():
+        token = line.strip().split()[0] if line.strip() else ""
+        token = token.strip("`[](),")
+        if AGY_MODEL_ID_RE.fullmatch(token) and (token.startswith("gemini-") or "/" in token):
+            if token not in models:
+                models.append(token)
+    return models, bool(models)
+
+
+def _parse_agy_model_enumeration(result: subprocess.CompletedProcess) -> tuple[list[str], bool]:
+    """Extract a strict model enumeration from an ``agy models`` result.
+
+    Model IDs are parsed exclusively from stdout; stderr is reserved for
+    diagnostics and harmless progress/info banners and must never be parsed
+    as model IDs. Known and generic info/banner lines in stdout (such as
+    progress banners, table headings, and info tags) are ignored and do
+    not contaminate the model enumeration or invalidate structure.
+    """
+    stdout_text = result.stdout if isinstance(result.stdout, str) else ""
+    if not stdout_text.strip():
+        return [], False
+
+    models: list[str] = []
+    structurally_valid = True
+
+    try:
+        decoded = json.loads(stdout_text)
+    except (TypeError, ValueError):
+        pass
+    else:
+        if isinstance(decoded, dict):
+            decoded = decoded.get("models")
+        if isinstance(decoded, list) and decoded:
+            for item in decoded:
+                model_id = item.get("id") if isinstance(item, dict) else item
+                if not isinstance(model_id, str) or not AGY_MODEL_ID_RE.fullmatch(model_id):
+                    structurally_valid = False
+                    continue
+                if model_id not in models:
+                    models.append(model_id)
+            return models, bool(models and structurally_valid)
+        return [], False
+
+    for raw_line in stdout_text.splitlines():
+        line = raw_line.strip()
+        if not line or AGY_INFO_OR_BANNER_RE.fullmatch(line):
+            continue
+        # The documented text format may be a tabular or a
+        # whitespace-separated ``id description`` row.
+        model_id = line.split(None, 1)[0]
+        if not AGY_MODEL_ID_RE.fullmatch(model_id):
+            structurally_valid = False
+            continue
+        if model_id not in models:
+            models.append(model_id)
+
+    return models, bool(models and structurally_valid)
+
+
+def _parse_agy_stderr_model_enumeration(
+    result: subprocess.CompletedProcess,
+) -> tuple[list[str], bool]:
+    """Extract only a strict model catalogue accidentally written to stderr.
+
+    Unlike stdout, stderr is primarily diagnostic output.  Every non-banner
+    line must therefore be either a complete model id with a provider-like
+    separator or a model row whose first field is such an id.  Any unknown
+    diagnostic line invalidates the fallback catalogue.
+    """
+    stderr_text = result.stderr if isinstance(result.stderr, str) else ""
+    if not stderr_text.strip():
+        return [], False
+
+    models: list[str] = []
+    structurally_valid = True
+    for raw_line in stderr_text.splitlines():
+        line = raw_line.strip()
+        if not line or AGY_INFO_OR_BANNER_RE.fullmatch(line):
+            continue
+        model_id = line.split(None, 1)[0]
+        if not AGY_STDERR_MODEL_ID_RE.fullmatch(model_id):
+            structurally_valid = False
+            continue
+        if model_id not in models:
+            models.append(model_id)
+
+    return models, bool(models and structurally_valid)
+
+
+def _is_valid_agy_model_catalogue(
+    result: subprocess.CompletedProcess,
+    *,
+    models: list[str],
+    structurally_valid: bool,
+) -> bool:
+    """Verify that ``agy models`` emitted a valid, unblocked Gemini-ready catalogue.
+
+    The public capability probe requires:
+      1. A non-empty, structurally valid model enumeration.
+      2. At least one ``gemini-*`` model present in the catalogue.
+      3. No authentication, login, network, or explicit error diagnostics.
+
+    When these semantic conditions hold, the capability is accepted even if
+    the CLI emitted an abnormal non-zero exit code.  Genuine login, auth,
+    network, or execution blockers remain strictly fail-closed.
+    """
+    output = _probe_text(result)
+    return (
+        bool(models)
+        and structurally_valid
+        and any(model_id.startswith("gemini-") for model_id in models)
+        and not bool(AGY_MODELS_BLOCKER_RE.search(output))
+    )
+
+
+_AGY_PROBE_LOCK = threading.Lock()
+_AGY_PROBE_CACHE: tuple[tuple[str, str, str, bool], float, dict] | None = None
 
 
 def _agy_cli_status() -> dict:
@@ -955,7 +1335,21 @@ def _agy_cli_status() -> dict:
     worker, not by the MCP transport, so ``supports_async`` is True
     once the CLI is verified.
     """
+    global _AGY_PROBE_CACHE
     executable = AGY_EXE
+    cwd = str(Path.cwd())
+    env = {k: v for k, v in os.environ.items() if v is not None}
+    dangerous_permissions_enabled = agy_dangerous_permissions_enabled(env)
+    cache_key = (
+        str(executable),
+        cwd,
+        hashlib.sha256(json.dumps(env, sort_keys=True).encode()).hexdigest(),
+        dangerous_permissions_enabled,
+    )
+    with _AGY_PROBE_LOCK:
+        cached = _AGY_PROBE_CACHE
+        if cached and cached[0] == cache_key and time.monotonic() - cached[1] <= AGY_PROBE_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached[2])
     reported_executable = str(executable)
     base = {
         "name": "agy",
@@ -969,6 +1363,7 @@ def _agy_cli_status() -> dict:
         "version": None,
         "capabilities": {},
         "noninteractive_command": None,
+        "dangerously_skip_permissions_enabled": dangerous_permissions_enabled,
         "session_behavior": (
             "agy --print runs one headless single-shot turn; the worker "
             "supervises the lifecycle and reads the final result from "
@@ -995,9 +1390,12 @@ def _agy_cli_status() -> dict:
         ("models", ["models"]),
     ):
         try:
-            result = _run_agy_probe([str(executable), *args])
+            result = _run_agy_probe([str(executable), *args], cwd=cwd, env=env)
             probes[label] = result
-            if result.returncode != 0:
+            # ``agy models`` is assessed below after its output has been
+            # structurally validated.  Version/help remain conventional
+            # fail-closed capability probes.
+            if label != "models" and result.returncode != 0:
                 detail = _probe_text(result).strip()[-500:]
                 probe_errors.append(
                     f"{label} exited {result.returncode}{': ' + detail if detail else ''}"
@@ -1025,30 +1423,62 @@ def _agy_cli_status() -> dict:
         "print_timeout": "--print-timeout" in help_text,
         "sandbox": "--sandbox" in help_text,
     }
+    models_result = probes.get("models")
+    models, models_structurally_valid = (
+        _parse_agy_model_enumeration(models_result)
+        if models_result is not None
+        else ([], False)
+    )
+    if models_result is not None and not (
+        models and models_structurally_valid
+    ):
+        # AGY 1.1.27 can write the otherwise valid catalogue to stderr while
+        # reporting progress there as well.  Keep stdout authoritative when
+        # it yields a valid catalogue; only then consider the strict stderr
+        # fallback, which treats unknown diagnostic lines as structural noise.
+        stderr_models, stderr_structurally_valid = _parse_agy_stderr_model_enumeration(
+            models_result
+        )
+        if stderr_models and stderr_structurally_valid:
+            models, models_structurally_valid = stderr_models, stderr_structurally_valid
+    if models_result is None:
+        probe_errors.append("models probe returned no result")
+    elif _is_valid_agy_model_catalogue(
+        models_result,
+        models=models,
+        structurally_valid=models_structurally_valid,
+    ):
+        pass
+    else:
+        detail = _probe_text(models_result).strip()[-500:]
+        if models_result.returncode != 0:
+            probe_errors.append(
+                f"models exited {models_result.returncode}{': ' + detail if detail else ''}"
+            )
+        else:
+            probe_errors.append(
+                f"models returned incomplete or blocked output{': ' + detail if detail else ''}"
+            )
+        models = []
+    base["models"] = models
     base.update(version=version, capabilities=capabilities)
 
     if probe_errors:
         base["blocker"] = "Antigravity CLI capability probes did not pass: " + "; ".join(probe_errors)
+        with _AGY_PROBE_LOCK: _AGY_PROBE_CACHE = (cache_key, time.monotonic(), copy.deepcopy(base))
         return base
 
     required = ("print", "dangerously_skip_permissions", "output_format", "model", "effort", "print_timeout")
     missing = [name for name in required if not capabilities[name]]
     if missing:
         base["blocker"] = "Antigravity CLI capability probes did not pass: missing verified exec capabilities: " + ", ".join(missing)
+        with _AGY_PROBE_LOCK: _AGY_PROBE_CACHE = (cache_key, time.monotonic(), copy.deepcopy(base))
         return base
 
     base.update(
         available=True,
         supports_async=True,
-        noninteractive_command=[
-            str(executable),
-            "--print",
-            "--dangerously-skip-permissions",
-            "--output-format",
-            "json",
-            "--print-timeout",
-            AGY_DEFAULT_PRINT_TIMEOUT,
-        ],
+        noninteractive_command=[str(executable), "--print"],
         parameter_mappings={
             "model": "--model <id>",
             "sandbox": "sandbox is a single boolean in agy; read-only is rejected (workspace-write is the only verified mapping).",
@@ -1056,6 +1486,12 @@ def _agy_cli_status() -> dict:
         },
         blocker=None,
     )
+    if dangerous_permissions_enabled:
+        base["noninteractive_command"].append("--dangerously-skip-permissions")
+    base["noninteractive_command"].extend(
+        ["--output-format", "json", "--print-timeout", AGY_DEFAULT_PRINT_TIMEOUT]
+    )
+    with _AGY_PROBE_LOCK: _AGY_PROBE_CACHE = (cache_key, time.monotonic(), copy.deepcopy(base))
     return base
 
 
@@ -1090,6 +1526,42 @@ def harness_status(name: str) -> dict:
     return {"ok": False, "error": f"unknown harness: {name}"}
 
 
+_HARNESS_TELEMETRY_PROVIDER: HarnessTelemetryProvider | None = None
+
+
+def _harness_job_activity() -> dict[str, dict[str, int | str]]:
+    counts = {name: {"running": 0, "queued": 0, "source": "Harbor job queue"} for name in ("codex", "minimax", "agy")}
+    if not JOBS_DIR.is_dir():
+        return counts
+    for path in JOBS_DIR.glob("*/status.json"):
+        try:
+            state = read_json_object(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        name = state.get("harness")
+        status = state.get("status")
+        if name in counts and status in {"queued", "running"}:
+            counts[name][status] += 1
+    return counts
+
+
+def harness_telemetry_snapshot(*, force_refresh: bool = False) -> dict:
+    """Return a bounded, read-only snapshot shared by core integrations."""
+    global _HARNESS_TELEMETRY_PROVIDER
+    if _HARNESS_TELEMETRY_PROVIDER is None:
+        def invalidate_agy_cache() -> None:
+            global _AGY_PROBE_CACHE
+            _AGY_PROBE_CACHE = None
+        _HARNESS_TELEMETRY_PROVIDER = HarnessTelemetryProvider(
+            status_provider=harness_status,
+            codex_quota_provider=lambda: {"state": "unavailable", "source": "Codex CLI status", "error": "no authoritative local quota source"},
+            job_activity_provider=_harness_job_activity,
+            process_adapter=default_process_activity_adapter(run_safe_subprocess),
+            agy_cache_invalidator=invalidate_agy_cache,
+        )
+    return _HARNESS_TELEMETRY_PROVIDER.snapshot(force_refresh=force_refresh)
+
+
 def resolve_task_cwd(project: str | None, cwd: str | None) -> tuple[Path, str | None]:
     if bool(project) == bool(cwd):
         raise ValueError("provide exactly one of project or cwd")
@@ -1110,8 +1582,15 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
         return {"ok": False, "error": "prompt must be a non-empty string"}
     if sandbox not in SANDBOXES:
         return {"ok": False, "error": f"unsupported sandbox: {sandbox}"}
-    if route != "current":
-        return {"ok": False, "error": f"only route=current is supported (received: {route})"}
+    if harness == "codex":
+        if route not in CODEX_ROUTES:
+            return {"ok": False, "error": f"Codex route must be one of {sorted(CODEX_ROUTES)}."}
+        try:
+            validate_codex_route(route)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+    elif route != "current":
+        return {"ok": False, "error": f"{harness} tasks only support route=current."}
     try:
         workdir, project_alias = resolve_task_cwd(project, cwd)
     except ValueError as exc:
@@ -1136,6 +1615,7 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
         agy_status = harness_status("agy")
         if not agy_status["available"]:
             return {"ok": False, "error": agy_status["blocker"]}
+        dangerous_permissions_enabled = agy_dangerous_permissions_enabled()
     if not CODEX_EXE.is_file() and harness == "codex":
         return {"ok": False, "error": f"Codex executable not found: {CODEX_EXE}"}
     job_id = uuid.uuid4().hex
@@ -1152,10 +1632,19 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
         "sandbox": sandbox,
         "reasoning_effort": reasoning_effort,
         "route_requested": route,
-        "route_used": "current",
+        "route_used": (
+            codex_route_attempts(route)[0] if harness == "codex" else "current"
+        ),
+        "fallback_used": False,
+        "fallback_reason": None,
+        "attempts": [],
+        "queue_root_fingerprint": QUEUE_ROOT.fingerprint,
         "native_process": None,
         "minimax_executable": minimax_status["executable"] if harness == "minimax" else None,
         "agy_executable": str(AGY_EXE) if harness == "agy" else None,
+        "agy_dangerously_skip_permissions": (
+            dangerous_permissions_enabled if harness == "agy" else False
+        ),
         "created_at": utc_now(),
         "updated_at": utc_now(),
     }
@@ -1170,7 +1659,12 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
     if harness == "agy":
         response["parameter_handling"] = {
             "model": "mapped to --model" if model else "not requested",
-            "sandbox": "not mapped; agy uses --dangerously-skip-permissions by default",
+            "sandbox": "workspace-write is required; dangerous permission bypass is opt-in",
+            "dangerously_skip_permissions": (
+                f"enabled via {AGY_DANGEROUS_PERMISSIONS_ENV}"
+                if dangerous_permissions_enabled
+                else f"disabled by default; set {AGY_DANGEROUS_PERMISSIONS_ENV}=1 to enable"
+            ),
             "reasoning_effort": "mapped to --effort" if reasoning_effort else "not requested",
             "cwd": "not passed via flag; the worker sets Popen(cwd=...)",
             "result_path": "not passed via flag; the worker writes result.txt from captured stdout",
@@ -1384,6 +1878,8 @@ def poll_task(
                 state = read_json_object(state_path)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 return {"ok": False, "error": f"Could not read job state: {exc}"}
+            if not queue_root_matches(state, QUEUE_ROOT):
+                return {"ok": False, "error": "job belongs to a different Harbor queue root"}
 
             status = state.get("status")
             if status in TERMINAL_STATUSES:
@@ -1513,13 +2009,42 @@ def cancel_task(job_id: str) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
-def build_codex_command(state: dict, result_path: Path) -> list[str]:
+def build_codex_command(
+    state: dict,
+    result_path: Path,
+    *,
+    route: str | None = None,
+) -> list[str]:
+    selected_route = route or state.get("route_used") or state.get("route_requested", "current")
+    if selected_route == "official_then_custom":
+        selected_route = codex_route_attempts(selected_route)[0]
     command = [
         str(CODEX_EXE), "exec", "--color", "never", "--sandbox", state["sandbox"],
         "-C", state["cwd"], "-o", str(result_path),
     ]
-    if state.get("model"):
-        command.extend(["--model", state["model"]])
+    if selected_route == "official":
+        command.extend(["-c", 'model_provider="openai"'])
+    elif selected_route == "custom":
+        custom = codex_custom_route_config()
+
+        def toml_string(value: str) -> str:
+            # JSON strings are valid TOML basic strings and safely escape any
+            # user-provided quotes, slashes, or control characters.
+            return json.dumps(value, ensure_ascii=False)
+
+        provider_id = custom["provider_id"]
+        command.extend([
+            "-c", f"model_provider={toml_string(provider_id)}",
+            "-c", f"model_providers.{provider_id}.name={toml_string(custom['provider_name'])}",
+            "-c", f"model_providers.{provider_id}.base_url={toml_string(custom['base_url'])}",
+            "-c", f"model_providers.{provider_id}.wire_api={toml_string(custom['wire_api'])}",
+            "-c", f"model_providers.{provider_id}.env_key={toml_string(custom['env_key'])}",
+        ])
+    effective_model = state.get("model")
+    if not effective_model and selected_route == "custom":
+        effective_model = codex_custom_route_config().get("default_model")
+    if effective_model:
+        command.extend(["--model", effective_model])
     if state.get("reasoning_effort"):
         command.extend(["-c", f'model_reasoning_effort="{state["reasoning_effort"]}"'])
     command.append(state["prompt"])
@@ -1536,7 +2061,7 @@ def build_minimax_command(state: dict, result_path: Path) -> list[str]:
     ]
     if state.get("model"):
         command.extend(["--model", state["model"]])
-    command.append(state["prompt"])
+    command.extend(["--input", "-"])
     return command
 
 
@@ -1548,25 +2073,22 @@ def build_agy_command(state: dict, result_path: Path) -> list[str]:
     * ``result_path`` is **not** passed to agy; the worker writes it
       itself from the captured stdout.
 
-    The base flags are the supported non-interactive argv:
-    ``agy --print --dangerously-skip-permissions --output-format json
-    --print-timeout 5m [...] -p "<prompt>"``
+    The base flags are the supported non-interactive argv. The dangerous
+    permission bypass is included only when the job explicitly records that
+    ``HARBOR_AGY_DANGEROUSLY_SKIP_PERMISSIONS`` was enabled.
     """
     executable = state.get("agy_executable") or str(AGY_EXE)
-    command: list[str] = [
-        executable,
-        "--print",
-        "--dangerously-skip-permissions",
-        "--output-format", "json",
-        "--print-timeout", AGY_DEFAULT_PRINT_TIMEOUT,
-    ]
+    command: list[str] = [executable]
+    if state.get("agy_dangerously_skip_permissions", agy_dangerous_permissions_enabled()):
+        command.append("--dangerously-skip-permissions")
+    command.extend(["--output-format", "json", "--print-timeout", AGY_DEFAULT_PRINT_TIMEOUT])
     if state.get("model"):
         command.extend(["--model", state["model"]])
     if state.get("reasoning_effort"):
         command.extend(["--effort", state["reasoning_effort"]])
     # The prompt must be a value of the ``-p`` flag; a bare positional
     # would be rejected by agy.
-    command.extend(["-p", state["prompt"]])
+    command.append("--print=" + state["prompt"])
     # result_path is intentionally unused here. The worker writes it.
     _ = result_path
     return command

@@ -1,0 +1,14 @@
+* text=auto
+
+# Keep Python, documentation, configuration, and CI files stable across hosts.
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.example text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+LICENSE text eol=lf
+
+# PowerShell is conventionally checked out with Windows line endings.
+*.ps1 text eol=crlf

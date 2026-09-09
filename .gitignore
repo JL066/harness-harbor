@@ -16,10 +16,15 @@ build/
 
 # Control-plane runtime state
 .control/
+*.lock
+*.pid
+poll_meta.json
+route-state.json
 
 # Logs
 *.log
 daemon-test.*
+tunnel-supervisor.log
 
 # Test caches
 .pytest_cache/
@@ -49,4 +54,5 @@ _*.ps1
 .vscode/
 *.tmp
 *.bak
+*.index
 scratch/

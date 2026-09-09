@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -88,7 +89,14 @@ class ControlPlaneTests(unittest.TestCase):
             fake_codex = root / "codex.exe"
             fake_codex.write_text("placeholder", encoding="utf-8")
 
-            with mock.patch.object(control_plane, "CODEX_EXE", fake_codex):
+            with mock.patch.object(control_plane, "CODEX_EXE", fake_codex), mock.patch.dict(
+                os.environ,
+                {
+                    control_plane.CODEX_CUSTOM_BASE_URL_ENV: "https://api.acme.test/v1",
+                    control_plane.CODEX_CUSTOM_API_KEY_ENV: "sk-" + "test-secret-value-12345678",
+                },
+                clear=False,
+            ):
                 cancelled = control_plane.start_task(
                     harness="codex", prompt="cancel", project="fixture", cwd=None,
                     model=None, sandbox="read-only", reasoning_effort=None,
@@ -115,9 +123,83 @@ class ControlPlaneTests(unittest.TestCase):
                 self.assertEqual("codex", polled["harness"])
                 self.assertEqual("fixture", polled["project"])
                 self.assertEqual("done", polled["final_message"])
+                self.assertEqual("current", polled["route_requested"])
+                self.assertEqual("current", polled["route_used"])
+                self.assertFalse(polled["fallback_used"])
+                self.assertIsNone(polled["fallback_reason"])
+                self.assertEqual(["current"], [item["route"] for item in polled["attempts"]])
                 argv = polled["native_process"]["argv"]
                 self.assertIn("--model", argv)
                 self.assertIn('model_reasoning_effort="high"', argv)
+
+    def test_codex_routes_are_accepted_and_non_codex_routes_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            project = root / "project"
+            project.mkdir()
+            self.write_projects(project)
+            fake_codex = root / "codex.exe"
+            fake_codex.write_text("placeholder", encoding="utf-8")
+            with mock.patch.object(control_plane, "CODEX_EXE", fake_codex), mock.patch.dict(
+                os.environ,
+                {
+                    control_plane.CODEX_CUSTOM_BASE_URL_ENV: "https://api.acme.test/v1",
+                    control_plane.CODEX_CUSTOM_API_KEY_ENV: "sk-" + "test-secret-value-12345678",
+                },
+                clear=False,
+            ):
+                for route in ("current", "official", "custom", "official_then_custom"):
+                    result = control_plane.start_task(
+                        harness="codex", prompt="route", project="fixture", cwd=None,
+                        model=None, sandbox="read-only", reasoning_effort=None, route=route,
+                    )
+                    self.assertTrue(result["ok"], result)
+                    state = json.loads(
+                        (control_plane.JOBS_DIR / result["job_id"] / "status.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    self.assertEqual(route, state["route_requested"])
+                    self.assertEqual(control_plane.codex_route_attempts(route)[0], state["route_used"])
+                refused = control_plane.start_task(
+                    harness="minimax", prompt="route", project="fixture", cwd=None,
+                    model=None, sandbox="workspace-write", reasoning_effort=None, route="custom",
+                )
+            self.assertFalse(refused["ok"])
+            self.assertIn("route=current", refused["error"])
+
+    def test_custom_route_fails_closed_when_configuration_is_missing_or_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            project = root / "project"
+            project.mkdir()
+            self.write_projects(project)
+            fake_codex = root / "codex.exe"
+            fake_codex.write_text("placeholder", encoding="utf-8")
+            with mock.patch.object(control_plane, "CODEX_EXE", fake_codex), mock.patch.dict(
+                os.environ,
+                {
+                    control_plane.CODEX_CUSTOM_BASE_URL_ENV: "not-a-url",
+                    control_plane.CODEX_CUSTOM_API_KEY_ENV: "",
+                },
+                clear=False,
+            ):
+                missing = control_plane.start_task(
+                    harness="codex", prompt="route", project="fixture", cwd=None,
+                    model=None, sandbox="read-only", reasoning_effort=None, route="custom",
+                )
+                self.assertFalse(missing["ok"])
+                self.assertIn("custom route requires", missing["error"])
+
+                os.environ[control_plane.CODEX_CUSTOM_API_KEY_ENV] = "sk-" + "test-secret-value-12345678"
+                invalid = control_plane.start_task(
+                    harness="codex", prompt="route", project="fixture", cwd=None,
+                    model=None, sandbox="read-only", reasoning_effort=None, route="official_then_custom",
+                )
+                self.assertFalse(invalid["ok"])
+                self.assertIn("must be an http(s) URL", invalid["error"])
 
     @staticmethod
     def minimax_probe(argv, **_kwargs) -> subprocess.CompletedProcess:
@@ -190,7 +272,7 @@ class ControlPlaneTests(unittest.TestCase):
             [
                 r"C:\fixture\mcode.cmd", "exec", "--cwd", r"C:\fixture\repo",
                 "--output-format", "json", "--output-last-message", str(result_path),
-                "--model", "provider/model", "finish",
+                "--model", "provider/model", "--input", "-",
             ],
             command,
         )

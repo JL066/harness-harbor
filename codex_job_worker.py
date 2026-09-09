@@ -61,7 +61,14 @@ from control_plane import (
     build_codex_command,
     build_minimax_command,
     claim_job,
+    classify_codex_route_failure,
+    codex_process_environment,
+    codex_route_attempts,
+    codex_route_redaction_values,
+    CODEX_ROUTE_FAILURES,
     read_json_object,
+    sanitize_codex_argv,
+    sanitize_codex_diagnostic,
     utc_now,
     write_json,
 )
@@ -93,6 +100,11 @@ def output_tail(value: object) -> str:
     return value[-OUTPUT_TAIL_CHARS:].strip()
 
 
+def sanitize_diagnostic(value: object) -> str:
+    """Bound diagnostics and redact common credential-shaped values."""
+    return sanitize_codex_diagnostic(value)
+
+
 def load_state(path: Path) -> dict:
     return read_json_object(path)
 
@@ -116,9 +128,14 @@ def release_job_lock(job_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def collect_result(result: subprocess.CompletedProcess, result_path: Path) -> dict:
-    stderr_tail = output_tail(result.stderr)
-    stdout_tail = output_tail(result.stdout)
+def collect_result(
+    result: subprocess.CompletedProcess,
+    result_path: Path,
+    *,
+    redact_values: tuple[str, ...] = (),
+) -> dict:
+    stderr_tail = sanitize_codex_diagnostic(result.stderr, redact_values=redact_values)
+    stdout_tail = sanitize_codex_diagnostic(result.stdout, redact_values=redact_values)
     collected = {
         "exit_code": result.returncode,
         "stderr": stderr_tail,
@@ -144,7 +161,10 @@ def collect_result(result: subprocess.CompletedProcess, result_path: Path) -> di
             )
             return collected
 
-    collected["final_message"] = final_message
+    collected["final_message"] = sanitize_codex_diagnostic(
+        final_message,
+        redact_values=redact_values,
+    )
     if result.returncode == 0:
         collected["status"] = "completed"
     else:
@@ -153,6 +173,87 @@ def collect_result(result: subprocess.CompletedProcess, result_path: Path) -> di
             failure_type="codex_execution_error",
             error="Codex exited with a non-zero status",
         )
+    return collected
+
+
+def run_codex_with_routes(
+    state: dict,
+    result_path: Path,
+    state_path: Path,
+) -> dict:
+    """Run a Codex job's ordered routes without changing its job identity.
+
+    The worker remains the sole owner of the job lock and workspace lease while
+    these attempts run. A fallback is therefore serial and cannot duplicate
+    concurrent execution.
+    """
+    requested_route = state.get("route_requested", "current")
+    routes = codex_route_attempts(requested_route)
+    attempts: list[dict] = []
+    fallback_used = False
+    fallback_reason: str | None = None
+    collected: dict = {}
+
+    for index, route in enumerate(routes):
+        if index > 0:
+            try:
+                result_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        command = build_codex_command(state, result_path, route=route)
+        child_env = codex_process_environment(route)
+        redact_values = codex_route_redaction_values(route)
+        state.update(
+            route_used=route,
+            attempts=attempts,
+            fallback_used=fallback_used,
+            fallback_reason=fallback_reason,
+            native_process={
+                "argv": sanitize_codex_argv(command, route=route),
+                "launcher_pid": os.getpid(),
+            },
+        )
+        write_state(state_path, state)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=child_env,
+        )
+        collected = collect_result(result, result_path, redact_values=redact_values)
+        classification = classify_codex_route_failure(result)
+        attempts.append({
+            "route": route,
+            "status": collected.get("status", "failed"),
+            "classification": classification,
+            "exit_code": result.returncode,
+        })
+
+        can_fallback = (
+            requested_route == "official_then_custom"
+            and index == 0
+            and classification in CODEX_ROUTE_FAILURES
+        )
+        if not can_fallback:
+            break
+        fallback_used = True
+        fallback_reason = classification
+        state.update(
+            attempts=attempts,
+            fallback_used=fallback_used,
+            fallback_reason=fallback_reason,
+        )
+        write_state(state_path, state)
+
+    collected.update(
+        route_used=state.get("route_used", routes[-1]),
+        fallback_used=fallback_used,
+        fallback_reason=fallback_reason,
+        attempts=attempts,
+    )
     return collected
 
 
@@ -332,6 +433,7 @@ def run_minimax_with_lifecycle(
     command: list[str],
     result_path: Path,
     *,
+    prompt: str = "",
     poll_interval: float = MINIMAX_POLL_INTERVAL,
     settle_grace: float = MINIMAX_RESULT_SETTLE_GRACE,
     exit_grace: float = MINIMAX_EXIT_GRACE,
@@ -351,7 +453,7 @@ def run_minimax_with_lifecycle(
       first became stable, or None
     """
     popen_kwargs: dict = {
-        "stdin": subprocess.DEVNULL,
+        "stdin": subprocess.PIPE,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
     }
@@ -376,6 +478,16 @@ def run_minimax_with_lifecycle(
     stderr_reader = _BoundedStreamReader(proc.stderr)
     stdout_reader.start()
     stderr_reader.start()
+
+    def feed_prompt() -> None:
+        try:
+            stdin = getattr(proc, "stdin", None)
+            if stdin is not None:
+                stdin.write(prompt.encode("utf-8"))
+                stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+    threading.Thread(target=feed_prompt, daemon=True, name="minimax-stdin-feeder").start()
 
     started = time.monotonic()
     deadline = started + total_timeout
@@ -521,7 +633,22 @@ def collect_minimax_lifecycle_result(
     reason = lifecycle.get("termination_reason", "self_exit")
     forced = bool(lifecycle.get("forced_exit", False))
 
+    canonical_status = None
+    stdout = lifecycle.get("stdout", "")
+    if isinstance(stdout, str):
+        for line in reversed(stdout.splitlines()):
+            try:
+                payload = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("status"), str):
+                canonical_status = payload["status"].strip().lower()
+                collected["agent_task_status"] = canonical_status
+                break
     if reason == "grace_expired_after_result" and final_message and not parse_error:
+        if canonical_status in {"failed", "error", "cancelled", "canceled"}:
+            collected.update(status="failed", failure_type="minimax_execution_error", error="MiniMax agent reported non-success status")
+            return collected
         collected["status"] = "completed"
         collected["forced_exit_after_result"] = True
         return collected
@@ -1000,36 +1127,28 @@ def main(job_dir: Path) -> None:
         result_path = job_dir / "result.txt"
         harness = state.get("harness", "codex")
         if harness == "codex":
-            command = build_codex_command(state, result_path)
+            collected = run_codex_with_routes(state, result_path, state_path)
         elif harness == "minimax":
             command = build_minimax_command(state, result_path)
         elif harness == "agy":
             command = build_agy_command(state, result_path)
         else:
             raise ValueError(f"Unsupported worker harness: {harness}")
-        state["native_process"] = {"argv": command, "launcher_pid": os.getpid()}
-        write_state(state_path, state)
-
         if harness == "minimax":
-            lifecycle = run_minimax_with_lifecycle(command, result_path)
+            state["native_process"] = {"argv": command, "launcher_pid": os.getpid()}
+            write_state(state_path, state)
+            lifecycle = run_minimax_with_lifecycle(command, result_path, prompt=state.get("prompt", ""))
             state.update(collect_minimax_lifecycle_result(lifecycle, result_path))
         elif harness == "agy":
+            state["native_process"] = {"argv": command, "launcher_pid": os.getpid()}
+            write_state(state_path, state)
             # Agy has no --cwd flag; the working directory is supplied
             # at the Popen layer. result.txt is not passed to agy; the
             # lifecycle collector writes it from the captured stdout.
             lifecycle = run_agy_with_lifecycle(command, cwd=state["cwd"])
             state.update(collect_agy_lifecycle_result(lifecycle, result_path))
         else:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-            state.update(collect_result(result, result_path))
-            state["route_used"] = "current"
+            state.update(collected)
 
         write_state(state_path, state)
     except Exception as exc:
@@ -1037,6 +1156,14 @@ def main(job_dir: Path) -> None:
             state = load_state(state_path)
         except (OSError, ValueError):
             state = {}
+        redact_values: tuple[str, ...] = ()
+        if state.get("harness", "codex") == "codex":
+            try:
+                redact_values = codex_route_redaction_values(
+                    state.get("route_used") or state.get("route_requested", "current")
+                )
+            except ValueError:
+                pass
         existing_stderr = state.get("stderr")
         existing_stdout = state.get("stdout_tail")
         stderr_tail = output_tail(state.get("stderr"))
@@ -1053,10 +1180,13 @@ def main(job_dir: Path) -> None:
                     else "Antigravity job wrapper failed"
                 )
             ),
-            wrapper_error=f"{type(exc).__name__}: {exc}",
-            stderr=stderr_tail,
-            stderr_tail=stderr_tail,
-            stdout_tail=stdout_tail,
+            wrapper_error=sanitize_codex_diagnostic(
+                f"{type(exc).__name__}: {exc}",
+                redact_values=redact_values,
+            ),
+            stderr=sanitize_codex_diagnostic(stderr_tail, redact_values=redact_values),
+            stderr_tail=sanitize_codex_diagnostic(stderr_tail, redact_values=redact_values),
+            stdout_tail=sanitize_codex_diagnostic(stdout_tail, redact_values=redact_values),
             stderr_is_diagnostic=True,
         )
         write_state(state_path, state)

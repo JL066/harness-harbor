@@ -15,6 +15,12 @@ from mcp.server.fastmcp import FastMCP
 
 from control_plane import (
     cancel_task,
+    build_codex_command,
+    classify_codex_route_failure,
+    codex_process_environment,
+    codex_route_attempts,
+    codex_route_redaction_values,
+    CODEX_ROUTE_FAILURES,
     directory_list_result,
     file_append_result,
     file_read_result,
@@ -34,13 +40,17 @@ from control_plane import (
     poll_task,
     resolve_project,
     run_safe_subprocess,
+    sanitize_codex_diagnostic,
     start_task,
+    validate_codex_route,
+    QUEUE_ROOT,
+    harness_telemetry_snapshot,
 )
 
 
 CODEX_EXE = Path(os.environ.get("HARBOR_CODEX_EXE") or shutil.which("codex") or ("codex.exe" if os.name == "nt" else "codex"))
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
-JOBS_DIR = Path(__file__).resolve().parent / ".jobs"
+JOBS_DIR = QUEUE_ROOT.path
 SANDBOXES = {"read-only", "workspace-write"}
 
 MAX_LIST_ENTRIES_HARD_LIMIT = 5000
@@ -65,7 +75,7 @@ BINARY_FILE_EXTENSIONS = {
     ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".avi", ".mov", ".wav",
 }
 
-mcp = FastMCP("ChatGPT Harbor")
+mcp = FastMCP("Harness Harbor")
 
 
 def _resolve_existing_path(path: str) -> Path:
@@ -167,6 +177,7 @@ async def codex_run(
     model: str | None = None,
     sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
     reasoning_effort: str | None = None,
+    route: Literal["current", "official", "custom", "official_then_custom"] = "current",
 ) -> dict:
     """Run a Codex task synchronously and wait for the final result.
 
@@ -174,7 +185,7 @@ async def codex_run(
 
     Do NOT use this as a substitute for codex_start.
 
-    For normal coding, repository analysis, debugging, edits, research, or any task that may take more than a few seconds, prefer codex_start followed by codex_poll. Long synchronous calls may exceed the OpenAI Tunnel response deadline and fail with a timeout or 502 error.
+    For normal coding, repository analysis, debugging, edits, research, or any task that may take more than a few seconds, prefer codex_start followed by codex_poll. Long synchronous calls may exceed a remote tunnel transport response deadline and fail with a timeout or 502 error.
     """
     workdir = Path(cwd).expanduser().resolve()
 
@@ -187,36 +198,28 @@ async def codex_run(
     fd, output_path = tempfile.mkstemp(prefix="codex-mcp-", suffix=".txt")
     os.close(fd)
 
-    cmd = [
-        str(CODEX_EXE),
-        "exec",
-        "--color",
-        "never",
-        "--sandbox",
-        sandbox,
-        "-C",
-        str(workdir),
-        "-o",
-        output_path,
-    ]
-
-    if model:
-        cmd.extend(["--model", model])
-    if reasoning_effort:
-        cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
-
-    cmd.append(prompt)
+    route_state = {
+        "cwd": str(workdir), "sandbox": sandbox, "model": model,
+        "reasoning_effort": reasoning_effort, "prompt": prompt,
+    }
 
     try:
-        def _run() -> "subprocess.CompletedProcess":
-            return run_safe_subprocess(
-                cmd,
-                cwd=None,
-                env=None,
-                timeout=600.0,
+        validate_codex_route(route)
+        result = None
+        for index, attempt_route in enumerate(codex_route_attempts(route)):
+            cmd = build_codex_command(route_state, Path(output_path), route=attempt_route)
+            child_env = codex_process_environment(attempt_route)
+            result = await asyncio.to_thread(
+                lambda: run_safe_subprocess(cmd, cwd=None, env=child_env, timeout=600.0)
             )
-
-        result = await asyncio.to_thread(_run)
+            classification = classify_codex_route_failure(result)
+            if not (
+                route == "official_then_custom"
+                and index == 0
+                and classification in CODEX_ROUTE_FAILURES
+            ):
+                break
+        assert result is not None
 
         final_message = ""
         try:
@@ -230,10 +233,19 @@ async def codex_run(
         return {
             "ok": result.returncode == 0,
             "exit_code": result.returncode,
-            "final_message": final_message,
-            "stderr": (result.stderr or "")[-4000:].strip(),
+            "final_message": sanitize_codex_diagnostic(
+                final_message,
+                redact_values=codex_route_redaction_values(attempt_route),
+            ),
+            "stderr": sanitize_codex_diagnostic(
+                result.stderr,
+                redact_values=codex_route_redaction_values(attempt_route),
+            ),
             "cwd": str(workdir),
         }
+
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "cwd": str(workdir)}
 
     finally:
         try:
@@ -249,6 +261,7 @@ async def codex_start(
     model: str | None = None,
     sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
     reasoning_effort: str | None = None,
+    route: Literal["current", "official", "custom", "official_then_custom"] = "current",
 ) -> dict:
     """Start a Codex task asynchronously.
 
@@ -265,7 +278,7 @@ async def codex_start(
         model=model,
         sandbox=sandbox,
         reasoning_effort=reasoning_effort,
-        route="current",
+        route=route,
     )
 
 
@@ -634,6 +647,12 @@ async def harness_status(harness: str) -> dict:
 
 
 @mcp.tool()
+async def harness_telemetry(force_refresh: bool = False) -> dict:
+    """Return bounded read-only harness status, queue, process, and quota telemetry."""
+    return await asyncio.to_thread(harness_telemetry_snapshot, force_refresh=force_refresh)
+
+
+@mcp.tool()
 def project_list() -> dict:
     """List aliases from .control/projects.json. This is an editable JSON registry, not a database."""
     try:
@@ -660,12 +679,13 @@ async def task_start(
     model: str | None = None,
     sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
     reasoning_effort: str | None = None,
-    route: Literal["current"] = "current",
+    route: Literal["current", "official", "custom", "official_then_custom"] = "current",
 ) -> dict:
     """Queue a unified async task using exactly one project alias or explicit cwd.
 
     Harness/model choice remains caller-controlled. MiniMax uses its verified
-    headless `mcode exec` interface. The route is fixed to `current`.
+    headless `mcode exec` interface. Codex supports the four public route
+    values; MiniMax and AGY accept only `current`.
 
     Offloaded to a worker thread because it may run a MiniMax capability probe.
     """

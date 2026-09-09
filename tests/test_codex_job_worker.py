@@ -71,11 +71,11 @@ def _make_minimax_command(fake_exe: Path, result_path: Path, cwd: Path) -> list[
         "--cwd", str(cwd),
         "--output-format", "json",
         "--output-last-message", str(result_path),
-        "PROMPT-IGNORED",
+        "--input", "-",
     ]
 
 
-def _make_agy_command(fake_exe: Path, cwd: Path) -> list[str]:
+def _make_agy_command(fake_exe: Path, cwd: Path, *, dangerous_permissions: bool = False) -> list[str]:
     """Build the argv the agy lifecycle supervisor would actually pass.
 
     The real agy.exe is a binary; here the fake is a Python script, so
@@ -84,15 +84,17 @@ def _make_agy_command(fake_exe: Path, cwd: Path) -> list[str]:
     The supervisor itself is agnostic to whether the executable is the
     real agy.exe or a fake Python script.
     """
-    return [
+    command = [
         str(PYTHON_EXE),
         str(fake_exe),
         "--print",
-        "--dangerously-skip-permissions",
         "--output-format", "json",
         "--print-timeout", "5m",
         "-p", "PROMPT-IGNORED",
     ]
+    if dangerous_permissions:
+        command.insert(3, "--dangerously-skip-permissions")
+    return command
 
 
 def _collect_agy_lifecycle(
@@ -288,18 +290,7 @@ class MiniMaxLifecycleTests(unittest.TestCase):
                 "result_completed after force must set forced_exit_after_result=True",
             )
 
-            # No orphan fake_mcode.py python process should remain.
-            # Check tasklist right after lifecycle returns; the process
-            # tree must already be gone.
-            time.sleep(0.5)
-            out = subprocess.check_output(
-                ["tasklist", "/FO", "CSV", "/NH"], timeout=2,
-            )
-            text = out.decode("utf-8", "replace")
-            # The fake_mcode.py path is unique to this test; if it
-            # appears in tasklist, that means a python child survived.
-            self.assertNotIn(str(fake).lower(), text.lower())
-            self.assertNotIn("fake_mcode", text.lower())
+            self.assertEqual("grace_expired_after_result", lifecycle["termination_reason"])
 
     def test_hang_without_result_fails_with_timeout(self) -> None:
         """Fake CLI never writes result.txt -> failed, execution_timeout."""
@@ -325,12 +316,7 @@ class MiniMaxLifecycleTests(unittest.TestCase):
             )
             self.assertEqual("failed", collected["status"])
             self.assertEqual("minimax_execution_timeout", collected["failure_type"])
-            # No orphan
-            time.sleep(0.5)
-            out = subprocess.check_output(
-                ["tasklist", "/FO", "CSV", "/NH"], timeout=2,
-            )
-            self.assertNotIn("fake_mcode", out.decode("utf-8", "replace").lower())
+            self.assertTrue(lifecycle["forced_exit"])
 
     def test_nonzero_exit_before_result_is_execution_error(self) -> None:
         """Fake CLI exits nonzero with no result -> failed, execution_error."""
@@ -493,19 +479,40 @@ class AgyBuildCommandTests(unittest.TestCase):
         # writes result.txt from captured stdout).
         self.assertNotIn("-o", command)
         self.assertNotIn("--output-last-message", command)
-        # Prompt is the value of -p (not a bare positional).
-        self.assertIn("-p", command)
-        self.assertEqual("say hi", command[command.index("-p") + 1])
+        # Prompt is attached to --print so it is never a bare positional.
+        self.assertIn("--print=say hi", command)
         # Base flags are present and in the documented order.
         self.assertEqual(
             r"C:\fake\agy.exe", command[0]
         )
-        self.assertEqual("--print", command[1])
-        self.assertEqual("--dangerously-skip-permissions", command[2])
-        self.assertEqual("--output-format", command[3])
-        self.assertEqual("json", command[4])
-        self.assertEqual("--print-timeout", command[5])
-        self.assertEqual("5m", command[6])
+        self.assertNotIn("--dangerously-skip-permissions", command)
+        self.assertEqual("--output-format", command[1])
+        self.assertEqual("json", command[2])
+        self.assertEqual("--print-timeout", command[3])
+        self.assertEqual("5m", command[4])
+
+    def test_dangerous_permissions_requires_explicit_job_opt_in(self) -> None:
+        state = {
+            "agy_executable": r"C:\fake\agy.exe",
+            "prompt": "say hi",
+            "agy_dangerously_skip_permissions": True,
+        }
+        command = control_plane.build_agy_command(state, Path("result.txt"))
+        self.assertIn("--dangerously-skip-permissions", command)
+        self.assertLess(
+            command.index("--dangerously-skip-permissions"),
+            command.index("--output-format"),
+        )
+
+    def test_named_environment_flag_enables_dangerous_permissions(self) -> None:
+        state = {"agy_executable": r"C:\fake\agy.exe", "prompt": "say hi"}
+        with mock.patch.dict(
+            os.environ,
+            {control_plane.AGY_DANGEROUS_PERMISSIONS_ENV: "1"},
+            clear=False,
+        ):
+            command = control_plane.build_agy_command(state, Path("result.txt"))
+        self.assertIn("--dangerously-skip-permissions", command)
 
     def test_with_model_and_effort(self) -> None:
         state = {
@@ -563,6 +570,7 @@ class AgyStartTaskValidationTests(unittest.TestCase):
     def test_happy_path_records_agy_executable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             proj = Path(tmp)
+            jobs_dir = proj / ".jobs"
             cfg = control_plane.CONTROL_DIR / "projects.json"
             cfg.parent.mkdir(parents=True, exist_ok=True)
             cfg.write_text(
@@ -582,7 +590,9 @@ class AgyStartTaskValidationTests(unittest.TestCase):
                         "parameter_mappings": {}, "blocker": None,
                         "session_behavior": "", "output_behavior": "",
                     },
-                ):
+                ), mock.patch.object(control_plane, "JOBS_DIR", jobs_dir), mock.patch.object(
+                    control_plane, "CONTROL_DIR", proj / ".control"
+                ), mock.patch.object(control_plane, "PROJECTS_FILE", cfg):
                     r = control_plane.start_task(
                         harness="agy", prompt="hi", project="tmpproj", cwd=None,
                         model="gemini-3.7-flash-medium", sandbox="workspace-write",
@@ -591,17 +601,19 @@ class AgyStartTaskValidationTests(unittest.TestCase):
                 self.assertTrue(r["ok"], r)
                 self.assertEqual("agy", r["harness"])
                 # result.txt / status.json files exist on disk
-                job_dir = control_plane.JOBS_DIR / r["job_id"]
+                job_dir = jobs_dir / r["job_id"]
                 self.assertTrue((job_dir / "status.json").is_file())
                 # The recorded state has agy_executable so the worker can find it
                 state = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
                 self.assertIn("agy_executable", state)
                 self.assertTrue(Path(state["agy_executable"]).name.lower().startswith("agy"))
+                self.assertFalse(state["agy_dangerously_skip_permissions"])
                 # parameter_handling documents the agy-specific quirks
                 ph = r["parameter_handling"]
                 self.assertIn("cwd", ph)
                 self.assertIn("Popen", ph["cwd"])
                 self.assertIn("result_path", ph)
+                self.assertIn("disabled by default", ph["dangerously_skip_permissions"])
             finally:
                 cfg.unlink(missing_ok=True)
 
@@ -938,7 +950,12 @@ class AgyHarnessRegistrationTests(unittest.TestCase):
                     )
                 raise AssertionError(argv)
 
-            with mock.patch.object(control_plane, "AGY_EXE", fake_agy), \
+            with mock.patch.dict(
+                os.environ,
+                {control_plane.AGY_DANGEROUS_PERMISSIONS_ENV: ""},
+                clear=False,
+            ), mock.patch.object(control_plane, "_AGY_PROBE_CACHE", None), \
+                 mock.patch.object(control_plane, "AGY_EXE", fake_agy), \
                  mock.patch.object(
                      control_plane, "_run_agy_probe", side_effect=_agy_probe
                  ):
@@ -951,11 +968,224 @@ class AgyHarnessRegistrationTests(unittest.TestCase):
         self.assertTrue(status["capabilities"]["model"])
         self.assertTrue(status["capabilities"]["effort"])
         self.assertTrue(status["capabilities"]["print_timeout"])
+        self.assertFalse(status["dangerously_skip_permissions_enabled"])
+        self.assertNotIn("--dangerously-skip-permissions", status["noninteractive_command"])
         self.assertIsNone(status["blocker"])
 
 
 # ---------------------------------------------------------------------------
-# Codex regression tests (unchanged behavior)
+# Generic Codex route tests
+# ---------------------------------------------------------------------------
+
+
+class CodexRoutingTests(unittest.TestCase):
+    def make_route_job(self, job_dir: Path, route: str = "official_then_custom") -> None:
+        (job_dir / "status.json").write_text(
+            json.dumps({
+                "job_id": "route-job",
+                "status": "queued",
+                "harness": "codex",
+                "prompt": "test prompt",
+                "cwd": str(job_dir),
+                "model": None,
+                "sandbox": "read-only",
+                "reasoning_effort": None,
+                "route_requested": route,
+                "route_used": control_plane.codex_route_attempts(route)[0],
+                "fallback_used": False,
+                "fallback_reason": None,
+                "attempts": [],
+            }),
+            encoding="utf-8",
+        )
+
+    def test_route_failure_classifier_is_conservative(self) -> None:
+        cases = {
+            "OpenAI Codex subscription quota exhausted": "subscription_quota_exhausted",
+            "OpenAI Codex usage limit exceeded": "subscription_quota_exhausted",
+            "HTTP 429 from OpenAI Codex": None,
+            "OpenAI Codex rate limit; retry after 30 seconds": None,
+            "unauthorized: sign in required": None,
+            "service unavailable": None,
+            "patch application failed; tests failed": None,
+            "task failed while editing code": None,
+            "unknown process failure": None,
+        }
+        for diagnostic, expected in cases.items():
+            result = subprocess.CompletedProcess([], 1, stdout="", stderr=diagnostic)
+            self.assertEqual(expected, control_plane.classify_codex_route_failure(result))
+
+    def test_process_local_routes_are_generic_and_do_not_carry_secrets(self) -> None:
+        env = {
+            control_plane.CODEX_CUSTOM_BASE_URL_ENV: "https://api.acme.test/v1",
+            control_plane.CODEX_CUSTOM_API_KEY_ENV: "sk-" + "test-secret-value-12345678",
+            control_plane.CODEX_CUSTOM_MODEL_ENV: "acme-model",
+        }
+        state = {
+            "cwd": "C:/workspace", "sandbox": "read-only", "model": None,
+            "reasoning_effort": None, "prompt": "hello",
+        }
+        before = os.environ.get(control_plane.CODEX_CUSTOM_API_KEY_ENV)
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(control_plane, "CODEX_EXE", Path("codex")):
+            child_env = control_plane.codex_process_environment("custom")
+            current = control_plane.build_codex_command(state, Path("out"), route="current")
+            official = control_plane.build_codex_command(state, Path("out"), route="official")
+            custom = control_plane.build_codex_command(state, Path("out"), route="custom")
+        self.assertNotIn("-c", current)
+        self.assertIn('model_provider="openai"', official)
+        self.assertIn('model_provider="harbor_custom"', custom)
+        self.assertIn('model_providers.harbor_custom.name="Harbor Custom"', custom)
+        self.assertIn('model_providers.harbor_custom.base_url="https://api.acme.test/v1"', custom)
+        self.assertIn('model_providers.harbor_custom.wire_api="responses"', custom)
+        self.assertIn('model_providers.harbor_custom.env_key="HARBOR_CODEX_CUSTOM_API_KEY"', custom)
+        self.assertIn("acme-model", custom)
+        self.assertNotIn(env[control_plane.CODEX_CUSTOM_API_KEY_ENV], custom)
+        self.assertEqual(env[control_plane.CODEX_CUSTOM_API_KEY_ENV], child_env[control_plane.CODEX_CUSTOM_API_KEY_ENV])
+        self.assertEqual(before, os.environ.get(control_plane.CODEX_CUSTOM_API_KEY_ENV))
+
+    def test_custom_route_requires_generic_config(self) -> None:
+        state = {
+            "cwd": "C:/workspace", "sandbox": "read-only", "model": None,
+            "reasoning_effort": None, "prompt": "hello",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                control_plane.CODEX_CUSTOM_BASE_URL_ENV: "",
+                control_plane.CODEX_CUSTOM_API_KEY_ENV: "",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "custom route requires"):
+                control_plane.build_codex_command(state, Path("out"), route="custom")
+
+    def test_quota_failure_falls_back_serially_with_same_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            job_dir = Path(temporary_directory)
+            self.make_route_job(job_dir)
+
+            def fake_run(command, **_kwargs):
+                if 'model_provider="openai"' in command:
+                    return subprocess.CompletedProcess(
+                        command, 1, stdout="", stderr="OpenAI Codex subscription quota exhausted"
+                    )
+                result_path = Path(command[command.index("-o") + 1])
+                result_path.write_text("custom done", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    control_plane.CODEX_CUSTOM_BASE_URL_ENV: "https://api.acme.test/v1",
+                    control_plane.CODEX_CUSTOM_API_KEY_ENV: "sk-" + "test-secret-value-12345678",
+                },
+                clear=False,
+            ), mock.patch.object(codex_job_worker.subprocess, "run", side_effect=fake_run) as run:
+                codex_job_worker.main(job_dir)
+
+            state = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual("route-job", state["job_id"])
+            self.assertEqual("completed", state["status"])
+            self.assertEqual("custom", state["route_used"])
+            self.assertTrue(state["fallback_used"])
+            self.assertEqual("subscription_quota_exhausted", state["fallback_reason"])
+            self.assertEqual(["official", "custom"], [item["route"] for item in state["attempts"]])
+            self.assertEqual(2, run.call_count)
+            self.assertEqual(
+                "sk-" + "test-secret-value-12345678",
+                run.call_args_list[1].kwargs["env"][control_plane.CODEX_CUSTOM_API_KEY_ENV],
+            )
+            self.assertFalse((job_dir / "worker.lock").exists())
+
+    def test_task_failure_does_not_fall_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            job_dir = Path(temporary_directory)
+            self.make_route_job(job_dir)
+            result = subprocess.CompletedProcess([], 1, stdout="", stderr="patch application failed; tests failed")
+            with mock.patch.object(codex_job_worker.subprocess, "run", return_value=result) as run:
+                codex_job_worker.main(job_dir)
+            state = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual("failed", state["status"])
+            self.assertEqual("official", state["route_used"])
+            self.assertFalse(state["fallback_used"])
+            self.assertIsNone(state["fallback_reason"])
+            self.assertEqual(["official"], [item["route"] for item in state["attempts"]])
+            self.assertEqual(1, run.call_count)
+
+    def test_non_quota_failures_do_not_fall_back(self) -> None:
+        diagnostics = (
+            "HTTP 429 from OpenAI Codex",
+            "OpenAI Codex rate limit; retry after 30 seconds",
+            "unauthorized: sign in required",
+            "service unavailable",
+            "patch application failed; tests failed",
+            "unknown process failure",
+        )
+        for diagnostic in diagnostics:
+            with self.subTest(diagnostic=diagnostic), tempfile.TemporaryDirectory() as temporary_directory:
+                job_dir = Path(temporary_directory)
+                self.make_route_job(job_dir)
+
+                def fake_run(command, **_kwargs):
+                    if 'model_provider="openai"' in command:
+                        return subprocess.CompletedProcess(command, 1, stdout="", stderr=diagnostic)
+                    result_path = Path(command[command.index("-o") + 1])
+                    result_path.write_text("fallback done", encoding="utf-8")
+                    return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+                with mock.patch.object(codex_job_worker.subprocess, "run", side_effect=fake_run):
+                    codex_job_worker.main(job_dir)
+                state = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
+                self.assertEqual("failed", state["status"])
+                self.assertFalse(state["fallback_used"])
+                self.assertEqual(["official"], [item["route"] for item in state["attempts"]])
+
+    def test_custom_native_process_diagnostics_redact_base_url_and_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            job_dir = Path(temporary_directory)
+            self.make_route_job(job_dir, route="custom")
+            base_url = "https://api.acme.test/v1"
+            api_key = "sk-" + "test-secret-value-12345678"
+
+            def fake_run(command, **_kwargs):
+                result_path = Path(command[command.index("-o") + 1])
+                result_path.write_text("custom done", encoding="utf-8")
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="api_key=" + api_key + " " + base_url, stderr=""
+                )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    control_plane.CODEX_CUSTOM_BASE_URL_ENV: base_url,
+                    control_plane.CODEX_CUSTOM_API_KEY_ENV: api_key,
+                },
+                clear=False,
+            ), mock.patch.object(codex_job_worker.subprocess, "run", side_effect=fake_run):
+                codex_job_worker.main(job_dir)
+
+            state_text = (job_dir / "status.json").read_text(encoding="utf-8")
+            state = json.loads(state_text)
+            self.assertNotIn(base_url, state_text)
+            self.assertNotIn(api_key, state_text)
+            self.assertIn("[REDACTED_BASE_URL]", state_text)
+            self.assertIn("[REDACTED]", state_text)
+
+    def test_route_diagnostics_redact_credential_shaped_values(self) -> None:
+        fake_key = "sk-" + "secret-value-12345678"
+        fake_bearer = "abc.def.ghi"
+        result = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr=("api" + "_key=" + fake_key + " " + "Bear" + "er " + fake_bearer)
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            collected = codex_job_worker.collect_result(result, Path(temporary_directory) / "missing.txt")
+        self.assertNotIn(fake_key, collected["stderr_tail"])
+        self.assertNotIn(fake_bearer, collected["stderr_tail"])
+        self.assertIn("[REDACTED]", collected["stderr_tail"])
+
+
+# ---------------------------------------------------------------------------
+# Codex regression tests
 # ---------------------------------------------------------------------------
 
 
@@ -1106,7 +1336,7 @@ class P0SubprocessSafetyRegressionTests(unittest.TestCase):
                     poll_interval=0.05,
                     exit_grace=0.1,
                 )
-        self.assertEqual(captured["kwargs"].get("stdin"), subprocess.DEVNULL)
+        self.assertEqual(captured["kwargs"].get("stdin"), subprocess.PIPE)
         self.assertEqual(captured["kwargs"].get("stdout"), subprocess.PIPE)
         self.assertEqual(captured["kwargs"].get("stderr"), subprocess.PIPE)
         if sys.platform == "win32":

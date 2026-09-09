@@ -1,4 +1,4 @@
-﻿import os
+import os
 import shutil
 import subprocess
 import tempfile
@@ -7,11 +7,22 @@ from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
+from control_plane import (
+    CODEX_ROUTE_FAILURES,
+    build_codex_command,
+    classify_codex_route_failure,
+    codex_route_attempts,
+    codex_process_environment,
+    codex_route_redaction_values,
+    sanitize_codex_diagnostic,
+    validate_codex_route,
+)
+
 
 CODEX_EXE = Path(os.environ.get("HARBOR_CODEX_EXE") or shutil.which("codex") or ("codex.exe" if os.name == "nt" else "codex"))
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 
-mcp = FastMCP("ChatGPT Harbor")
+mcp = FastMCP("Harness Harbor")
 
 
 @mcp.tool()
@@ -54,6 +65,7 @@ def codex_run(
     cwd: str,
     model: str | None = None,
     sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
+    route: Literal["current", "official", "custom", "official_then_custom"] = "current",
 ) -> dict:
     """Run Codex non-interactively in a specific working directory."""
     workdir = Path(cwd).expanduser().resolve()
@@ -67,32 +79,32 @@ def codex_run(
     fd, output_path = tempfile.mkstemp(prefix="codex-mcp-", suffix=".txt")
     os.close(fd)
 
-    cmd = [
-        str(CODEX_EXE),
-        "exec",
-        "--color",
-        "never",
-        "--sandbox",
-        sandbox,
-        "-C",
-        str(workdir),
-        "-o",
-        output_path,
-    ]
-
-    if model:
-        cmd.extend(["--model", model])
-
-    cmd.append(prompt)
+    route_state = {
+        "cwd": str(workdir), "sandbox": sandbox, "model": model,
+        "prompt": prompt,
+    }
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False,
-        )
+        validate_codex_route(route)
+        result = None
+        for index, attempt_route in enumerate(codex_route_attempts(route)):
+            cmd = build_codex_command(route_state, Path(output_path), route=attempt_route)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+                env=codex_process_environment(attempt_route),
+            )
+            classification = classify_codex_route_failure(result)
+            if not (
+                route == "official_then_custom"
+                and index == 0
+                and classification in CODEX_ROUTE_FAILURES
+            ):
+                break
+        assert result is not None
 
         final_message = ""
         try:
@@ -106,11 +118,23 @@ def codex_run(
         return {
             "ok": result.returncode == 0,
             "exit_code": result.returncode,
-            "final_message": final_message,
-            "stderr": result.stderr[-4000:].strip(),
+            "final_message": sanitize_codex_diagnostic(
+                final_message,
+                redact_values=codex_route_redaction_values(attempt_route),
+            ),
+            "stderr": sanitize_codex_diagnostic(
+                result.stderr,
+                redact_values=codex_route_redaction_values(attempt_route),
+            ),
             "cwd": str(workdir),
         }
 
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "cwd": str(workdir),
+        }
     except subprocess.TimeoutExpired:
         return {
             "ok": False,

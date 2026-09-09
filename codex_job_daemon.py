@@ -1,4 +1,4 @@
-"""ChatGPT Harbor — Multi-harness job daemon scheduler with worker pools.
+"""Harness Harbor — optional multi-harness queue daemon with worker pools.
 
 Per-harness concurrency defaults to 3 (codex=3, minimax=3, agy=3),
 allowing up to 9 concurrent workers across all three harnesses.
@@ -599,7 +599,7 @@ def get_disk_busy_harnesses(jobs_dir: Path = JOBS_DIR) -> set[str]:
 
 
 class HarborScheduler:
-    """Non-blocking multi-lane worker pool scheduler for ChatGPT Harbor jobs."""
+    """Non-blocking multi-lane worker pool dispatcher for Harness Harbor jobs."""
 
     def __init__(
         self,
@@ -776,14 +776,14 @@ class HarborScheduler:
 
 def main() -> None:
     JOBS_DIR.mkdir(exist_ok=True)
-    print(f"ChatGPT Harbor daemon started: {JOBS_DIR}", flush=True)
+    print(f"Harness Harbor daemon started: {JOBS_DIR}", flush=True)
     scheduler = HarborScheduler(jobs_dir=JOBS_DIR)
     try:
         while True:
             scheduler.tick()
             time.sleep(0.5)
     except KeyboardInterrupt:
-        print("ChatGPT Harbor daemon stopped", flush=True)
+        print("Harness Harbor daemon stopped", flush=True)
         scheduler.shutdown(timeout=2.0)
 
 

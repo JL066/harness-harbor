@@ -1,109 +1,219 @@
-# ChatGPT Harbor
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-ChatGPT Harbor is a local MCP control plane that lets you run and supervise coding-agent CLI jobs on your own machine directly from ChatGPT conversations.
+# Harness Harbor
 
-Harbor connects ChatGPT to local Codex, MiniMax, and Antigravity/agy CLIs through MCP. From the chat interface, you can submit jobs, inspect status, poll results, cancel work, and coordinate multiple local agents without switching back and forth between terminals.
+*A lightweight local broker for AI coding harnesses.*
 
-Combined with background scheduling and ChatGPT scheduled tasks, Harbor can also support automated workflows such as: wake up on a schedule, inspect the previous job, decide the next step, submit new work, and continue later without manual terminal supervision.
+Harness Harbor turns locally installed coding harnesses into a reliable worker
+pool for an upstream Supervisor/Agent. MCP is the primary integration surface
+in this public release: the upstream system submits work, and Harbor provides
+a small, disk-backed execution layer for **Probe → Route → Lease → Run →
+Track → Recover**. The Supervisor remains the brain: it owns reasoning,
+planning, acceptance, retry policy, and scheduled or event-driven wake-ups.
+
+> **Current status: Windows-first / validated on Windows.** This public release
+> is implemented and tested for Windows. **macOS: Not yet supported / planned.**
+> macOS has not been implemented or validated for this release.
+
+## Why Harness Harbor?
+
+Coding harnesses often have separate authentication, model catalogs,
+quota/availability signals, and process behavior. A Supervisor should not need
+bespoke glue for every locally installed CLI. Harbor gives an MCP-capable
+upstream system one narrow control surface for discovering harnesses, starting
+work, polling results, and handling local execution state.
+
+## How it fits
 
 ```text
-ChatGPT chat
-    ↓
-OpenAI official tunnel transport
-    ↓
-ChatGPT Harbor (local MCP control plane)
-    ↓
-Codex CLI / MiniMax CLI / Antigravity (agy) CLI
+Supervisor / Agent (reasoning, planning, acceptance, wake-up)
+                         |
+                        MCP
+                         v
+Harness Harbor (Probe · Route · Lease · Run · Track · Recover)
+                         |
+                         v
+                 Codex / AGY / MiniMax
 ```
 
-Harbor is currently Windows-oriented. Runtime job records live under `.jobs/`; routing state and project aliases live under `.control/`. Both are local-only state and should not be committed.
+Harbor is deliberately small and relatively dumb. It does not decide what a
+task means or which result is acceptable. Any upstream system that can call
+MCP can use the current release. Long-running workflows are especially useful
+when that upstream system also has a scheduler, future wake-up mechanism,
+cron/event loop, or equivalent. Harbor itself does not provide that wake-up.
 
 ## What Harbor does
 
-- Control local coding-agent CLI jobs from ChatGPT conversations through MCP.
-- Submit jobs to Codex, MiniMax, or Antigravity/agy and run them in the background.
-- Poll job status and retrieve results without keeping an interactive terminal session open.
-- Cancel jobs and coordinate concurrent work across supported harnesses.
-- Keep runtime state local to the machine running Harbor.
-- Combine with scheduled ChatGPT tasks for recurring or multi-stage automated workflows.
+- **Probe** installed harness integrations and their verified capabilities.
+- **Route** caller-selected work to the current local project/workspace and,
+  for Codex, to a second generic execution route. Harbor does not perform
+  intelligent automatic routing: the Supervisor selects both layers.
+- **Lease** queued work with per-harness concurrency limits and an exclusive
+  workspace lease.
+- **Run** bounded local CLI jobs with supervised subprocess I/O.
+- **Track** job status and results in disk-backed records under `.jobs/` for
+  polling and diagnostics.
+- **Recover** stale reservations and workspace leases after worker or daemon
+  failure/restart.
 
-## Requirements
+The complete MCP server is `server_legacy.py`; its name is retained for source
+compatibility. `server.py` is the smaller Codex-only compatibility server. The
+optional `codex_job_daemon.py` dispatches queued jobs locally; it is an
+execution component, not an upstream reasoning or wake-up service.
 
-Harbor does **not** bundle Codex, MiniMax, Antigravity, or the OpenAI tunnel client.
+## Two-layer routing
 
-Install only the agent CLIs you plan to use:
+The Supervisor controls two independent choices in `task_start`:
 
-- **Codex CLI** for Codex jobs.
-- **MiniMax CLI** for MiniMax jobs.
-- **Antigravity/agy CLI** for Antigravity jobs.
+1. **Harness selection** chooses `codex`, `minimax`, or `agy`.
+2. **Codex route selection** chooses `current`, `official`, `custom`, or
+   `official_then_custom` when the harness is Codex. MiniMax and AGY accept
+   `current` only.
 
-You do not need to install all three. Harbor can use whichever supported CLIs are available on your machine.
+`current` passes through the user's normal Codex CLI configuration. `official`
+adds the process-local Codex override `-c model_provider="openai"`. `custom`
+adds a generic process-local provider named `harbor_custom` with Responses API
+wire mode. Set `HARBOR_CODEX_CUSTOM_BASE_URL` and
+`HARBOR_CODEX_CUSTOM_API_KEY`; `HARBOR_CODEX_CUSTOM_MODEL` is optional. Harbor
+passes the key only through a copied child environment using the provider's
+`env_key`; it never writes the user's Codex config or places the key in argv.
 
-Each CLI must be installed and configured independently with its own account, credentials, provider settings, and other required local configuration. Put the executable on `PATH`, or point Harbor to it with the corresponding `HARBOR_*` environment variable shown in `.env.example`.
+For example, a Supervisor can request `route="official_then_custom"`. Harbor
+tries the subscription-backed `official` route first, then tries the generic
+`custom` route only when the first attempt clearly identifies OpenAI/Codex
+subscription or usage quota exhaustion. Auth errors, ordinary rate limits,
+429s, unknown errors, and task, code, prompt, parser, or test failures do not
+trigger this fallback.
+The job record stores only the requested/used route, sanitized classification,
+and a bounded attempt summary.
 
-To connect ChatGPT to Harbor, you also need OpenAI's official `tunnel-client` / official tunnel transport. Harbor does not include a tunnel executable, profile, or credentials.
+## What Harbor deliberately does not do
+
+- It is not an agent framework, model runtime, or the Supervisor's brain.
+- It does not provide reasoning, planning, result acceptance, memory,
+  personality, or generic orchestration.
+- It does not own scheduled/event-driven wake-ups or the policy for retries.
+- It does not claim universal harness coverage; integrations are explicit and
+  limited to the verified code in this release.
+
+## Example: ChatGPT as a Supervisor
+
+ChatGPT is one concrete integration example, not a dependency or endorsement.
+An MCP-capable ChatGPT workflow could look like this:
+
+1. ChatGPT reasons about the request and plans a stage.
+2. It calls Harbor's MCP `task_start` tool with the selected harness and
+   project/workspace.
+3. It saves the returned `job_id`.
+4. ChatGPT's scheduled wake-up capability revisits the job later and calls
+   `task_poll` when appropriate. Harbor itself does not schedule this wake-up.
+5. ChatGPT inspects the result and decides whether the stage is accepted.
+6. It dispatches the next task or follow-up stage through MCP.
+
+The same execution layer can be used by an MCP-capable Supervisor/Agent,
+including a custom agent or another compatible local workflow. Mentioning
+ChatGPT here does not imply affiliation with or endorsement by OpenAI.
+
+## Supported platform
+
+**Windows-first / validated on Windows.** The current release candidate is
+implemented and tested for Windows, including its process and PowerShell
+launcher behavior. **macOS: Not yet supported / planned** and has not been
+implemented or validated. No macOS setup instructions are provided yet.
+
+## Supported harnesses
+
+The current integrations in code are:
+
+- **Codex**
+- **MiniMax**
+- **Antigravity / AGY**
+
+Each CLI and its credentials/configuration must be installed and configured
+locally. Use the MCP `harness_list` or `harness_status` tools to inspect actual
+local availability and verified capabilities. These are current integrations,
+not a claim of universal coverage or third-party affiliation. Harbor does not
+bundle CLIs, models, credentials, or account access.
 
 ## Setup
 
-1. Install Python 3.11 or newer and create a virtual environment.
-2. Run `python -m pip install -r requirements.txt`.
-3. Install and configure at least one supported agent CLI: Codex, MiniMax, or Antigravity/agy.
-4. Put the CLIs you use on `PATH`, or set the matching `HARBOR_*` variables shown in `.env.example` in the process that launches Harbor.
-5. Run `python server_legacy.py` for the full MCP server. `server.py` is the smaller Codex-only compatibility server.
-6. For background job scheduling, run `start-codex-job-daemon.ps1` separately. It uses `python` unless `HARBOR_PYTHON` selects another interpreter.
-7. Configure OpenAI's official tunnel transport so ChatGPT can reach the local Harbor MCP server.
+The release candidate is for Windows PowerShell and is verified with Python
+3.11 and 3.12.
 
-### ChatGPT tunnel requirement
+1. Create and activate a virtual environment:
 
-Connecting ChatGPT to Harbor's local MCP server requires OpenAI's official `tunnel-client` / official tunnel transport. The tunnel client is an external prerequisite and is not bundled with this repository. Users must obtain and configure their own official tunnel setup, profile, and credentials according to OpenAI's applicable instructions.
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   ```
 
-The included tunnel supervisor is optional convenience tooling and contains no bundled executable, profile, or credentials. `start-tunnel.ps1` refuses to start until its executable and profile settings are provided through environment variables.
+2. Install the runtime dependency:
 
-This project is compatible with OpenAI's tunnel transport but is not endorsed by, affiliated with, or partnered with OpenAI.
+   ```powershell
+   python -m pip install -r requirements.txt
+   ```
 
-### Agent CLI integrations
+3. Put the CLIs you use on `PATH`, or set the matching `HARBOR_*` variables
+   shown in [.env.example](.env.example) in the process that launches Harbor.
+   Harbor does not load `.env.example` automatically. AGY's
+   `--dangerously-skip-permissions` flag is never added by default; set
+   `HARBOR_AGY_DANGEROUSLY_SKIP_PERMISSIONS=1` only after reviewing
+   [SECURITY.md](SECURITY.md).
 
-Harbor integrates with external Codex, MiniMax, and Antigravity/agy command-line tools. These CLIs are separate software and must be installed and configured independently.
+4. Start the complete MCP server:
 
-Harbor invokes the CLI versions of these tools; it does not depend on or control their desktop applications.
+   ```powershell
+   python server_legacy.py
+   ```
 
-These integrations are optional. Install only the CLIs you intend to use and supply their required local configuration and credentials yourself. This project is not endorsed by, affiliated with, certified by, or partnered with those third parties.
+5. For optional background dispatch of queued jobs, run the daemon in a
+   separate PowerShell window:
 
-## Automation
+   ```powershell
+   .\start-codex-job-daemon.ps1
+   ```
 
-Harbor's job daemon can keep queued work running independently of an interactive ChatGPT conversation. When Harbor is combined with scheduled ChatGPT tasks, a conversation can periodically reconnect to the control plane, inspect job state and results, and decide what to do next.
+   It uses `python` unless `HARBOR_PYTHON` selects another interpreter.
 
-A typical multi-stage workflow can look like this:
+## Optional tunnel integration
 
-```text
-Scheduled ChatGPT task
-    ↓
-Check Harbor job status / result
-    ↓
-Review or decide next action
-    ↓
-Submit the next local CLI job
-    ↓
-Harbor daemon runs it in the background
-    ↓
-Next scheduled check continues the workflow
-```
+Use a tunnel only if you choose to connect a remote MCP client to Harbor's
+local server. Local stdio use and the unit suite do not require one. The
+external tunnel client, transport, profile, and credentials are not bundled;
+obtain and configure them separately according to the applicable provider's
+instructions.
 
-This makes Harbor useful not only for one-off remote control from ChatGPT, but also for longer-running supervised development workflows where work can continue across multiple scheduled check-ins.
+The included `start-tunnel.ps1` is convenience tooling only. It refuses to
+start until its executable and profile settings are supplied through
+environment variables, and it contains no bundled executable, profile, or
+credentials.
 
-## Development
+## Development and testing
 
-Run the isolated unit suite without starting Harbor, a tunnel, or the daemon:
+Run the isolated unit suite without starting Harbor, a tunnel, a daemon, or a
+real coding-agent CLI:
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
 The tests use temporary directories and mocked subprocesses for runtime state.
+The GitHub Actions workflow runs the same suite on Windows with Python 3.11
+and 3.12.
 
-## Security and local data
+## Local data and security
 
-Do not commit `.env`, `.jobs/`, `.control/`, logs, CLI configuration files, tunnel profiles, credentials, or diagnostic scripts. Harbor can invoke local agent CLIs and perform filesystem/Git operations, so expose its MCP transport only to clients and networks you trust.
+Runtime records live under `.jobs/`; routing state and project aliases live
+under `.control/`. Both are local-only state and are ignored by Git. Do not
+commit `.env`, runtime directories, logs, CLI configuration files, tunnel
+profiles, credentials, or diagnostic scripts. Harbor can invoke local agent
+CLIs and perform filesystem/Git operations on behalf of its MCP client, so
+expose it only to clients and networks you trust. Read
+[SECURITY.md](SECURITY.md) before connecting Harbor to a real worktree.
+
+Harbor is an independent third-party project. It is not affiliated with,
+endorsed by, or sponsored by OpenAI, the Codex/MiniMax/Antigravity providers,
+or any tunnel provider.
 
 ## License
 
