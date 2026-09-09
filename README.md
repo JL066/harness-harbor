@@ -472,6 +472,14 @@ Harbor can recover stale reservations and workspace leases after worker or daemo
 
 For Codex, the Supervisor can explicitly choose between several execution routes, including controlled fallback between an official provider and a generic custom Responses API provider.
 
+### Authoritative telemetry and quota
+
+Harbor provides a unified, read-only telemetry model (`harness_telemetry`) covering harness status, process activity, and AGY models. Quota is reported only when an authoritative provider source exists; otherwise it is reported unavailable and never guessed.
+
+### Safe Git delivery
+
+Harbor exposes constrained `git_ls_remote`, `git_push_dry_run`, and `git_push_ref` tools for safe branch delivery without exposing generic shell access or accepting credential injection.
+
 ---
 
 ## Harbor is intentionally not an agent framework
@@ -562,6 +570,8 @@ Harbor does not bundle:
 
 Use the MCP tools `harness_list` and `harness_status` to inspect what is actually available on the current machine.
 
+The MCP server also exposes `harness_telemetry` for unified, authoritative inspection of installation state, process activity, and AGY models. Quota is displayed only when an authoritative provider source exists; otherwise it is reported unavailable and never guessed. Lighthouse consumes this authoritative telemetry directly in the UI.
+
 ---
 
 ## Quick Start
@@ -618,6 +628,40 @@ For background dispatch of queued jobs, open another PowerShell window and run:
 
 The launcher uses `python` unless another interpreter is selected through `HARBOR_PYTHON`.
 
+### 7. Optional: launch Lighthouse graphical launcher or package standalone executable
+
+Harness Harbor includes **Lighthouse**, a standalone Windows graphical launcher providing a setup/settings wizard, service lifecycle management, system tray support, log viewer, diagnostics, and background health monitoring.
+
+Start Lighthouse with Python:
+
+```powershell
+python run_launcher.py
+```
+
+or using the PowerShell launcher script:
+
+```powershell
+.\run-launcher.ps1
+```
+
+To package Lighthouse as a standalone Windows executable:
+
+```powershell
+python build_exe.py
+```
+
+Packaging uses `harbor_launcher.spec` and bundles brand icon assets from `launcher/assets/`.
+
+---
+
+## Core + Lighthouse Launcher
+
+This Public RC includes both the Python Core and Lighthouse, a standalone Windows graphical launcher. Lighthouse provides the setup/settings wizard, secure CredentialStore integration, managed tunnel profile/lifecycle, start/stop/restart controls, tray support, log viewing, diagnostics, and a background health monitor. It remains version `1.0.0`; start it with `run_launcher.py` or `run-launcher.ps1`, and package it with `build_exe.py` or `harbor_launcher.spec`. Harbor/Lighthouse icons and runtime packaging assets are included in `launcher/assets/`.
+
+The wizard persists only non-secret settings. Tunnel runtime keys and custom provider keys are stored in Windows Credential Manager and passed only to the relevant child process environment; plaintext fallback is forbidden. Managed tunnel settings use operator-supplied generic HTTPS control configuration and local paths, with no private endpoint or account binding bundled.
+
+Lighthouse consumes Core's authoritative telemetry for Codex, MiniMax, and Antigravity/AGY. It displays verified installation/capability state, activity, and AGY models. Quota is displayed only when an authoritative provider source exists; otherwise it is reported unavailable and never guessed.
+
 ---
 
 ## Connecting ChatGPT to Harbor
@@ -648,9 +692,11 @@ The tunnel client, OpenAI-side configuration, authentication, and permissions ar
 
 Harbor does not bundle tunnel credentials or an OpenAI account configuration.
 
-The included `start-tunnel.ps1` is optional convenience tooling for environments where the external tunnel client has already been configured.
+For environments using managed tunnels, Lighthouse provides managed tunnel profile and lifecycle controls directly from the launcher interface, with tunnel runtime credentials stored securely in Windows Credential Manager without plaintext fallback. All managed tunnel settings use operator-supplied generic HTTPS control configuration and local paths, with no private endpoint or account binding bundled.
 
-It contains no bundled tunnel executable, profile, or credentials.
+The included `start-tunnel.ps1` is optional convenience tooling for headless or command-line environments where the external tunnel client has already been configured.
+
+It refuses to start until its executable and profile settings are supplied through environment variables, and it contains no bundled tunnel executable, profile, or credentials.
 
 A tunnel is unnecessary when the MCP client can already reach Harbor directly or when Harbor is being used locally through an appropriate transport.
 
@@ -778,6 +824,8 @@ Harbor passes the API key only through a copied child-process environment using 
 
 It does not write the key into the user's Codex configuration and does not place the key in command-line arguments.
 
+The custom route is a configurable generic OpenAI-compatible provider. The Public RC contains no personal route, private provider, account binding, or provider-specific fallback configuration.
+
 ### `official_then_custom`
 
 This route first attempts the subscription-backed official provider.
@@ -799,6 +847,19 @@ It does not automatically fall back for:
 Harbor records only the requested and used routes, sanitized classification information, and a bounded attempt summary.
 
 The Supervisor remains responsible for deciding whether the result is acceptable.
+
+---
+
+## Safe Git delivery
+
+The complete MCP server exposes constrained `git_ls_remote`, `git_push_dry_run`, and `git_push_ref` tools for safe branch delivery:
+
+- accept configured remote names only;
+- require credential-free HTTPS push URLs and exact `refs/heads/*` branch refs;
+- reject tags, branch deletions, force pushes, and arbitrary refspecs;
+- verify the expected remote HEAD before push;
+- perform one non-force fast-forward update and verify the resulting remote ref;
+- stream bounded, secret-redacted Git output without exposing a generic shell or credential injection API.
 
 ---
 
@@ -868,7 +929,7 @@ Do not commit:
 - `.control/`;
 - local logs;
 - secret-bearing provider configuration;
-- machine-specific diagnostic artifacts.
+- diagnostic outputs, dumps, reports, or machine-specific artifacts.
 
 AGY's `--dangerously-skip-permissions` flag is never enabled automatically.
 
@@ -879,6 +940,8 @@ HARBOR_AGY_DANGEROUSLY_SKIP_PERMISSIONS=1
 ```
 
 only if you explicitly intend to use that behavior and have reviewed [SECURITY.md](SECURITY.md).
+
+The setup wizard persists only non-secret settings. Tunnel runtime keys and custom provider keys are stored in Windows Credential Manager and passed only to the relevant child process environment; plaintext fallback is forbidden. Managed tunnel settings use operator-supplied generic HTTPS control configuration and local paths, with no private endpoint or account binding bundled.
 
 Read [SECURITY.md](SECURITY.md) before connecting Harbor to important worktrees or exposing its MCP endpoint remotely.
 
@@ -903,12 +966,12 @@ GitHub Actions runs the same unit suite on Windows using supported Python versio
 | Platform | Status |
 | --- | --- |
 | Windows | Supported and validated |
-| macOS | Planned |
+| macOS | Planned (not yet supported) |
 | Linux | Not currently validated |
 
-The current implementation is Windows-first, including its PowerShell launchers and process behavior.
+The current implementation is Windows-first, including its PowerShell launchers, Windows Credential Manager integration, Lighthouse GUI, and process behavior.
 
-macOS support is planned but is not yet implemented or documented.
+macOS support is planned but has not been implemented or validated. No macOS setup instructions are provided yet.
 
 ---
 

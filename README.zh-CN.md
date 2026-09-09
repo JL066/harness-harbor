@@ -470,6 +470,14 @@ Worker 以受控本地进程运行，并具有有边界的执行行为和持久�
 
 对于 Codex，Supervisor 可以显式选择多个执行 route，包括在官方 provider 与通用 custom Responses API provider 之间进行受控 fallback。
 
+### 权威遥测与配额
+
+Harbor 提供统一的只读遥测模型（`harness_telemetry`），涵盖各 harness 状态、进程活动与 AGY 模型列表。仅在存在权威 provider 来源时报告配额；否则明确报告不可用，绝不擅自猜测。
+
+### 安全 Git 交付
+
+Harbor 暴露受限的 `git_ls_remote`、`git_push_dry_run` 和 `git_push_ref` 工具，用于安全分支交付，不暴露通用 shell 访问，也不接受凭据注入。
+
 ---
 
 ## Harbor 刻意不是一个 agent framework
@@ -560,6 +568,8 @@ Harbor 不捆绑：
 
 可以使用 MCP 工具 `harness_list` 和 `harness_status` 检查当前机器上实际可用的 integration。
 
+MCP 服务端还暴露 `harness_telemetry`，用于统一、权威地检查安装状态、进程活动与 AGY 模型列表。仅在存在权威 provider 来源时显示配额；否则报告不可用，绝不擅自猜测。Lighthouse 直接在界面中消费该权威遥测数据。
+
 ---
 
 ## 快速开始
@@ -616,6 +626,40 @@ python server_legacy.py
 
 除非通过 `HARBOR_PYTHON` 指定其他解释器，否则 launcher 使用 `python`。
 
+### 7. 可选：启动 Lighthouse 图形界面或打包独立可执行文件
+
+Harness Harbor 包含 **Lighthouse**，一个独立的 Windows 图形化启动器，提供设置/向导界面、服务生命周期管理、系统托盘、日志查看、诊断以及后台健康监测。
+
+使用 Python 启动 Lighthouse：
+
+```powershell
+python run_launcher.py
+```
+
+或使用 PowerShell 启动脚本：
+
+```powershell
+.\run-launcher.ps1
+```
+
+如需将 Lighthouse 打包为独立的 Windows 可执行文件：
+
+```powershell
+python build_exe.py
+```
+
+打包使用 `harbor_launcher.spec`，并捆绑来自 `launcher/assets/` 的品牌图标资源。
+
+---
+
+## Core 与 Lighthouse Launcher
+
+此 Public RC 包含 Python Core 与 Lighthouse（独立 Windows 图形启动器）。Lighthouse 提供设置/向导界面、安全的 CredentialStore 集成、托管隧道配置与生命周期、启动/停止/重启控制、系统托盘、日志查看、诊断以及后台健康监测。其版本保持为 `1.0.0`；可通过 `run_launcher.py` 或 `run-launcher.ps1` 启动，并可通过 `build_exe.py` 或 `harbor_launcher.spec` 打包。Harbor/Lighthouse 图标及运行时打包资源位于 `launcher/assets/`。
+
+向导仅持久化非敏感配置。隧道运行时密钥和自定义 provider 密钥存储于 Windows Credential Manager，仅传递给相关子进程环境变量；严禁明文回退。托管隧道设置采用操作者提供的通用 HTTPS 控制配置与本地路径，不捆绑私有端点或账户绑定。
+
+Lighthouse 消费 Core 对 Codex、MiniMax 和 Antigravity/AGY 的权威遥测数据。它显示已验证的安装/能力状态、活动状态与 AGY 模型列表。仅在存在权威 provider 来源时显示配额；否则报告不可用，绝不擅自猜测。
+
 ---
 
 ## 将 ChatGPT 连接到 Harbor
@@ -646,9 +690,9 @@ Tunnel client、OpenAI 侧 MCP 配置、认证和权限均位于本仓库之外�
 
 Harbor 不捆绑 tunnel 凭据，也不包含 OpenAI 账户配置。
 
-仓库中的 `start-tunnel.ps1` 只是为已经配置好外部 tunnel client 的环境提供可选便利启动方式。
+对于使用托管隧道的环境，Lighthouse 直接在启动器界面中提供托管隧道 profile 配置与生命周期控制，运行时凭据安全存储于 Windows Credential Manager 中，杜绝明文回退。所有托管隧道设置均采用操作者提供的通用 HTTPS 控制端点与本地路径，不捆绑私有端点或账户绑定。
 
-脚本中不包含 tunnel executable、profile 或凭据。
+随附的 `start-tunnel.ps1` 是面向无头或命令行环境的可选便利工具。它在通过环境变量提供可执行文件和 profile 设置之前会拒绝启动，且不包含任何捆绑的可执行文件、profile 或凭据。
 
 如果上游 MCP client 本身已经能够直接访问 Harbor，或者 Harbor 通过合适 transport 在本地使用，则不需要 tunnel。
 
@@ -776,6 +820,8 @@ Harbor 只通过 provider 的 `env_key` 把 API key 放入复制后的子进程�
 
 它不会把 key 写入用户的 Codex 配置，也不会把 key 放入命令行参数。
 
+自定义路由是可配置的通用兼容 OpenAI provider。此 Public RC 不包含个人路由、私有 provider、账户绑定或特定 provider 的回退配置。
+
 ### `official_then_custom`
 
 该 route 首先尝试 subscription-backed 的 official provider。
@@ -797,6 +843,19 @@ Harbor 只通过 provider 的 `env_key` 把 API key 放入复制后的子进程�
 Harbor 只记录请求 route、实际使用 route、脱敏后的 classification 信息以及有边界的 attempt summary。
 
 结果是否可接受，仍然由 Supervisor 决定。
+
+---
+
+## 安全 Git 交付
+
+完整 MCP 服务端暴露受限的 `git_ls_remote`、`git_push_dry_run` 和 `git_push_ref` 工具，用于安全的分支交付：
+
+- 仅接受已配置的远程名称；
+- 要求无凭据的 HTTPS push URL 和精确的 `refs/heads/*` 分支引用；
+- 拒绝 tag、分支删除、强制推送（force push）和任意 refspec；
+- 在推送前校验预期的远程 HEAD；
+- 执行单次非强制的快进更新，并校验最终的远程分支引用；
+- 流式传输受限且脱敏机密信息的 Git 输出，不提供通用 shell 或凭据注入 API。
 
 ---
 
@@ -866,7 +925,7 @@ Harness Harbor 可以让功能强大的 coding-agent CLI 对真实本地仓库�
 - `.control/`；
 - 本地日志；
 - 含有秘密信息的 provider 配置；
-- 与单台机器绑定的诊断产物。
+- 诊断输出、转储、报告或与单台机器绑定的诊断产物。
 
 AGY 的 `--dangerously-skip-permissions` 默认绝不会自动启用。
 
@@ -875,6 +934,8 @@ AGY 的 `--dangerously-skip-permissions` 默认绝不会自动启用。
 ```text
 HARBOR_AGY_DANGEROUSLY_SKIP_PERMISSIONS=1
 ```
+
+设置向导仅持久化非敏感配置。隧道运行时密钥和自定义 provider 密钥安全存储于 Windows Credential Manager 中，且仅注入到相关子进程环境中；严禁明文回退。托管隧道设置采用操作者提供的通用 HTTPS 控制配置与本地路径，不捆绑私有端点或账户绑定。
 
 在把 Harbor 连接到重要 worktree 或远程暴露 MCP endpoint 之前，请阅读 [SECURITY.md](SECURITY.md)。
 
@@ -899,12 +960,12 @@ GitHub Actions 会在支持的 Python 版本上运行同一套 Windows 测试。
 | 平台 | 状态 |
 | --- | --- |
 | Windows | 已支持并验证 |
-| macOS | 计划中 / 开发中 |
-| Linux | 当前尚未验证 |
+| macOS | 计划中（尚未支持） |
+| Linux | 目前未验证 |
 
-当前实现仍然是 Windows-first，其中包括 PowerShell launcher 和部分进程行为。
+当前实现以 Windows 为首要平台，包括其 PowerShell 启动脚本、Windows Credential Manager 集成、Lighthouse 图形界面以及进程行为。
 
-macOS 适配正在开发，但在完成实机验收并合入稳定线之前，不应视为正式支持。
+macOS 支持已在计划中，但尚未实现或验证，本版本暂不提供 macOS 设置说明。
 
 ---
 

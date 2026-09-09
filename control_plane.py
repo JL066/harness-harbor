@@ -163,6 +163,7 @@ SANDBOXES = {"read-only", "workspace-write"}
 MAX_TEXT_BYTES = 200_000
 MAX_DIRECTORY_ENTRIES = 5_000
 MAX_GIT_OUTPUT = 50_000
+GIT_DELIVERY_TIMEOUT_SECONDS = 30
 MAX_SUBPROCESS_OUTPUT_BYTES = 2_000_000
 BINARY_SNIFF_BYTES = 8_192
 JOB_ID_RE = re.compile(r"^[0-9a-zA-Z_\-]+$")
@@ -1035,6 +1036,201 @@ def git_commit_result(repo: str, message: str) -> dict:
         return {"repo_root": str(root), **result}
     except (OSError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Constrained host-side Git delivery
+# ---------------------------------------------------------------------------
+
+_GIT_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_GIT_REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_GIT_DELIVERY_REF_RE = re.compile(
+    r"^refs/heads/(?!.*//)(?!.*\.\.)(?!.*(?:^|/)\.{1,2}(?:/|$))[A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9_-])?$"
+)
+_GIT_CREDENTIAL_URL_RE = re.compile(r"(?i)(https?://)[^/\s@]+@")
+_GIT_CREDENTIAL_VALUE_RE = re.compile(
+    r"(?i)\b(authorization|token|password|passwd|pat|api[_-]?key|secret)\b\s*([=:])\s*[^\s,;]+"
+)
+_GIT_BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
+_GIT_TOKEN_SHAPE_RE = re.compile(
+    r"(?i)\b(?:gh[pousr]_[a-z0-9_]{20,}|github_pat_[a-z0-9_]{20,}|glpat-[a-z0-9_-]{20,}|akia[0-9a-z]{16})\b"
+)
+
+
+def _redact_git_delivery_text(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = _GIT_CREDENTIAL_URL_RE.sub(r"\1<redacted>@", value)
+    value = _GIT_BEARER_RE.sub("Bearer <redacted>", value)
+    value = _GIT_CREDENTIAL_VALUE_RE.sub(r"\1\2<redacted>", value)
+    return _GIT_TOKEN_SHAPE_RE.sub("<redacted>", value)
+
+
+def _sanitize_git_delivery_argv(argv: list[str]) -> list[str]:
+    return ["<configured-https-remote>" if arg.lower().startswith("https://") else arg for arg in argv]
+
+
+def _git_delivery_failure(message: str, *, operation: str, dry_run: bool = False, pushed: bool = False, **extra: Any) -> dict:
+    return {**extra, "ok": False, "error": _redact_git_delivery_text(message), "operation": operation, "dry_run": dry_run, "pushed": pushed}
+
+
+class _GitDeliveryError(ValueError):
+    def __init__(self, message: str, result: dict):
+        super().__init__(message)
+        self.result = result
+
+
+def _validate_git_delivery_ref(value: str, *, field: str) -> str:
+    if not isinstance(value, str) or not _GIT_DELIVERY_REF_RE.fullmatch(value):
+        raise ValueError(f"{field} must be one explicit branch ref under refs/heads/")
+    return value
+
+
+def _validate_expected_remote_head(value: str) -> str:
+    if not isinstance(value, str) or not _GIT_COMMIT_SHA_RE.fullmatch(value):
+        raise ValueError("expected_remote_head must be a full 40-hex commit SHA; new branches are not supported")
+    return value.lower()
+
+
+def _validate_git_delivery_remote_name(value: str) -> str:
+    if not isinstance(value, str) or not _GIT_REMOTE_NAME_RE.fullmatch(value):
+        raise ValueError("remote must be an existing simple configured remote name")
+    return value
+
+
+def _validate_git_delivery_https_url(value: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 2048 or any(ord(ch) < 32 or ch.isspace() for ch in value):
+        raise ValueError("configured remote URL is invalid")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("configured remote URL is invalid") from exc
+    host = parsed.hostname
+    lower_host = host.lower().rstrip(".") if host else ""
+    if (parsed.scheme.lower() != "https" or not host or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or port not in (None, 443)
+            or lower_host == "localhost" or lower_host.endswith(".localhost") or lower_host.endswith(".local")
+            or re.fullmatch(r"\d+(?:\.\d+){3}", lower_host) or ":" in lower_host
+            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", lower_host)):
+        raise ValueError("configured remote must use a credential-free HTTPS URL")
+    return value
+
+
+def _git_delivery_command(args: list[str], root: Path) -> dict:
+    raw = _run_git(args, root, timeout=GIT_DELIVERY_TIMEOUT_SECONDS)
+    result = {"ok": bool(raw.get("ok")), "argv": _sanitize_git_delivery_argv(list(raw.get("argv", []))),
+              "stdout": _redact_git_delivery_text(str(raw.get("stdout", ""))),
+              "stderr": _redact_git_delivery_text(str(raw.get("stderr", ""))), "exit_code": raw.get("exit_code"),
+              "truncated": bool(raw.get("truncated", False))}
+    if raw.get("error"):
+        result["error"] = _redact_git_delivery_text(str(raw["error"]))
+    return result
+
+
+def _resolve_git_delivery_remote(root: Path, remote: str) -> tuple[str, dict]:
+    result = _git_delivery_command(["remote", "get-url", "--push", remote], root)
+    if not result["ok"]:
+        raise _GitDeliveryError("configured remote could not be resolved", result)
+    lines = result["stdout"].splitlines()
+    if len(lines) != 1 or not lines[0].strip():
+        raise ValueError("configured remote URL is invalid")
+    return _validate_git_delivery_https_url(lines[0].strip()), result
+
+
+def _read_exact_git_delivery_head(root: Path, remote_url: str, dst_ref: str) -> tuple[str | None, dict]:
+    result = _git_delivery_command(["ls-remote", "--refs", "--exit-code", remote_url, dst_ref], root)
+    if not result["ok"]:
+        if result.get("exit_code") == 2:
+            return None, result
+        raise _GitDeliveryError(result.get("error") or "remote ref lookup failed", result)
+    lines = [line for line in result["stdout"].splitlines() if line]
+    if len(lines) != 1:
+        raise ValueError("remote ref lookup did not return exactly one ref")
+    try:
+        object_id, returned_ref = lines[0].split("\t", 1)
+    except ValueError as exc:
+        raise ValueError("remote ref lookup returned malformed output") from exc
+    if returned_ref != dst_ref or not _GIT_COMMIT_SHA_RE.fullmatch(object_id):
+        raise ValueError("remote ref lookup returned malformed output")
+    return object_id.lower(), result
+
+
+def _resolve_git_delivery_source(root: Path, src_ref: str) -> tuple[str, dict]:
+    result = _git_delivery_command(["rev-parse", "--verify", f"{src_ref}^{{commit}}"], root)
+    if not result["ok"]:
+        raise _GitDeliveryError("source branch could not be resolved to a commit", result)
+    object_id = result["stdout"].strip()
+    if not _GIT_COMMIT_SHA_RE.fullmatch(object_id):
+        raise ValueError("source branch did not resolve to a full commit SHA")
+    return object_id.lower(), result
+
+
+def git_ls_remote_result(repo: str, remote: str, ref: str) -> dict:
+    operation = "git_ls_remote"
+    try:
+        root = resolve_repo(repo); remote = _validate_git_delivery_remote_name(remote); ref = _validate_git_delivery_ref(ref, field="ref")
+        remote_url, _ = _resolve_git_delivery_remote(root, remote); before_head, command = _read_exact_git_delivery_head(root, remote_url, ref)
+        if before_head is None:
+            return _git_delivery_failure("remote branch does not exist; new branches are not supported", operation=operation, repo_root=str(root), remote=remote, ref=ref, before_head=None, after_head=None, **command)
+        return {"ok": True, "operation": operation, "dry_run": False, "pushed": False, "repo_root": str(root), "remote": remote, "ref": ref, "before_head": before_head, "after_head": before_head, **command}
+    except _GitDeliveryError as exc:
+        return _git_delivery_failure(str(exc), operation=operation, **exc.result)
+    except (OSError, ValueError) as exc:
+        return _git_delivery_failure(str(exc), operation=operation)
+
+
+def _prepare_git_push(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str, *, operation: str):
+    try:
+        root = resolve_repo(repo); remote = _validate_git_delivery_remote_name(remote); src_ref = _validate_git_delivery_ref(src_ref, field="src_ref"); dst_ref = _validate_git_delivery_ref(dst_ref, field="dst_ref"); expected_remote_head = _validate_expected_remote_head(expected_remote_head)
+        remote_url, _ = _resolve_git_delivery_remote(root, remote); before_head, lookup = _read_exact_git_delivery_head(root, remote_url, dst_ref)
+        if before_head != expected_remote_head:
+            return _git_delivery_failure("remote destination head differs from expected_remote_head (concurrent drift or new branch)", operation=operation, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, expected_remote_head=expected_remote_head, before_head=before_head, after_head=before_head, **lookup)
+        source_head, _ = _resolve_git_delivery_source(root, src_ref)
+        return root, remote, remote_url, src_ref, dst_ref, source_head, {"expected_remote_head": expected_remote_head, "before_head": before_head}
+    except _GitDeliveryError as exc:
+        return _git_delivery_failure(str(exc), operation=operation, **exc.result)
+    except (OSError, ValueError) as exc:
+        return _git_delivery_failure(str(exc), operation=operation)
+
+
+def git_push_dry_run_result(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str) -> dict:
+    operation = "git_push_dry_run"; prepared = _prepare_git_push(repo, remote, src_ref, dst_ref, expected_remote_head, operation=operation)
+    if isinstance(prepared, dict): return prepared
+    root, remote, remote_url, src_ref, dst_ref, source_head, metadata = prepared
+    command = _git_delivery_command(["push", "--dry-run", remote_url, f"{src_ref}:{dst_ref}"], root)
+    if not command["ok"]:
+        return _git_delivery_failure(command.get("error") or "git push --dry-run failed", operation=operation, dry_run=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=metadata["before_head"], **metadata, **command)
+    return {"ok": True, "operation": operation, "dry_run": True, "pushed": False, "repo_root": str(root), "remote": remote, "src_ref": src_ref, "dst_ref": dst_ref, "source_head": source_head, "after_head": metadata["before_head"], **metadata, **command}
+
+
+def git_push_ref_result(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str) -> dict:
+    operation = "git_push_ref"; prepared = _prepare_git_push(repo, remote, src_ref, dst_ref, expected_remote_head, operation=operation)
+    if isinstance(prepared, dict): return prepared
+    root, remote, remote_url, src_ref, dst_ref, source_head, metadata = prepared
+    dry_run = _git_delivery_command(["push", "--dry-run", remote_url, f"{src_ref}:{dst_ref}"], root)
+    if not dry_run["ok"]:
+        return _git_delivery_failure(dry_run.get("error") or "git push --dry-run failed", operation=operation, dry_run=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=metadata["before_head"], **metadata, **dry_run)
+    try:
+        fresh_remote_url, _ = _resolve_git_delivery_remote(root, remote)
+        if fresh_remote_url != remote_url: raise ValueError("configured remote URL changed during delivery")
+        fresh_head, fresh_lookup = _read_exact_git_delivery_head(root, fresh_remote_url, dst_ref)
+        if fresh_head != metadata["expected_remote_head"]:
+            return _git_delivery_failure("remote destination head differs from expected_remote_head immediately before push", operation=operation, dry_run=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, expected_remote_head=metadata["expected_remote_head"], before_head=fresh_head, after_head=fresh_head, **fresh_lookup)
+    except _GitDeliveryError as exc:
+        return _git_delivery_failure(str(exc), operation=operation, dry_run=True, **exc.result)
+    except (OSError, ValueError):
+        return _git_delivery_failure("pre-push remote validation failed", operation=operation, dry_run=True)
+    command = _git_delivery_command(["push", fresh_remote_url, f"{src_ref}:{dst_ref}"], root)
+    if not command["ok"]:
+        return _git_delivery_failure(command.get("error") or "git push failed", operation=operation, dry_run=False, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=fresh_head, **metadata, **command)
+    try: after_head, verification = _read_exact_git_delivery_head(root, fresh_remote_url, dst_ref)
+    except (_GitDeliveryError, OSError, ValueError) as exc:
+        details = exc.result if isinstance(exc, _GitDeliveryError) else {}
+        return _git_delivery_failure(str(exc), operation=operation, dry_run=False, pushed=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=None, **metadata, **details)
+    if after_head != source_head:
+        return _git_delivery_failure("push completed but post-push remote head verification did not match source_head", operation=operation, dry_run=False, pushed=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=after_head, **metadata, **verification)
+    return {"ok": True, "operation": operation, "dry_run": False, "pushed": True, "repo_root": str(root), "remote": remote, "src_ref": src_ref, "dst_ref": dst_ref, "source_head": source_head, "after_head": after_head, **metadata, **command}
 
 
 def _minimax_cli_candidates() -> list[Path]:

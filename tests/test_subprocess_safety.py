@@ -365,7 +365,8 @@ class EventLoopResponsivenessTests(unittest.TestCase):
 
         tool_names = {
             "git_status", "git_diff", "git_branch", "git_log",
-            "git_worktree_list", "git_rev_parse", "git_add", "git_commit",
+            "git_worktree_list", "git_rev_parse", "git_add", "git_commit", "git_ls_remote",
+            "git_push_dry_run", "git_push_ref",
             "codex_status", "codex_run", "codex_start",
             "harness_list", "harness_status", "task_start",
         }

@@ -411,7 +411,8 @@ class ControlPlaneTests(unittest.TestCase):
             "harness_list", "harness_status", "task_start", "task_poll", "task_cancel",
             "project_list", "project_resolve", "file_read", "file_write", "file_append",
             "file_stat", "directory_list", "git_status", "git_diff", "git_branch", "git_log",
-            "git_worktree_list", "git_rev_parse", "git_add", "git_commit",
+            "git_worktree_list", "git_rev_parse", "git_add", "git_commit", "git_ls_remote",
+            "git_push_dry_run", "git_push_ref",
         }.issubset(names))
 
 
