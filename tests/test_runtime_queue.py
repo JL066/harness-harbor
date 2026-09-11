@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from runtime_queue import queue_root_matches, resolve_queue_root
 
@@ -22,9 +23,20 @@ class RuntimeQueueTests(unittest.TestCase):
 
     def test_mismatched_queue_identity_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = resolve_queue_root(Path(tmp) / "project", {})
-            other = resolve_queue_root(Path(tmp) / "other", {})
+            root = resolve_queue_root(Path(tmp), {"HARBOR_JOBS_DIR": tmp + "/one"})
+            other = resolve_queue_root(Path(tmp), {"HARBOR_JOBS_DIR": tmp + "/two"})
             self.assertFalse(queue_root_matches({"queue_root_fingerprint": other.fingerprint}, root))
+
+    def test_macos_direct_and_app_entrypoints_share_default_queue(self):
+        from harbor_platform.paths import PlatformPaths
+        with tempfile.TemporaryDirectory() as tmp, patch("sys.platform", "darwin"):
+            env = {"HARBOR_USER_SETTINGS_DIR": tmp}
+            expected = PlatformPaths(Path(tmp), env).jobs_dir()
+            for project in (Path(tmp) / "source", Path(tmp) / "app/Resources"):
+                self.assertEqual(resolve_queue_root(project, env).path, expected)
+                self.assertEqual(resolve_queue_root(project, PlatformPaths(project, env).environment()).path, expected)
+        with patch("sys.platform", "win32"):
+            self.assertEqual(resolve_queue_root(Path.cwd(), {}).path, Path.cwd() / ".jobs")
 
 
 if __name__ == "__main__":

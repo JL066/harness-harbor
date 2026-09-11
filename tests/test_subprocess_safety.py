@@ -222,7 +222,7 @@ class StdinIsolationTests(unittest.TestCase):
             def wait(self, timeout=None):
                 return 0
 
-        with mock.patch.object(control_plane.subprocess, "Popen", _FakePopen):
+        with mock.patch("harbor_platform.process.spawn_owned", _FakePopen):
             control_plane.run_safe_subprocess([sys.executable, "--version"], timeout=1.0)
 
         self.assertEqual(captured["kwargs"].get("stdin"), subprocess.DEVNULL)
@@ -365,7 +365,8 @@ class EventLoopResponsivenessTests(unittest.TestCase):
 
         tool_names = {
             "git_status", "git_diff", "git_branch", "git_log",
-            "git_worktree_list", "git_rev_parse", "git_add", "git_commit",
+            "git_worktree_list", "git_rev_parse", "git_add", "git_commit", "git_ls_remote",
+            "git_push_dry_run", "git_push_ref",
             "codex_status", "codex_run", "codex_start",
             "harness_list", "harness_status", "task_start",
         }

@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -23,55 +24,31 @@ from urllib.parse import urlsplit
 
 from harness_process_adapter import default_process_activity_adapter
 from harness_telemetry import HarnessTelemetryProvider
-from runtime_queue import QueueRoot, queue_root_matches, resolve_queue_root
+from runtime_queue import QueueRoot, describe_queue_root, queue_root_matches, resolve_queue_root
+from harbor_platform import process as platform_process
 
 
 def _is_pid_alive(pid: int) -> bool:
-    """Check if a process ID is currently active in the operating system."""
-    if pid <= 0:
-        return False
-    if sys.platform == "win32":
-        try:
-            import ctypes
-
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            SYNCHRONIZE = 0x00100000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid
-            )
-            if not handle:
-                return False
-            exit_code = ctypes.c_ulong()
-            ctypes.windll.kernel32.GetExitCodeProcess(
-                handle, ctypes.byref(exit_code)
-            )
-            ctypes.windll.kernel32.CloseHandle(handle)
-            STILL_ACTIVE = 259
-            return bool(exit_code.value == STILL_ACTIVE)
-        except Exception:
-            try:
-                os.kill(pid, 0)
-                return True
-            except (OSError, ProcessLookupError, PermissionError) as exc:
-                return isinstance(exc, PermissionError)
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, OSError):
-            return False
+    from harbor_platform.process import is_alive
+    return is_alive(pid)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 QUEUE_ROOT: QueueRoot = resolve_queue_root(PROJECT_ROOT)
 JOBS_DIR = QUEUE_ROOT.path
-CONTROL_DIR = PROJECT_ROOT / ".control"
+CONTROL_DIR = Path(os.environ.get("HARBOR_CONTROL_DIR") or (
+    str(Path(os.environ["HARBOR_STATE_DIR"]) / "control")
+    if os.environ.get("HARBOR_STATE_DIR") else str(PROJECT_ROOT / ".control")))
+if not CONTROL_DIR.is_absolute():
+    raise ValueError("HARBOR_CONTROL_DIR must be an absolute path")
 PROJECTS_FILE = CONTROL_DIR / "projects.json"
 BACKUPS_DIR = CONTROL_DIR / "backups"
 
 CODEX_EXE = Path(os.environ.get("HARBOR_CODEX_EXE") or shutil.which("codex") or ("codex.exe" if os.name == "nt" else "codex"))
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 CODEX_ROUTES = frozenset({"current", "official", "custom", "official_then_custom"})
+CODEX_DEFAULT_MODEL = "gpt-5.6-sol"
+CODEX_DEFAULT_REASONING_EFFORT = "medium"
 CODEX_CUSTOM_BASE_URL_ENV = "HARBOR_CODEX_CUSTOM_BASE_URL"
 CODEX_CUSTOM_API_KEY_ENV = "HARBOR_CODEX_CUSTOM_API_KEY"
 CODEX_CUSTOM_MODEL_ENV = "HARBOR_CODEX_CUSTOM_MODEL"
@@ -84,7 +61,6 @@ _CODEX_SECRET_DIAGNOSTIC_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
     re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}\b"),
 )
-MINIMAX_EXE = Path(os.environ.get("HARBOR_MINIMAX_EXE") or shutil.which("minimax") or ("minimax.exe" if os.name == "nt" else "minimax"))
 MINIMAX_CLI_EXE = Path(os.environ.get("HARBOR_MINIMAX_CLI_EXE") or shutil.which("mcode") or ("mcode.cmd" if os.name == "nt" else "mcode"))
 MINIMAX_CONFIG = Path(os.environ.get("HARBOR_MINIMAX_CONFIG") or Path.home() / ".minimax-code" / "config.json")
 AGY_EXE = Path(os.environ.get("HARBOR_AGY_EXE") or shutil.which("agy") or ("agy.exe" if os.name == "nt" else "agy"))
@@ -163,6 +139,7 @@ SANDBOXES = {"read-only", "workspace-write"}
 MAX_TEXT_BYTES = 200_000
 MAX_DIRECTORY_ENTRIES = 5_000
 MAX_GIT_OUTPUT = 50_000
+GIT_DELIVERY_TIMEOUT_SECONDS = 30
 MAX_SUBPROCESS_OUTPUT_BYTES = 2_000_000
 BINARY_SNIFF_BYTES = 8_192
 JOB_ID_RE = re.compile(r"^[0-9a-zA-Z_\-]+$")
@@ -385,11 +362,65 @@ def _make_safe_popen_kwargs(
     }
     if IS_WINDOWS:
         kwargs["creationflags"] = _WIN_CREATION_FLAGS
+    else:
+        kwargs["start_new_session"] = True
     return kwargs
 
 
+def _posix_descendant_pids(root_pid: int) -> list[int]:
+    """Return a best-effort bottom-up snapshot of a POSIX process tree."""
+    # ponytail: one ps snapshot can miss a child born after it; process-group
+    # isolation is the upgrade path if launcher validation needs stronger guarantees.
+    if IS_WINDOWS:
+        return []
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        try:
+            pid, parent_pid = (int(fields[0]), int(fields[1]))
+        except ValueError:
+            continue
+        children.setdefault(parent_pid, []).append(pid)
+
+    descendants: list[int] = []
+    pending = [root_pid]
+    seen = {root_pid}
+    while pending:
+        parent_pid = pending.pop()
+        for pid in children.get(parent_pid, ()):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            descendants.append(pid)
+            pending.append(pid)
+    descendants.reverse()
+    return descendants
+
+
+def _signal_pids(pids: list[int], signum: signal.Signals) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signum)
+        except (OSError, ProcessLookupError):
+            pass
+
+
 def _escalate_terminate(proc: subprocess.Popen, argv: list[str]) -> None:
-    """Terminate ``proc`` and (on Windows) its entire process tree.
+    """Terminate ``proc`` and its descendants.
 
     Never raises. Intended to be called from a finally block or after a
     timeout, so it must always succeed at reaping or at least attempting
@@ -409,34 +440,38 @@ def _escalate_terminate(proc: subprocess.Popen, argv: list[str]) -> None:
     pid = proc.pid
     if pid is None:
         return
+    if isinstance(getattr(proc, "_harbor_identity", None), dict) or not IS_WINDOWS and getattr(proc, "_harbor_pgid", None) == pid:
+        platform_process.terminate_tree(proc)
+        return
 
     # 1. SIGTERM-equivalent (TerminateProcess on Windows). On Windows
     #    the immediate Popen child may die while its descendants
     #    survive; we keep this step for the non-Windows code path
     #    where ``proc.terminate()`` is sufficient.
+    descendants = _posix_descendant_pids(pid)
     if not IS_WINDOWS:
+        _signal_pids(descendants, signal.SIGTERM)
         try:
             if proc.poll() is None:
                 proc.terminate()
             try:
                 proc.wait(timeout=0.5)
-                return
             except subprocess.TimeoutExpired:
                 pass
         except (OSError, ProcessLookupError):
-            return
+            pass
 
         # 2. SIGKILL-equivalent (still best-effort; some processes can resist)
+        _signal_pids(descendants, signal.SIGKILL)
         try:
             if proc.poll() is None:
                 proc.kill()
             try:
                 proc.wait(timeout=0.5)
-                return
             except subprocess.TimeoutExpired:
                 pass
         except (OSError, ProcessLookupError):
-            return
+            pass
 
     # 3. Windows: ALWAYS run ``taskkill /T /F /PID <pid>`` first, then
     #    optionally escalate. /T walks the child tree; /F forces.
@@ -525,7 +560,7 @@ def run_safe_subprocess(
     popen_kwargs = _make_safe_popen_kwargs(env=env, cwd=cwd)
     if input is not None:
         popen_kwargs["stdin"] = subprocess.PIPE
-    proc = subprocess.Popen(argv, **popen_kwargs)
+    proc = platform_process.spawn_owned(argv, **popen_kwargs)
 
     stdout_bytes = bytearray()
     stderr_bytes = bytearray()
@@ -565,6 +600,8 @@ def run_safe_subprocess(
                 proc.wait(timeout=0.5)
         except Exception:
             pass
+        if isinstance(getattr(proc, "_harbor_identity", None), dict) or not IS_WINDOWS and getattr(proc, "_harbor_pgid", None) == proc.pid:
+            platform_process.terminate_tree(proc)
     out_thread.join(timeout=1.0)
     err_thread.join(timeout=1.0)
     for stream in (stdout_stream, stderr_stream):
@@ -968,7 +1005,7 @@ def git_diff_result(repo: str, staged: bool = False, paths: list[str] | None = N
 
 
 def git_branch_result(repo: str) -> dict:
-    return git_command(repo, ["branch", "--show-current"])
+    return git_command(repo, ["rev-parse", "--abbrev-ref", "HEAD"])
 
 
 def git_log_result(repo: str, count: int = 10) -> dict:
@@ -1035,6 +1072,201 @@ def git_commit_result(repo: str, message: str) -> dict:
         return {"repo_root": str(root), **result}
     except (OSError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Constrained host-side Git delivery
+# ---------------------------------------------------------------------------
+
+_GIT_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_GIT_REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_GIT_DELIVERY_REF_RE = re.compile(
+    r"^refs/heads/(?!.*//)(?!.*\.\.)(?!.*(?:^|/)\.{1,2}(?:/|$))[A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9_-])?$"
+)
+_GIT_CREDENTIAL_URL_RE = re.compile(r"(?i)(https?://)[^/\s@]+@")
+_GIT_CREDENTIAL_VALUE_RE = re.compile(
+    r"(?i)\b(authorization|token|password|passwd|pat|api[_-]?key|secret)\b\s*([=:])\s*[^\s,;]+"
+)
+_GIT_BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
+_GIT_TOKEN_SHAPE_RE = re.compile(
+    r"(?i)\b(?:gh[pousr]_[a-z0-9_]{20,}|github_pat_[a-z0-9_]{20,}|glpat-[a-z0-9_-]{20,}|akia[0-9a-z]{16})\b"
+)
+
+
+def _redact_git_delivery_text(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = _GIT_CREDENTIAL_URL_RE.sub(r"\1<redacted>@", value)
+    value = _GIT_BEARER_RE.sub("Bearer <redacted>", value)
+    value = _GIT_CREDENTIAL_VALUE_RE.sub(r"\1\2<redacted>", value)
+    return _GIT_TOKEN_SHAPE_RE.sub("<redacted>", value)
+
+
+def _sanitize_git_delivery_argv(argv: list[str]) -> list[str]:
+    return ["<configured-https-remote>" if arg.lower().startswith("https://") else arg for arg in argv]
+
+
+def _git_delivery_failure(message: str, *, operation: str, dry_run: bool = False, pushed: bool = False, **extra: Any) -> dict:
+    return {**extra, "ok": False, "error": _redact_git_delivery_text(message), "operation": operation, "dry_run": dry_run, "pushed": pushed}
+
+
+class _GitDeliveryError(ValueError):
+    def __init__(self, message: str, result: dict):
+        super().__init__(message)
+        self.result = result
+
+
+def _validate_git_delivery_ref(value: str, *, field: str) -> str:
+    if not isinstance(value, str) or not _GIT_DELIVERY_REF_RE.fullmatch(value):
+        raise ValueError(f"{field} must be one explicit branch ref under refs/heads/")
+    return value
+
+
+def _validate_expected_remote_head(value: str) -> str:
+    if not isinstance(value, str) or not _GIT_COMMIT_SHA_RE.fullmatch(value):
+        raise ValueError("expected_remote_head must be a full 40-hex commit SHA; new branches are not supported")
+    return value.lower()
+
+
+def _validate_git_delivery_remote_name(value: str) -> str:
+    if not isinstance(value, str) or not _GIT_REMOTE_NAME_RE.fullmatch(value):
+        raise ValueError("remote must be an existing simple configured remote name")
+    return value
+
+
+def _validate_git_delivery_https_url(value: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 2048 or any(ord(ch) < 32 or ch.isspace() for ch in value):
+        raise ValueError("configured remote URL is invalid")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("configured remote URL is invalid") from exc
+    host = parsed.hostname
+    lower_host = host.lower().rstrip(".") if host else ""
+    if (parsed.scheme.lower() != "https" or not host or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or port not in (None, 443)
+            or lower_host == "localhost" or lower_host.endswith(".localhost") or lower_host.endswith(".local")
+            or re.fullmatch(r"\d+(?:\.\d+){3}", lower_host) or ":" in lower_host
+            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", lower_host)):
+        raise ValueError("configured remote must use a credential-free HTTPS URL")
+    return value
+
+
+def _git_delivery_command(args: list[str], root: Path) -> dict:
+    raw = _run_git(args, root, timeout=GIT_DELIVERY_TIMEOUT_SECONDS)
+    result = {"ok": bool(raw.get("ok")), "argv": _sanitize_git_delivery_argv(list(raw.get("argv", []))),
+              "stdout": _redact_git_delivery_text(str(raw.get("stdout", ""))),
+              "stderr": _redact_git_delivery_text(str(raw.get("stderr", ""))), "exit_code": raw.get("exit_code"),
+              "truncated": bool(raw.get("truncated", False))}
+    if raw.get("error"):
+        result["error"] = _redact_git_delivery_text(str(raw["error"]))
+    return result
+
+
+def _resolve_git_delivery_remote(root: Path, remote: str) -> tuple[str, dict]:
+    result = _git_delivery_command(["remote", "get-url", "--push", remote], root)
+    if not result["ok"]:
+        raise _GitDeliveryError("configured remote could not be resolved", result)
+    lines = result["stdout"].splitlines()
+    if len(lines) != 1 or not lines[0].strip():
+        raise ValueError("configured remote URL is invalid")
+    return _validate_git_delivery_https_url(lines[0].strip()), result
+
+
+def _read_exact_git_delivery_head(root: Path, remote_url: str, dst_ref: str) -> tuple[str | None, dict]:
+    result = _git_delivery_command(["ls-remote", "--refs", "--exit-code", remote_url, dst_ref], root)
+    if not result["ok"]:
+        if result.get("exit_code") == 2:
+            return None, result
+        raise _GitDeliveryError(result.get("error") or "remote ref lookup failed", result)
+    lines = [line for line in result["stdout"].splitlines() if line]
+    if len(lines) != 1:
+        raise ValueError("remote ref lookup did not return exactly one ref")
+    try:
+        object_id, returned_ref = lines[0].split("\t", 1)
+    except ValueError as exc:
+        raise ValueError("remote ref lookup returned malformed output") from exc
+    if returned_ref != dst_ref or not _GIT_COMMIT_SHA_RE.fullmatch(object_id):
+        raise ValueError("remote ref lookup returned malformed output")
+    return object_id.lower(), result
+
+
+def _resolve_git_delivery_source(root: Path, src_ref: str) -> tuple[str, dict]:
+    result = _git_delivery_command(["rev-parse", "--verify", f"{src_ref}^{{commit}}"], root)
+    if not result["ok"]:
+        raise _GitDeliveryError("source branch could not be resolved to a commit", result)
+    object_id = result["stdout"].strip()
+    if not _GIT_COMMIT_SHA_RE.fullmatch(object_id):
+        raise ValueError("source branch did not resolve to a full commit SHA")
+    return object_id.lower(), result
+
+
+def git_ls_remote_result(repo: str, remote: str, ref: str) -> dict:
+    operation = "git_ls_remote"
+    try:
+        root = resolve_repo(repo); remote = _validate_git_delivery_remote_name(remote); ref = _validate_git_delivery_ref(ref, field="ref")
+        remote_url, _ = _resolve_git_delivery_remote(root, remote); before_head, command = _read_exact_git_delivery_head(root, remote_url, ref)
+        if before_head is None:
+            return _git_delivery_failure("remote branch does not exist; new branches are not supported", operation=operation, repo_root=str(root), remote=remote, ref=ref, before_head=None, after_head=None, **command)
+        return {"ok": True, "operation": operation, "dry_run": False, "pushed": False, "repo_root": str(root), "remote": remote, "ref": ref, "before_head": before_head, "after_head": before_head, **command}
+    except _GitDeliveryError as exc:
+        return _git_delivery_failure(str(exc), operation=operation, **exc.result)
+    except (OSError, ValueError) as exc:
+        return _git_delivery_failure(str(exc), operation=operation)
+
+
+def _prepare_git_push(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str, *, operation: str):
+    try:
+        root = resolve_repo(repo); remote = _validate_git_delivery_remote_name(remote); src_ref = _validate_git_delivery_ref(src_ref, field="src_ref"); dst_ref = _validate_git_delivery_ref(dst_ref, field="dst_ref"); expected_remote_head = _validate_expected_remote_head(expected_remote_head)
+        remote_url, _ = _resolve_git_delivery_remote(root, remote); before_head, lookup = _read_exact_git_delivery_head(root, remote_url, dst_ref)
+        if before_head != expected_remote_head:
+            return _git_delivery_failure("remote destination head differs from expected_remote_head (concurrent drift or new branch)", operation=operation, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, expected_remote_head=expected_remote_head, before_head=before_head, after_head=before_head, **lookup)
+        source_head, _ = _resolve_git_delivery_source(root, src_ref)
+        return root, remote, remote_url, src_ref, dst_ref, source_head, {"expected_remote_head": expected_remote_head, "before_head": before_head}
+    except _GitDeliveryError as exc:
+        return _git_delivery_failure(str(exc), operation=operation, **exc.result)
+    except (OSError, ValueError) as exc:
+        return _git_delivery_failure(str(exc), operation=operation)
+
+
+def git_push_dry_run_result(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str) -> dict:
+    operation = "git_push_dry_run"; prepared = _prepare_git_push(repo, remote, src_ref, dst_ref, expected_remote_head, operation=operation)
+    if isinstance(prepared, dict): return prepared
+    root, remote, remote_url, src_ref, dst_ref, source_head, metadata = prepared
+    command = _git_delivery_command(["push", "--dry-run", remote_url, f"{src_ref}:{dst_ref}"], root)
+    if not command["ok"]:
+        return _git_delivery_failure(command.get("error") or "git push --dry-run failed", operation=operation, dry_run=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=metadata["before_head"], **metadata, **command)
+    return {"ok": True, "operation": operation, "dry_run": True, "pushed": False, "repo_root": str(root), "remote": remote, "src_ref": src_ref, "dst_ref": dst_ref, "source_head": source_head, "after_head": metadata["before_head"], **metadata, **command}
+
+
+def git_push_ref_result(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str) -> dict:
+    operation = "git_push_ref"; prepared = _prepare_git_push(repo, remote, src_ref, dst_ref, expected_remote_head, operation=operation)
+    if isinstance(prepared, dict): return prepared
+    root, remote, remote_url, src_ref, dst_ref, source_head, metadata = prepared
+    dry_run = _git_delivery_command(["push", "--dry-run", remote_url, f"{src_ref}:{dst_ref}"], root)
+    if not dry_run["ok"]:
+        return _git_delivery_failure(dry_run.get("error") or "git push --dry-run failed", operation=operation, dry_run=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=metadata["before_head"], **metadata, **dry_run)
+    try:
+        fresh_remote_url, _ = _resolve_git_delivery_remote(root, remote)
+        if fresh_remote_url != remote_url: raise ValueError("configured remote URL changed during delivery")
+        fresh_head, fresh_lookup = _read_exact_git_delivery_head(root, fresh_remote_url, dst_ref)
+        if fresh_head != metadata["expected_remote_head"]:
+            return _git_delivery_failure("remote destination head differs from expected_remote_head immediately before push", operation=operation, dry_run=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, expected_remote_head=metadata["expected_remote_head"], before_head=fresh_head, after_head=fresh_head, **fresh_lookup)
+    except _GitDeliveryError as exc:
+        return _git_delivery_failure(str(exc), operation=operation, dry_run=True, **exc.result)
+    except (OSError, ValueError):
+        return _git_delivery_failure("pre-push remote validation failed", operation=operation, dry_run=True)
+    command = _git_delivery_command(["push", fresh_remote_url, f"{src_ref}:{dst_ref}"], root)
+    if not command["ok"]:
+        return _git_delivery_failure(command.get("error") or "git push failed", operation=operation, dry_run=False, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=fresh_head, **metadata, **command)
+    try: after_head, verification = _read_exact_git_delivery_head(root, fresh_remote_url, dst_ref)
+    except (_GitDeliveryError, OSError, ValueError) as exc:
+        details = exc.result if isinstance(exc, _GitDeliveryError) else {}
+        return _git_delivery_failure(str(exc), operation=operation, dry_run=False, pushed=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=None, **metadata, **details)
+    if after_head != source_head:
+        return _git_delivery_failure("push completed but post-push remote head verification did not match source_head", operation=operation, dry_run=False, pushed=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=after_head, **metadata, **verification)
+    return {"ok": True, "operation": operation, "dry_run": False, "pushed": True, "repo_root": str(root), "remote": remote, "src_ref": src_ref, "dst_ref": dst_ref, "source_head": source_head, "after_head": after_head, **metadata, **command}
 
 
 def _minimax_cli_candidates() -> list[Path]:
@@ -1196,7 +1428,7 @@ def _run_agy_probe(command: list[str], *, cwd: str | None = None, env: dict[str,
         command,
         cwd=cwd,
         env=env,
-        timeout=5.0,
+        timeout=30.0 if command[1:] == ["models"] else 5.0,
         max_output_bytes=MAX_SUBPROCESS_OUTPUT_BYTES,
     )
 
@@ -1529,19 +1761,40 @@ def harness_status(name: str) -> dict:
 _HARNESS_TELEMETRY_PROVIDER: HarnessTelemetryProvider | None = None
 
 
-def _harness_job_activity() -> dict[str, dict[str, int | str]]:
-    counts = {name: {"running": 0, "queued": 0, "source": "Harbor job queue"} for name in ("codex", "minimax", "agy")}
-    if not JOBS_DIR.is_dir():
+def _harness_job_activity(jobs_dir: Path | None = None) -> dict[str, dict[str, Any]]:
+    jobs_dir = jobs_dir or JOBS_DIR
+    counts = {name: {"running": 0, "queued": 0, "running_job_ids": [], "source": "Harbor job queue"} for name in ("codex", "minimax", "agy")}
+    if not jobs_dir.is_dir():
         return counts
-    for path in JOBS_DIR.glob("*/status.json"):
+    for path in jobs_dir.glob("*/status.json"):
         try:
             state = read_json_object(path)
         except (OSError, ValueError, json.JSONDecodeError):
+            for row in counts.values():
+                row["error"] = "Some job states could not be read"
             continue
         name = state.get("harness")
         status = state.get("status")
+        if not queue_root_matches(state, jobs_dir):
+            for row in counts.values():
+                row["error"] = "Job queue identity mismatch"
+            continue
+        if name in counts:
+            timestamp = state.get("updated_at") or state.get("created_at")
+            if isinstance(timestamp, str):
+                try:
+                    timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    if timestamp.tzinfo is not None:
+                        normalized = timestamp.astimezone(timezone.utc).isoformat()
+                        counts[name]["latest_activity_at"] = max(normalized, counts[name].get("latest_activity_at", ""))
+                except ValueError:
+                    pass
         if name in counts and status in {"queued", "running"}:
             counts[name][status] += 1
+            if status == "running":
+                counts[name]["running_job_ids"].append(path.parent.name)
+    for row in counts.values():
+        row["running_job_ids"].sort()
     return counts
 
 
@@ -1573,9 +1826,18 @@ def resolve_task_cwd(project: str | None, cwd: str | None) -> tuple[Path, str | 
     return workdir, None
 
 
+def codex_model_options(model: str | None, reasoning_effort: str | None) -> tuple[str, str | None]:
+    model = model if model is not None else CODEX_DEFAULT_MODEL
+    if reasoning_effort is None and model == CODEX_DEFAULT_MODEL:
+        reasoning_effort = CODEX_DEFAULT_REASONING_EFFORT
+    return model, reasoning_effort
+
+
 def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, project: str | None,
                cwd: str | None, model: str | None, sandbox: str, reasoning_effort: str | None,
-               route: str = "current") -> dict:
+               route: str | None = None) -> dict:
+    if route is None:
+        route = os.environ.get("HARBOR_CODEX_DEFAULT_ROUTE", "current") if harness == "codex" else "current"
     if harness not in {"codex", "minimax", "agy"}:
         return {"ok": False, "error": f"unsupported harness: {harness}"}
     if not isinstance(prompt, str) or not prompt.strip():
@@ -1583,6 +1845,7 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
     if sandbox not in SANDBOXES:
         return {"ok": False, "error": f"unsupported sandbox: {sandbox}"}
     if harness == "codex":
+        model, reasoning_effort = codex_model_options(model, reasoning_effort)
         if route not in CODEX_ROUTES:
             return {"ok": False, "error": f"Codex route must be one of {sorted(CODEX_ROUTES)}."}
         try:
@@ -1638,7 +1901,7 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
         "fallback_used": False,
         "fallback_reason": None,
         "attempts": [],
-        "queue_root_fingerprint": QUEUE_ROOT.fingerprint,
+        "queue_root_fingerprint": describe_queue_root(JOBS_DIR, QUEUE_ROOT.source).fingerprint,
         "native_process": None,
         "minimax_executable": minimax_status["executable"] if harness == "minimax" else None,
         "agy_executable": str(AGY_EXE) if harness == "agy" else None,
@@ -1649,7 +1912,8 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
         "updated_at": utc_now(),
     }
     write_json(job_dir / "status.json", state)
-    response = {"ok": True, "job_id": job_id, "status": "queued", "harness": harness, "cwd": str(workdir), "project": project_alias}
+    response = {"ok": True, "job_id": job_id, "status": "queued", "harness": harness, "cwd": str(workdir), "project": project_alias,
+                "queue_root": describe_queue_root(JOBS_DIR, QUEUE_ROOT.source).as_dict()}
     if harness == "minimax":
         response["parameter_handling"] = {
             "model": "mapped to --model" if model else "not requested",
@@ -1776,15 +2040,38 @@ def poll_task(
         return {"ok": False, "error": "invalid job_id"}
     base_jobs_dir = jobs_dir or JOBS_DIR
     job_dir = base_jobs_dir / job_id
-    if not job_dir.is_dir():
-        state_path = job_dir / "status.json"
-        if not state_path.is_file():
-            return {"ok": False, "error": f"Unknown job_id: {job_id}"}
+    state_path = job_dir / "status.json"
+    # Local reads never probe a harness. Terminal truth must precede cached
+    # snapshots, corrupt poll metadata, and even a busy cooldown metadata lock.
+    def local_state():
+        try:
+            state = read_json_object(state_path)
+        except FileNotFoundError:
+            return None, {"ok": False, "error": f"Unknown job_id: {job_id}",
+                          "queue_root": describe_queue_root(base_jobs_dir, "reader").as_dict()}
+        except (OSError, ValueError) as exc:
+            return None, {"ok": False, "error": f"Could not read job state: {exc}"}
+        if not queue_root_matches(state, base_jobs_dir):
+            return None, {"ok": False, "error": "job belongs to a different Harbor queue root",
+                          "queue_root": describe_queue_root(base_jobs_dir, "reader").as_dict()}
+        if state.get("status") in TERMINAL_STATUSES:
+            return state, {**state, "ok": True, "poll_throttled": False, "last_polled_at": utc_now()}
+        if state.get("status") not in {"queued", "running"}:
+            return None, {"ok": False, "error": "invalid local job status"}
+        return state, None
+
+    state, response = local_state()
+    if response is not None:
+        return response
 
     norm_key = os.path.normcase(os.path.abspath(str(job_dir)))
 
     try:
         with _job_poll_lock(job_dir, timeout=lock_timeout):
+            # A worker can finish while this reader waits for metadata ownership.
+            state, response = local_state()
+            if response is not None:
+                return response
             poll_meta_path = job_dir / "poll_meta.json"
             state_path = job_dir / "status.json"
             disk_meta: dict | None = None
@@ -1839,10 +2126,6 @@ def poll_task(
             cached_snapshot = meta.get("snapshot")
             last_polled_ts = meta.get("last_polled_ts")
 
-            # If a terminal state was already observed, return cached result directly without reading disk
-            if isinstance(cached_snapshot, dict) and cached_snapshot.get("status") in TERMINAL_STATUSES:
-                return {"ok": True, **cached_snapshot, "poll_throttled": False}
-
             now_ts = time.time()
             now_iso = utc_now()
 
@@ -1854,6 +2137,7 @@ def poll_task(
             is_throttled = (
                 not immediate
                 and isinstance(cached_snapshot, dict)
+                and cached_snapshot.get("status") in {"queued", "running"}
                 and elapsed is not None
                 and elapsed < POLL_THROTTLE_INTERVAL_SECONDS
             )
@@ -1870,45 +2154,6 @@ def poll_task(
                     "next_allowed_at": next_allowed_at,
                     "last_polled_at": meta.get("last_polled_at"),
                 }
-
-            # Actual poll: read status.json from disk
-            if not state_path.is_file():
-                return {"ok": False, "error": f"Unknown job_id: {job_id}"}
-            try:
-                state = read_json_object(state_path)
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                return {"ok": False, "error": f"Could not read job state: {exc}"}
-            if not queue_root_matches(state, QUEUE_ROOT):
-                return {"ok": False, "error": "job belongs to a different Harbor queue root"}
-
-            status = state.get("status")
-            if status in TERMINAL_STATUSES:
-                new_meta = {
-                    "last_polled_at": now_iso,
-                    "last_polled_ts": now_ts,
-                    "snapshot": state,
-                    "next_allowed_at": None,
-                }
-                with _JOB_POLL_META_LOCK:
-                    _JOB_POLL_IN_MEMORY_META[norm_key] = dict(new_meta)
-
-                meta_persisted = True
-                try:
-                    write_json(poll_meta_path, new_meta)
-                except OSError as exc:
-                    meta_persisted = False
-                    with _JOB_POLL_META_LOCK:
-                        _JOB_POLL_IN_MEMORY_META[norm_key]["persistence_error"] = str(exc)
-
-                resp = {
-                    "ok": True,
-                    **state,
-                    "poll_throttled": False,
-                    "last_polled_at": now_iso,
-                }
-                if not meta_persisted:
-                    resp["meta_persisted"] = False
-                return resp
 
             # Non-terminal state (queued/running): record snapshot and 10-minute cooldown
             next_allowed_ts = now_ts + POLL_THROTTLE_INTERVAL_SECONDS
@@ -1942,6 +2187,9 @@ def poll_task(
             return resp
 
     except JobPollLockError as exc:
+        state, response = local_state()
+        if response is not None:
+            return response
         now_ts = time.time()
         now_iso = utc_now()
         poll_meta_path = job_dir / "poll_meta.json"
@@ -1995,11 +2243,14 @@ def cancel_task(job_id: str) -> dict:
     job_dir = JOBS_DIR / job_id
     state_path = job_dir / "status.json"
     if not state_path.is_file():
-        return {"ok": False, "error": f"unknown job_id: {job_id}"}
-    if (job_dir / "worker.lock").exists():
-        return {"ok": False, "error": "task already claimed by worker and cannot be safely cancelled", "status": "running"}
+        return {"ok": False, "error": f"unknown job_id: {job_id}", "queue_root": QUEUE_ROOT.as_dict()}
     try:
         state = read_json_object(state_path)
+        if not queue_root_matches(state, JOBS_DIR):
+            return {"ok": False, "error": "job belongs to a different Harbor queue root",
+                    "queue_root": describe_queue_root(JOBS_DIR, "reader").as_dict()}
+        if (job_dir / "worker.lock").exists():
+            return {"ok": False, "error": "task already claimed by worker and cannot be safely cancelled", "status": "running"}
         if state.get("status") != "queued":
             return {"ok": False, "error": f"task is not queued: {state.get('status')}", "status": state.get("status")}
         state.update(status="cancelled", cancelled_at=utc_now(), updated_at=utc_now())
@@ -2040,13 +2291,11 @@ def build_codex_command(
             "-c", f"model_providers.{provider_id}.wire_api={toml_string(custom['wire_api'])}",
             "-c", f"model_providers.{provider_id}.env_key={toml_string(custom['env_key'])}",
         ])
-    effective_model = state.get("model")
-    if not effective_model and selected_route == "custom":
-        effective_model = codex_custom_route_config().get("default_model")
+    effective_model, effective_effort = codex_model_options(state.get("model"), state.get("reasoning_effort"))
     if effective_model:
         command.extend(["--model", effective_model])
-    if state.get("reasoning_effort"):
-        command.extend(["-c", f'model_reasoning_effort="{state["reasoning_effort"]}"'])
+    if effective_effort:
+        command.extend(["-c", f'model_reasoning_effort="{effective_effort}"'])
     command.append(state["prompt"])
     return command
 
@@ -2105,6 +2354,6 @@ def claim_job(job_dir: Path) -> dict | None:
     state = read_json_object(job_dir / "status.json")
     if state.get("status") != "queued":
         return None
-    state.update(status="running", started_at=utc_now(), updated_at=utc_now())
+    state.update(status="running", worker_pid=os.getpid(), started_at=utc_now(), updated_at=utc_now())
     write_json(job_dir / "status.json", state)
     return state

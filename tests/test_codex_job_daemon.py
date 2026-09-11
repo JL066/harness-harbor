@@ -124,6 +124,20 @@ def _write_fake_worker(dir_path: Path) -> Path:
 
 
 class TestCodexJobDaemon(unittest.TestCase):
+    def test_zero_exit_without_terminal_preserves_original_and_retries_write(self):
+        job = _create_job(self.jobs_dir, "zero_exit", status="running")
+        scheduler = HarborScheduler(jobs_dir=self.jobs_dir)
+        proc = mock.Mock()
+        proc.poll.return_value = 0
+        scheduler.active_workers["codex"][job.name] = ActiveWorker(proc, job, "codex", time.monotonic(), str(job))
+        with mock.patch.object(codex_job_daemon, "write_json", side_effect=OSError("disk")), mock.patch.object(codex_job_daemon, "release_workspace_lease") as release:
+            self.assertEqual(scheduler.reap_workers(), [])
+            release.assert_not_called()
+        self.assertIn(job.name, scheduler.active_workers["codex"])
+        self.assertEqual(len(scheduler.reap_workers()), 1)
+        self.assertEqual(json.loads((job / "status.json").read_text())["status"], "failed")
+        self.assertEqual(json.loads((job / "status.before-recovery.json").read_text())["status"], "running")
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
@@ -153,6 +167,33 @@ class TestCodexJobDaemon(unittest.TestCase):
         self.assertEqual(get_job_harness(j_minimax), "minimax")
         self.assertEqual(get_job_harness(j_agy), "agy")
         self.assertEqual(get_job_harness(j_unknown), "codex")
+
+    def test_abandoned_worker_recovery_preserves_live_unknown_and_handoff_jobs(self):
+        from harbor_platform.process import spawn_owned
+        dead = spawn_owned([sys.executable, "-c", "pass"])
+        dead.wait(timeout=5)
+        jobs = {}
+        for name, pid in (("dead", dead.pid), ("live", os.getpid()), ("unknown", None), ("handoff", dead.pid)):
+            job = _create_job(self.jobs_dir, name, status="running")
+            state = json.loads((job / "status.json").read_text())
+            state["native_process"] = {"launcher_pid": pid}
+            (job / "status.json").write_text(json.dumps(state))
+            if pid:
+                (job / "worker.lock").write_text(f"{pid}\n")
+            if name != "handoff":
+                os.utime(job / "status.json", (time.time() - 60, time.time() - 60))
+            if name in {"dead", "handoff"} and isinstance(getattr(dead, "_harbor_identity", None), dict):
+                (job / "worker.identity.json").write_text(json.dumps(dead._harbor_identity))
+            jobs[name] = job
+        with codex_job_daemon.harness_dispatch_lock(self.jobs_dir, "codex"):
+            recovered = codex_job_daemon.recover_abandoned_jobs(self.jobs_dir, "codex")
+        self.assertEqual(recovered, ["dead"])
+        self.assertEqual(json.loads((jobs["dead"] / "status.json").read_text())["failure_type"], "worker_disappeared")
+        self.assertEqual(json.loads((jobs["dead"] / "status.before-recovery.json").read_text())["status"], "running")
+        self.assertFalse((jobs["dead"] / "worker.lock").exists())
+        for name in ("live", "unknown", "handoff"):
+            self.assertEqual(json.loads((jobs[name] / "status.json").read_text())["status"], "running")
+        self.assertNotIn("dead", get_disk_active_job_ids(self.jobs_dir)["codex"])
 
     def test_queued_jobs_ordering_and_filtering(self) -> None:
         """Queued jobs are sorted FIFO and ignore running/locked jobs."""
@@ -1160,7 +1201,12 @@ class TestCodexJobDaemon(unittest.TestCase):
             worker_script=self.fake_worker,
         )
 
-        # Tick: Reclaims dead lease and spawns j2
+        # Legacy Windows records cannot prove that an orphan child has exited.
+        if codex_job_daemon.IS_WINDOWS:
+            self.assertEqual(scheduler.tick(), [])
+            self.assertTrue(lease_path.exists())
+            return
+        # POSIX group observation proves the dead lease can be reclaimed.
         spawned = scheduler.tick()
         self.assertEqual(len(spawned), 1)
         self.assertEqual(spawned[0][1], j2)
@@ -1218,9 +1264,6 @@ class TestCodexJobDaemon(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
 
 
 

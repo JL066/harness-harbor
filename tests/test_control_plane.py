@@ -101,6 +101,12 @@ class ControlPlaneTests(unittest.TestCase):
                     harness="codex", prompt="cancel", project="fixture", cwd=None,
                     model=None, sandbox="read-only", reasoning_effort=None,
                 )
+                default_state = control_plane.read_json_object(control_plane.JOBS_DIR / cancelled["job_id"] / "status.json")
+                self.assertEqual(default_state["model"], "gpt-5.6-sol")
+                self.assertEqual(default_state["reasoning_effort"], "medium")
+                default_cmd = control_plane.build_codex_command(default_state, root / "default-result")
+                self.assertEqual(default_cmd[default_cmd.index("--model") + 1], "gpt-5.6-sol")
+                self.assertIn('model_reasoning_effort="medium"', default_cmd)
                 self.assertTrue(control_plane.cancel_task(cancelled["job_id"])["ok"])
 
                 started = control_plane.start_task(
@@ -114,7 +120,7 @@ class ControlPlaneTests(unittest.TestCase):
                     result_path.write_text("done", encoding="utf-8")
                     return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
-                with mock.patch.object(codex_job_worker.subprocess, "run", side_effect=fake_run):
+                with mock.patch.object(control_plane, "run_safe_subprocess", side_effect=fake_run):
                     codex_job_worker.main(job_dir)
 
                 polled = control_plane.poll_task(started["job_id"])
@@ -411,7 +417,8 @@ class ControlPlaneTests(unittest.TestCase):
             "harness_list", "harness_status", "task_start", "task_poll", "task_cancel",
             "project_list", "project_resolve", "file_read", "file_write", "file_append",
             "file_stat", "directory_list", "git_status", "git_diff", "git_branch", "git_log",
-            "git_worktree_list", "git_rev_parse", "git_add", "git_commit",
+            "git_worktree_list", "git_rev_parse", "git_add", "git_commit", "git_ls_remote",
+            "git_push_dry_run", "git_push_ref",
         }.issubset(names))
 
 

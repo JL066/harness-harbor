@@ -167,6 +167,7 @@ class HarnessTelemetryProvider:
             result[name] = {
                 "state": state,
                 "running_jobs": running,
+                "running_job_ids": list(job.get("running_job_ids", [])),
                 "queued_jobs": queued,
                 "process_count": count,
                 "source": " + ".join(dict.fromkeys(sources)) or "source unavailable",

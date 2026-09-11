@@ -979,6 +979,21 @@ class AgyHarnessRegistrationTests(unittest.TestCase):
 
 
 class CodexRoutingTests(unittest.TestCase):
+    def test_default_sol_medium_and_explicit_model_effort_precedence(self):
+        base = {"cwd": ".", "sandbox": "read-only", "prompt": "hello"}
+        for model, effort, expected_model, expected_effort in (
+            (None, None, "gpt-5.6-sol", "medium"),
+            (None, "high", "gpt-5.6-sol", "high"),
+            ("gpt-5.6-sol", None, "gpt-5.6-sol", "medium"),
+            ("other-model", "low", "other-model", "low"),
+            ("other-model", None, "other-model", None),
+        ):
+            with self.subTest(model=model, effort=effort):
+                cmd = control_plane.build_codex_command({**base, "model": model, "reasoning_effort": effort}, Path("out"))
+                self.assertEqual(cmd[cmd.index("--model") + 1], expected_model)
+                actual = [arg for arg in cmd if arg.startswith("model_reasoning_effort=")]
+                self.assertEqual(actual, [f'model_reasoning_effort="{expected_effort}"'] if expected_effort else [])
+
     def make_route_job(self, job_dir: Path, route: str = "official_then_custom") -> None:
         (job_dir / "status.json").write_text(
             json.dumps({
@@ -1031,14 +1046,15 @@ class CodexRoutingTests(unittest.TestCase):
             current = control_plane.build_codex_command(state, Path("out"), route="current")
             official = control_plane.build_codex_command(state, Path("out"), route="official")
             custom = control_plane.build_codex_command(state, Path("out"), route="custom")
-        self.assertNotIn("-c", current)
+        self.assertIn('model_reasoning_effort="medium"', current)
+        self.assertNotIn('model_provider="openai"', current)
         self.assertIn('model_provider="openai"', official)
         self.assertIn('model_provider="harbor_custom"', custom)
         self.assertIn('model_providers.harbor_custom.name="Harbor Custom"', custom)
         self.assertIn('model_providers.harbor_custom.base_url="https://api.acme.test/v1"', custom)
         self.assertIn('model_providers.harbor_custom.wire_api="responses"', custom)
         self.assertIn('model_providers.harbor_custom.env_key="HARBOR_CODEX_CUSTOM_API_KEY"', custom)
-        self.assertIn("acme-model", custom)
+        self.assertEqual(custom[custom.index("--model") + 1], "gpt-5.6-sol")
         self.assertNotIn(env[control_plane.CODEX_CUSTOM_API_KEY_ENV], custom)
         self.assertEqual(env[control_plane.CODEX_CUSTOM_API_KEY_ENV], child_env[control_plane.CODEX_CUSTOM_API_KEY_ENV])
         self.assertEqual(before, os.environ.get(control_plane.CODEX_CUSTOM_API_KEY_ENV))
@@ -1080,7 +1096,7 @@ class CodexRoutingTests(unittest.TestCase):
                     control_plane.CODEX_CUSTOM_API_KEY_ENV: "sk-" + "test-secret-value-12345678",
                 },
                 clear=False,
-            ), mock.patch.object(codex_job_worker.subprocess, "run", side_effect=fake_run) as run:
+            ), mock.patch.object(control_plane, "run_safe_subprocess", side_effect=fake_run) as run:
                 codex_job_worker.main(job_dir)
 
             state = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
@@ -1102,7 +1118,7 @@ class CodexRoutingTests(unittest.TestCase):
             job_dir = Path(temporary_directory)
             self.make_route_job(job_dir)
             result = subprocess.CompletedProcess([], 1, stdout="", stderr="patch application failed; tests failed")
-            with mock.patch.object(codex_job_worker.subprocess, "run", return_value=result) as run:
+            with mock.patch.object(control_plane, "run_safe_subprocess", return_value=result) as run:
                 codex_job_worker.main(job_dir)
             state = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
             self.assertEqual("failed", state["status"])
@@ -1133,7 +1149,7 @@ class CodexRoutingTests(unittest.TestCase):
                     result_path.write_text("fallback done", encoding="utf-8")
                     return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
-                with mock.patch.object(codex_job_worker.subprocess, "run", side_effect=fake_run):
+                with mock.patch.object(control_plane, "run_safe_subprocess", side_effect=fake_run):
                     codex_job_worker.main(job_dir)
                 state = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
                 self.assertEqual("failed", state["status"])
@@ -1161,7 +1177,7 @@ class CodexRoutingTests(unittest.TestCase):
                     control_plane.CODEX_CUSTOM_API_KEY_ENV: api_key,
                 },
                 clear=False,
-            ), mock.patch.object(codex_job_worker.subprocess, "run", side_effect=fake_run):
+            ), mock.patch.object(control_plane, "run_safe_subprocess", side_effect=fake_run):
                 codex_job_worker.main(job_dir)
 
             state_text = (job_dir / "status.json").read_text(encoding="utf-8")
@@ -1215,15 +1231,14 @@ class CodexJobWorkerTests(unittest.TestCase):
             (job_dir / "result.txt").write_text("finished", encoding="utf-8")
             result = subprocess.CompletedProcess([], 0, stdout="", stderr="diagnostic")
 
-            with mock.patch.object(codex_job_worker.subprocess, "run", return_value=result) as run:
+            with mock.patch.object(control_plane, "run_safe_subprocess", return_value=result) as run:
                 codex_job_worker.main(job_dir)
 
             state = self.read_state(job_dir)
             self.assertEqual("completed", state["status"])
             self.assertEqual(0, state["exit_code"])
             self.assertEqual("finished", state["final_message"])
-            self.assertEqual("utf-8", run.call_args.kwargs["encoding"])
-            self.assertEqual("replace", run.call_args.kwargs["errors"])
+            self.assertEqual(3600, run.call_args.kwargs["timeout"])
             # worker.lock must be released on success
             self.assertFalse((job_dir / "worker.lock").exists())
 
@@ -1234,7 +1249,7 @@ class CodexJobWorkerTests(unittest.TestCase):
             (job_dir / "result.txt").write_text("finished", encoding="utf-8")
             result = subprocess.CompletedProcess([], 0, stdout=None, stderr=None)
 
-            with mock.patch.object(codex_job_worker.subprocess, "run", return_value=result):
+            with mock.patch.object(control_plane, "run_safe_subprocess", return_value=result):
                 codex_job_worker.main(job_dir)
 
             state = self.read_state(job_dir)
@@ -1250,7 +1265,7 @@ class CodexJobWorkerTests(unittest.TestCase):
             self.make_job(job_dir)
             result = subprocess.CompletedProcess([], 0, stdout="stdout", stderr="diagnostic")
 
-            with mock.patch.object(codex_job_worker.subprocess, "run", return_value=result):
+            with mock.patch.object(control_plane, "run_safe_subprocess", return_value=result):
                 codex_job_worker.main(job_dir)
 
             state = self.read_state(job_dir)
@@ -1268,7 +1283,7 @@ class CodexJobWorkerTests(unittest.TestCase):
             self.make_job(job_dir)
             result = subprocess.CompletedProcess([], 7, stdout="", stderr="real failure")
 
-            with mock.patch.object(codex_job_worker.subprocess, "run", return_value=result):
+            with mock.patch.object(control_plane, "run_safe_subprocess", return_value=result):
                 codex_job_worker.main(job_dir)
 
             state = self.read_state(job_dir)
@@ -1284,7 +1299,7 @@ class CodexJobWorkerTests(unittest.TestCase):
             job_dir = Path(temporary_directory)
             self.make_job(job_dir)
             with mock.patch.object(
-                codex_job_worker.subprocess, "run",
+                control_plane, "run_safe_subprocess",
                 side_effect=RuntimeError("explode"),
             ):
                 # Should NOT raise: the worker must swallow the wrapper
@@ -1326,7 +1341,7 @@ class P0SubprocessSafetyRegressionTests(unittest.TestCase):
             def wait(self, timeout=None):
                 return 0
 
-        with mock.patch.object(control_plane.subprocess, "Popen", _FakePopen):
+        with mock.patch("harbor_platform.process.spawn_owned", _FakePopen):
             with tempfile.TemporaryDirectory() as tmp:
                 rp = Path(tmp) / "r.txt"
                 codex_job_worker.run_minimax_with_lifecycle(

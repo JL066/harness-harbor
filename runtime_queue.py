@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -59,6 +60,17 @@ def resolve_queue_root(
         if not candidate.is_absolute():
             raise ValueError(f"{JOBS_DIR_ENV} must be an absolute path: {configured!r}")
         source = "environment"
+    elif env.get("HARBOR_STATE_DIR", "").strip():
+        root = Path(env["HARBOR_STATE_DIR"]).expanduser()
+        if not root.is_absolute():
+            raise ValueError("HARBOR_STATE_DIR must be an absolute path")
+        candidate = root / "jobs"
+        source = "state_environment"
+    elif sys.platform == "darwin":
+        # Direct stdio/daemon entrypoints and the packaged App must agree.
+        from harbor_platform.paths import PlatformPaths
+        candidate = PlatformPaths(project_root, env).jobs_dir()
+        source = "application_support"
     else:
         candidate = Path(project_root) / ".jobs"
         source = "project_fallback"

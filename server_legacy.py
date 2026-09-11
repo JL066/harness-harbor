@@ -31,6 +31,9 @@ from control_plane import (
     git_commit_result,
     git_diff_result,
     git_log_result,
+    git_ls_remote_result,
+    git_push_dry_run_result,
+    git_push_ref_result,
     git_rev_parse_result,
     git_status_result,
     git_worktree_list_result,
@@ -45,6 +48,16 @@ from control_plane import (
     validate_codex_route,
     QUEUE_ROOT,
     harness_telemetry_snapshot,
+)
+from host_diagnostics import (
+    dns_resolve as diag_dns_resolve,
+    firewall_query as diag_firewall_query,
+    http_probe as diag_http_probe,
+    network_interfaces as diag_network_interfaces,
+    port_listeners as diag_port_listeners,
+    process_inspect as diag_process_inspect,
+    tcp_connect_probe as diag_tcp_connect_probe,
+    tls_inspect as diag_tls_inspect,
 )
 
 
@@ -177,16 +190,19 @@ async def codex_run(
     model: str | None = None,
     sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
     reasoning_effort: str | None = None,
-    route: Literal["current", "official", "custom", "official_then_custom"] = "current",
+    route: Literal["current", "official", "custom", "official_then_custom"] | None = None,
 ) -> dict:
     """Run a Codex task synchronously and wait for the final result.
 
+    Defaults to gpt-5.6-sol with medium reasoning; only override model/reasoning
+    when explicitly requested by the user.
     Use ONLY for very short tasks expected to finish quickly.
 
     Do NOT use this as a substitute for codex_start.
 
     For normal coding, repository analysis, debugging, edits, research, or any task that may take more than a few seconds, prefer codex_start followed by codex_poll. Long synchronous calls may exceed a remote tunnel transport response deadline and fail with a timeout or 502 error.
     """
+    route = route if route is not None else os.environ.get("HARBOR_CODEX_DEFAULT_ROUTE", "current")
     workdir = Path(cwd).expanduser().resolve()
 
     if not CODEX_EXE.is_file():
@@ -261,10 +277,12 @@ async def codex_start(
     model: str | None = None,
     sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
     reasoning_effort: str | None = None,
-    route: Literal["current", "official", "custom", "official_then_custom"] = "current",
+    route: Literal["current", "official", "custom", "official_then_custom"] | None = None,
 ) -> dict:
     """Start a Codex task asynchronously.
 
+    Defaults to gpt-5.6-sol with medium reasoning; only override model/reasoning
+    when explicitly requested by the user.
     This compatibility tool retains the original Codex-only API. For project
     aliases or another harness, use task_start. Jobs created here are unified
     task records and are still read with codex_poll.
@@ -288,7 +306,8 @@ def codex_poll(job_id: str, immediate: bool = False) -> dict:
 
     If status is "queued" or "running", the job is still executing.
     By default, polling queued/running jobs is rate-limited to at most once every 10 minutes per job_id.
-    Within the 10-minute cooldown window, normal polls return a cached status snapshot without reading disk.
+    Every call reads local status.json first; completed/failed/cancelled return immediately without probing.
+    Only locally queued/running jobs use cached snapshots within the 10-minute cooldown.
 
     Only pass immediate=True when the current user prompt explicitly and unambiguously requests an immediate
     status check for this specific job. Supervisors, cron/scheduled tasks, loops, or autonomous model decisions
@@ -679,11 +698,13 @@ async def task_start(
     model: str | None = None,
     sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
     reasoning_effort: str | None = None,
-    route: Literal["current", "official", "custom", "official_then_custom"] = "current",
+    route: Literal["current", "official", "custom", "official_then_custom"] | None = None,
 ) -> dict:
     """Queue a unified async task using exactly one project alias or explicit cwd.
 
-    Harness/model choice remains caller-controlled. MiniMax uses its verified
+    Codex defaults to gpt-5.6-sol with medium reasoning. Supervisors must only
+    override model/reasoning when explicitly requested by the user.
+    Harness choice remains caller-controlled. MiniMax uses its verified
     headless `mcode exec` interface. Codex supports the four public route
     values; MiniMax and AGY accept only `current`.
 
@@ -707,7 +728,8 @@ def task_poll(job_id: str, immediate: bool = False) -> dict:
     """Read a unified task record. Poll a queued/running task with the same job_id.
 
     By default, polling non-terminal jobs (queued/running) is rate-limited to at most once every 10 minutes per job_id.
-    Within the 10-minute cooldown window, normal polls return a cached status snapshot without reading disk.
+    Every call reads local status.json first; completed/failed/cancelled return immediately without probing.
+    Only locally queued/running jobs use cached snapshots within the 10-minute cooldown.
 
     Only pass immediate=True when the current user prompt explicitly and unambiguously requests an immediate
     status check for this specific job. Supervisors, cron/scheduled tasks, loops, or autonomous model decisions
@@ -801,6 +823,76 @@ async def git_commit(repo: str, message: str) -> dict:
     Offloaded to a worker thread.
     """
     return await asyncio.to_thread(git_commit_result, repo, message)
+
+
+@mcp.tool()
+async def git_ls_remote(repo: str, remote: str, ref: str) -> dict:
+    """Read one existing branch ref from a configured HTTPS remote."""
+    return await asyncio.to_thread(git_ls_remote_result, repo, remote, ref)
+
+
+@mcp.tool()
+async def git_push_dry_run(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str) -> dict:
+    """Dry-run exactly one non-force existing-branch update with an exact-head precondition."""
+    return await asyncio.to_thread(
+        git_push_dry_run_result, repo, remote, src_ref, dst_ref, expected_remote_head,
+    )
+
+
+@mcp.tool()
+async def git_push_ref(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str) -> dict:
+    """Push one non-force branch update after dry-run, drift checks, and verification."""
+    return await asyncio.to_thread(
+        git_push_ref_result, repo, remote, src_ref, dst_ref, expected_remote_head,
+    )
+
+
+@mcp.tool()
+async def port_listeners(port: int, protocol: Literal["tcp", "udp"] = "tcp") -> dict:
+    """Read current listeners and owning PIDs for one TCP or UDP port."""
+    return await asyncio.to_thread(diag_port_listeners, port, protocol)
+
+
+@mcp.tool()
+async def process_inspect(pid: int) -> dict:
+    """Read safe metadata for one process by PID; no process mutation is performed."""
+    return await asyncio.to_thread(diag_process_inspect, pid)
+
+
+@mcp.tool()
+async def http_probe(url: str, method: Literal["HEAD", "GET"] = "HEAD", timeout_seconds: int = 5) -> dict:
+    """Perform a bounded, SSRF-restricted read-only HTTP probe."""
+    return await asyncio.to_thread(diag_http_probe, url, method=method, timeout_seconds=timeout_seconds)
+
+
+@mcp.tool()
+async def tls_inspect(host: str, port: int = 443, timeout_seconds: int = 5) -> dict:
+    """Inspect TLS certificate metadata for an approved local/LAN target."""
+    return await asyncio.to_thread(diag_tls_inspect, host, port=port, timeout_seconds=timeout_seconds)
+
+
+@mcp.tool()
+async def firewall_query(port: int | None = None, protocol: Literal["tcp", "udp"] | None = None, executable: str | None = None) -> dict:
+    """Read-only query of matching Windows Defender Firewall rules."""
+    return await asyncio.to_thread(diag_firewall_query, port=port, protocol=protocol, executable=executable)
+
+
+@mcp.tool()
+async def network_interfaces() -> dict:
+    """Read local network interface metadata."""
+    return await asyncio.to_thread(diag_network_interfaces)
+
+
+@mcp.tool()
+async def tcp_connect_probe(host: str, port: int, timeout_seconds: int = 3) -> dict:
+    """Test TCP connectivity without sending application data."""
+    return await asyncio.to_thread(diag_tcp_connect_probe, host, port, timeout_seconds=timeout_seconds)
+
+
+@mcp.tool()
+async def dns_resolve(hostname: str) -> dict:
+    """Resolve a hostname to A/AAAA records with bounded timeout."""
+    return await asyncio.to_thread(diag_dns_resolve, hostname)
 
 
 if __name__ == "__main__":

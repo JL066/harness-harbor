@@ -93,15 +93,72 @@ class WindowsProcessActivityAdapter:
         }
 
 
+class MacOSProcessActivityAdapter:
+    """Narrow macOS process observer using the built-in ``ps`` command."""
+
+    def __init__(self, runner: Callable[..., subprocess.CompletedProcess]) -> None:
+        self._runner = runner
+
+    def observe(self, harnesses: Sequence[str]) -> Mapping[str, Mapping[str, Any]]:
+        if sys.platform != "darwin":
+            return UnavailableProcessActivityAdapter().observe(harnesses)
+        try:
+            result = self._runner(["ps", "-axo", "comm=,args="], timeout=5)
+            if result.returncode != 0:
+                raise OSError("process query failed")
+            output = result.stdout or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            rows = str(output).splitlines()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return {
+                name: {
+                    "process_count": 0,
+                    "source": "macOS process adapter",
+                    "error": "macOS process discovery failed",
+                }
+                for name in harnesses
+            }
+
+        counts = {name: 0 for name in harnesses}
+        for row in rows:
+            columns = row.strip().split(None, 1)
+            if not columns:
+                continue
+            image = columns[0].rsplit("/", 1)[-1].lower()
+            command = row.lower()
+            if image == "codex" and " app-server " not in f" {command} ":
+                counts["codex"] = counts.get("codex", 0) + 1
+            elif image == "agy":
+                counts["agy"] = counts.get("agy", 0) + 1
+            elif image in {"mcode", "minimax"} or (
+                image == "node"
+                and (
+                    "@minimax-ai/code/cli.js" in command
+                    or ".minimax-code/node_modules" in command
+                )
+            ):
+                counts["minimax"] = counts.get("minimax", 0) + 1
+        return {
+            name: {"process_count": counts.get(name, 0), "source": "macOS process adapter", "error": None}
+            for name in harnesses
+        }
+
+
 def default_process_activity_adapter(
     runner: Callable[..., subprocess.CompletedProcess],
 ) -> ProcessActivityAdapter:
-    return WindowsProcessActivityAdapter(runner) if sys.platform == "win32" else UnavailableProcessActivityAdapter()
+    if sys.platform == "win32":
+        return WindowsProcessActivityAdapter(runner)
+    if sys.platform == "darwin":
+        return MacOSProcessActivityAdapter(runner)
+    return UnavailableProcessActivityAdapter()
 
 
 __all__ = [
     "ProcessActivityAdapter",
     "UnavailableProcessActivityAdapter",
     "WindowsProcessActivityAdapter",
+    "MacOSProcessActivityAdapter",
     "default_process_activity_adapter",
 ]

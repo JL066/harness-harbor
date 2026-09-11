@@ -1,0 +1,41 @@
+name: Windows release artifact
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-build.yml'
+      - 'build_exe.py'
+      - 'harbor_runtime/**'
+      - 'launcher/**'
+      - 'run_launcher.py'
+      - 'tests/**'
+      - 'requirements*.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install runtime, launcher, and test dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-launcher.txt
+      - name: Run shared test suites
+        run: |
+          python -m pytest -q -m "shared or windows_ci"
+      - name: Build versioned Windows onedir archive
+        run: python build_exe.py --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Harness-Harbor-windows-release
+          path: |
+            dist/Harness-Harbor-v*-windows-x64.zip
+            dist/SHA256SUMS.txt

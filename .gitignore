@@ -11,6 +11,12 @@ dist/
 build/
 *.egg
 
+# Release artifacts
+*.app
+*.dmg
+*.exe
+*.msi
+
 # Job runtime records — must never be committed
 .jobs/
 
@@ -31,6 +37,8 @@ tunnel-supervisor.log
 .tox/
 .coverage
 htmlcov/
+.build/
+.swiftpm/
 
 # OS noise
 .DS_Store
@@ -56,3 +64,7 @@ _*.ps1
 *.bak
 *.index
 scratch/
+
+# Package initializers and entrypoints are release source, not one-off underscore scripts
+!**/__init__.py
+!**/__main__.py

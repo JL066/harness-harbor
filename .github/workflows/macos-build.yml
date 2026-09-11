@@ -1,0 +1,27 @@
+name: macOS release artifact
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['macos/**', 'harbor_runtime/**', 'harbor_platform/**', 'launcher/**', 'run_runtime.py']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r macos/requirements-build.txt
+      - run: swift test --package-path macos --scratch-path build/swift-tests
+      - run: sh macos/check.sh
+      - run: python macos/build.py --dmg
+      - run: sh macos/check.sh "$PWD"/dist/macos-*/Harness\ Harbor.app/Contents/Resources/HarborRuntime/harbor-runtime
+        timeout-minutes: 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Harness-Harbor-macos-release
+          path: |
+            dist/**/Harness-Harbor-v*-macos-*.dmg
+            dist/**/SHA256SUMS.txt

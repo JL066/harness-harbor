@@ -8,7 +8,7 @@ back the final state, and always releases the lock in ``finally``.
 Three execution models are supported:
 
 * **Codex** — runs the Codex CLI via a one-shot blocking
-  ``subprocess.run``. Codex exits cleanly on completion.
+  the shared bounded subprocess wrapper. Codex exits cleanly on completion.
 * **MiniMax** — runs the MiniMax CLI through a lifecycle-aware
   supervisor that:
     - Polls the process every 200ms instead of blocking forever.
@@ -214,15 +214,8 @@ def run_codex_with_routes(
             },
         )
         write_state(state_path, state)
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            env=child_env,
-        )
+        from control_plane import run_safe_subprocess
+        result = run_safe_subprocess(command, env=child_env, timeout=3600)
         collected = collect_result(result, result_path, redact_values=redact_values)
         classification = classify_codex_route_failure(result)
         attempts.append({
@@ -463,7 +456,10 @@ def run_minimax_with_lifecycle(
         )
 
     try:
-        proc = subprocess.Popen(command, **popen_kwargs)
+        if sys.platform != "win32":
+            popen_kwargs["start_new_session"] = True
+        from harbor_platform.process import spawn_owned
+        proc = spawn_owned(command, **popen_kwargs)
     except (OSError, ValueError) as exc:
         return {
             "exit_code": -1,
@@ -555,6 +551,8 @@ def run_minimax_with_lifecycle(
             time.sleep(poll_interval)
     finally:
         # Reap (idempotent) and drain remaining pipe bytes.
+        from harbor_platform.process import terminate_tree
+        terminate_tree(proc)
         try:
             if proc.poll() is None:
                 _escalate_terminate(proc, list(command))
@@ -686,7 +684,7 @@ def collect_minimax_lifecycle_result(
 # ---------------------------------------------------------------------------
 #
 # The agy CLI runs as a one-shot ``agy --print`` process. Unlike Codex
-# (which has its own blocking subprocess.run wrapper) and unlike MiniMax
+# (which uses the shared bounded subprocess wrapper) and unlike MiniMax
 # (which writes a result file we can poll for stability), agy emits a
 # single JSON object on stdout at the end of the turn. The worker must
 # therefore watch the *stdout stream* for the final non-empty line and
@@ -850,7 +848,10 @@ def run_agy_with_lifecycle(
         )
 
     try:
-        proc = subprocess.Popen(command, **popen_kwargs)
+        if sys.platform != "win32":
+            popen_kwargs["start_new_session"] = True
+        from harbor_platform.process import spawn_owned
+        proc = spawn_owned(command, **popen_kwargs)
     except (OSError, ValueError) as exc:
         return {
             "exit_code": -1,
@@ -931,6 +932,8 @@ def run_agy_with_lifecycle(
 
             time.sleep(poll_interval)
     finally:
+        from harbor_platform.process import terminate_tree
+        terminate_tree(proc)
         try:
             if proc.poll() is None:
                 _escalate_terminate(proc, list(command))
@@ -1151,7 +1154,7 @@ def main(job_dir: Path) -> None:
             state.update(collected)
 
         write_state(state_path, state)
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         try:
             state = load_state(state_path)
         except (OSError, ValueError):
@@ -1201,4 +1204,9 @@ def main(job_dir: Path) -> None:
 
 
 if __name__ == "__main__":
+    if sys.platform != "win32":
+        import signal
+        def _stop(*_):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, _stop)
     main(Path(sys.argv[1]))

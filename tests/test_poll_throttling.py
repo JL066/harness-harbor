@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -18,6 +19,41 @@ import server_legacy
 
 
 class PollThrottlingTests(unittest.TestCase):
+    def test_terminal_written_while_waiting_for_metadata_lock(self):
+        for busy in (False, True):
+            with self.subTest(busy=busy):
+                job_id = "completion_during_lock_wait"
+                job = self._create_job(job_id)
+                (job / "poll_meta.json").write_text("broken")
+
+                @contextmanager
+                def complete_during_wait(*args, **kwargs):
+                    state = json.loads((job / "status.json").read_text())
+                    state.update(status="completed", final_message="done")
+                    (job / "status.json").write_text(json.dumps(state))
+                    if busy:
+                        raise control_plane.JobPollLockError("busy")
+                    yield
+
+                with mock.patch.object(control_plane, "_job_poll_lock", complete_during_wait):
+                    result = control_plane.poll_task(job_id)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["status"], "completed")
+                self.assertFalse(result["poll_throttled"])
+
+    def test_queue_mismatch_precedes_cancel_lock_and_explains_reader(self):
+        job_id = "wrong_queue"
+        job = self._create_job(job_id)
+        state = json.loads((job / "status.json").read_text())
+        state["queue_root_fingerprint"] = "other"
+        (job / "status.json").write_text(json.dumps(state))
+        (job / "worker.lock").write_text("claimed")
+        for read in (control_plane.poll_task, control_plane.cancel_task):
+            result = read(job_id)
+            self.assertFalse(result["ok"])
+            self.assertIn("different Harbor queue", result["error"])
+            self.assertEqual(Path(result["queue_root"]["jobs_dir"]), self.jobs_dir.resolve())
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.jobs_dir = Path(self.temp_dir.name) / ".jobs"
@@ -76,7 +112,7 @@ class PollThrottlingTests(unittest.TestCase):
         self.assertIn("snapshot", meta)
         self.assertEqual("running", meta["snapshot"]["status"])
 
-    def test_second_poll_within_10m_returns_cached_snapshot_without_reading_status_file(self):
+    def test_second_poll_reads_local_running_status_but_keeps_cooldown(self):
         job_id = "test_job_002"
         job_dir = self._create_job(job_id, status="running")
 
@@ -85,8 +121,6 @@ class PollThrottlingTests(unittest.TestCase):
             res1 = control_plane.poll_task(job_id)
         self.assertFalse(res1["poll_throttled"])
 
-        # Delete status.json to prove second poll does NOT touch status.json at all
-        (job_dir / "status.json").unlink()
 
         t1 = t0 + 60.0
         with mock.patch("time.time", return_value=t1):
@@ -98,7 +132,7 @@ class PollThrottlingTests(unittest.TestCase):
         self.assertEqual(540, res2["retry_after_seconds"])
         self.assertEqual(res1["next_allowed_at"], res2["next_allowed_at"])
 
-    def test_status_change_cached_during_cooldown_and_refreshed_after_cooldown(self):
+    def test_worker_completion_bypasses_cached_running_within_cooldown(self):
         job_id = "test_job_status_change"
         job_dir = self._create_job(job_id, status="running")
 
@@ -118,15 +152,16 @@ class PollThrottlingTests(unittest.TestCase):
         }
         (job_dir / "status.json").write_text(json.dumps(completed_state), encoding="utf-8")
 
-        # Within 10m (e.g. t0 + 100s), normal poll MUST still return cached running snapshot
+        # Local completion wins immediately, without immediate=True or waiting 10 minutes
         t_mid = t0 + 100.0
         with mock.patch("time.time", return_value=t_mid):
             res_cached = control_plane.poll_task(job_id, immediate=False)
 
         self.assertTrue(res_cached["ok"])
-        self.assertEqual("running", res_cached["status"])
-        self.assertTrue(res_cached["poll_throttled"])
-        self.assertEqual(500, res_cached["retry_after_seconds"])
+        self.assertEqual("completed", res_cached["status"])
+        self.assertEqual("job finished successfully", res_cached["final_message"])
+        self.assertFalse(res_cached["poll_throttled"])
+        self.assertNotIn("retry_after_seconds", res_cached)
 
         # After 10m expires (t0 + 601s), normal poll reads disk and returns completed
         t_after = t0 + 601.0
@@ -166,6 +201,40 @@ class PollThrottlingTests(unittest.TestCase):
         self.assertEqual("done", res_imm["final_message"])
         self.assertFalse(res_imm["poll_throttled"])
 
+    def test_all_terminal_states_override_corrupt_meta_and_busy_lock_without_probes(self):
+        for terminal in ("completed", "failed", "cancelled"):
+            with self.subTest(terminal=terminal):
+                job_id = "terminal_" + terminal
+                job_dir = self._create_job(job_id, status="running")
+                self.assertEqual(control_plane.poll_task(job_id)["status"], "running")
+                state_path = job_dir / "status.json"
+                state = json.loads(state_path.read_text())
+                state.update(status=terminal, final_message="fresh result")
+                control_plane.write_json(state_path, state)
+                (job_dir / "poll_meta.json").write_text("{corrupt")
+                lock = control_plane._get_job_thread_lock(str(job_dir))
+                lock.acquire()
+                try:
+                    with mock.patch.object(control_plane, "run_safe_subprocess") as probe, mock.patch.object(control_plane, "write_json") as write:
+                        result = control_plane.poll_task(job_id)
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(result["status"], terminal)
+                    self.assertEqual(result["final_message"], "fresh result")
+                    self.assertFalse(result["poll_throttled"])
+                    probe.assert_not_called()
+                    write.assert_not_called()
+                finally:
+                    lock.release()
+
+    def test_missing_or_unreadable_local_status_never_returns_cached_running(self):
+        job_id = "missing_status"
+        job_dir = self._create_job(job_id)
+        control_plane.poll_task(job_id)
+        (job_dir / "status.json").write_text("{invalid")
+        self.assertFalse(control_plane.poll_task(job_id)["ok"])
+        (job_dir / "status.json").unlink()
+        self.assertIn("Unknown job_id", control_plane.poll_task(job_id)["error"])
+
     def test_immediate_true_resets_cooldown_for_running_job(self):
         job_id = "test_job_imm_reset"
         self._create_job(job_id, status="running")
@@ -187,7 +256,7 @@ class PollThrottlingTests(unittest.TestCase):
         self.assertTrue(res_sub["poll_throttled"])
         self.assertEqual(540, res_sub["retry_after_seconds"])
 
-    def test_terminal_snapshot_repeated_reads_without_status_file_access(self):
+    def test_terminal_polls_always_read_latest_local_result(self):
         job_id = "test_job_terminal_cached"
         job_dir = self._create_job(job_id, status="completed")
 
@@ -198,8 +267,10 @@ class PollThrottlingTests(unittest.TestCase):
         self.assertEqual("completed", res1["status"])
         self.assertFalse(res1["poll_throttled"])
 
-        # Delete status.json to prove subsequent reads are completely served from terminal snapshot
-        (job_dir / "status.json").unlink()
+        # A later local result revision must not be hidden by a terminal cache.
+        state = json.loads((job_dir / "status.json").read_text())
+        state["final_message"] = "latest local result"
+        (job_dir / "status.json").write_text(json.dumps(state))
 
         for offset in (1, 5, 10, 100, 1000):
             with mock.patch("time.time", return_value=t0 + offset):
@@ -207,8 +278,9 @@ class PollThrottlingTests(unittest.TestCase):
                 self.assertTrue(res["ok"])
                 self.assertEqual("completed", res["status"])
                 self.assertFalse(res["poll_throttled"])
+                self.assertEqual(res["final_message"], "latest local result")
 
-    def test_concurrent_first_polls_exact_one_disk_read(self):
+    def test_concurrent_first_polls_read_local_state_but_only_one_advances_cooldown(self):
         job_id = "test_job_concurrent_penetration"
         self._create_job(job_id, status="running")
 
@@ -232,8 +304,8 @@ class PollThrottlingTests(unittest.TestCase):
                     futures = [executor.submit(control_plane.poll_task, job_id) for _ in range(4)]
                     results = [f.result() for f in futures]
 
-        # Exactly 1 thread performed actual status.json read
-        self.assertEqual(1, read_count)
+        # Read before and after lock acquisition; cooldown updates remain serialized.
+        self.assertEqual(8, read_count)
 
         # Exactly 1 returned poll_throttled=False, all other 3 were throttled
         unthrottled = [r for r in results if not r["poll_throttled"]]
@@ -241,7 +313,7 @@ class PollThrottlingTests(unittest.TestCase):
         self.assertEqual(1, len(unthrottled))
         self.assertEqual(3, len(throttled))
 
-    def test_thread_lock_timeout_fails_closed_without_status_read(self):
+    def test_thread_lock_timeout_reads_local_state_and_fails_closed(self):
         job_id = "test_job_thread_lock_timeout"
         job_dir = self._create_job(job_id, status="running")
 
@@ -265,12 +337,12 @@ class PollThrottlingTests(unittest.TestCase):
             self.assertTrue(res["lock_busy"])
             self.assertIn("busy", res["error"])
             self.assertEqual(600, res["retry_after_seconds"])
-            # status.json was NOT read
-            self.assertEqual(0, read_count)
+            # Reading local status does not bypass the metadata lock for running jobs
+            self.assertEqual(2, read_count)
         finally:
             thread_lock.release()
 
-    def test_file_lock_timeout_fails_closed_without_status_read(self):
+    def test_file_lock_timeout_reads_local_state_and_fails_closed(self):
         job_id = "test_job_file_lock_timeout"
         job_dir = self._create_job(job_id, status="running")
 
@@ -297,8 +369,8 @@ class PollThrottlingTests(unittest.TestCase):
             self.assertTrue(res["lock_busy"])
             self.assertIn("busy", res["error"])
             self.assertEqual(600, res["retry_after_seconds"])
-            # status.json was NOT read
-            self.assertEqual(0, read_count)
+            # Reading local status does not bypass the metadata lock for running jobs
+            self.assertEqual(2, read_count)
         finally:
             os.close(fd)
             lock_file.unlink(missing_ok=True)
@@ -326,7 +398,7 @@ class PollThrottlingTests(unittest.TestCase):
             self.assertTrue(res["poll_throttled"])
             self.assertTrue(res["lock_busy"])
             self.assertEqual(600, res["retry_after_seconds"])
-            self.assertEqual(0, read_count)
+            self.assertEqual(2, read_count)
         finally:
             thread_lock.release()
 
@@ -443,10 +515,7 @@ class PollThrottlingTests(unittest.TestCase):
         self.assertFalse(res1["poll_throttled"])
         self.assertFalse(res1.get("meta_persisted", True))
 
-        # Delete status.json to ensure disk status cannot be read
-        (job_dir / "status.json").unlink()
-
-        # Second poll at t0 + 30s must use in-memory cache and be throttled without reading disk
+        # Local status is still read; in-memory metadata preserves the cooldown.
         t1 = t0 + 30.0
         with mock.patch("time.time", return_value=t1):
             res2 = control_plane.poll_task(job_id)

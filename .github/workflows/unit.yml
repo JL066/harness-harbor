@@ -10,10 +10,11 @@ permissions:
 
 jobs:
   unit:
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [windows-latest, macos-latest]
         python-version: ["3.11", "3.12"]
     steps:
       - name: Check out source
@@ -25,18 +26,24 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install runtime dependency
-        run: python -m pip install -r requirements.txt
-
-      - name: Run isolated unit suite
-        shell: pwsh
-        env:
-          HARBOR_AGY_DANGEROUSLY_SKIP_PERMISSIONS: ""
-          HARBOR_TUNNEL_EXE: ""
-          HARBOR_TUNNEL_PROFILE_DIR: ""
-          HARBOR_TUNNEL_PROFILE: ""
+      - name: Install runtime and test dependencies
         run: |
-          Get-ChildItem Env: | Where-Object { $_.Name -like 'HARBOR_*' } | ForEach-Object {
-            Remove-Item -LiteralPath ("Env:" + $_.Name) -ErrorAction SilentlyContinue
-          }
-          python -m unittest discover -s tests -v
+          python -m pip install -r requirements.txt
+          python -m pip install pytest requests pillow customtkinter
+
+      - name: Shared contracts required on both platforms
+        run: python -m pytest -q -m shared --junitxml=build/shared-results.xml
+
+      - name: macOS platform contracts
+        if: runner.os == 'macOS'
+        run: python -m pytest -q -m macos --junitxml=build/macos-results.xml
+
+      - name: Windows hosted-runner contracts
+        if: runner.os == 'Windows'
+        run: python -m pytest -q -m windows_ci --junitxml=build/windows-ci-results.xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}-${{ matrix.python-version }}
+          path: build/*-results.xml
