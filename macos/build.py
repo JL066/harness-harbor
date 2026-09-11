@@ -77,7 +77,9 @@ def main():
         command += ["--codesign-identity", args.signing_identity]
     subprocess.run(command, cwd=ROOT, env=env, check=True)
     scratch = ROOT / "build/swift"
-    subprocess.run(["swift", "build", "--package-path", str(ROOT / "macos"), "--scratch-path", str(scratch), "-c", "release"], env=env, check=True)
+    subprocess.run(["swift", "build", "--package-path", str(ROOT / "macos"), "--scratch-path", str(scratch), "-c", "release",
+                    "-Xswiftc", "-file-prefix-map", "-Xswiftc", f"{ROOT}=.",
+                    "-Xswiftc", "-debug-prefix-map", "-Xswiftc", f"{ROOT}=."], env=env, check=True)
     app = output / "Harness Harbor.app"
     contents = app / "Contents"
     (contents / "MacOS").mkdir(parents=True)
