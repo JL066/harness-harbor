@@ -52,3 +52,10 @@ suites, then uploads the archive and checksum file as an Actions artifact.
 `.app`, `.dmg`, `.exe`, and `.msi` outputs are ignored by Git. Release
 artifacts remain local or in CI artifact storage until an operator performs a
 separate, explicitly authorized publication step.
+
+## Independent platform releases
+
+Use `macos-v<version>` and `windows-v<version>` tags; previews append
+`-preview.N` and are GitHub prereleases. Shared runtime version stays `1.1.0`.
+Only macOS DMG/checksums belong in a macOS Release. Windows binaries require
+separate native acceptance; do not imply they passed from Mac results.

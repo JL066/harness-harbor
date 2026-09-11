@@ -1,6 +1,8 @@
 # macOS native development build — 1.1.0
 
-Status: Apple Silicon development implementation. Not a notarized public release.
+Status: Apple Silicon downloadable preview. Ad-hoc signed, not notarized.
+
+[Download macOS 1.1.0 preview DMG and checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.1).
 Intel and clean-machine Gatekeeper acceptance remain unvalidated.
 
 The native SwiftUI app has a menu-bar entry, dashboard, setup, settings, Keychain,
@@ -81,7 +83,7 @@ submits the signed app, checks Accepted, staples, assesses Gatekeeper, creates a
 notarizes/staples a DMG. It uses an existing credential profile and does not install
 certificates, change keychains, or publish a GitHub Release.
 
-Before public distribution: run Windows/macOS CI, real Keychain write/read/delete,
+Before stable public distribution: run Windows/macOS CI, real Keychain write/read/delete,
 login enable/disable, Secure Tunnel → MCP → Codex end-to-end, Developer ID and
 notarization, and a clean-machine drag-to-Applications/Gatekeeper check.
 Do not label macOS Supported until all PRD gates pass. See
