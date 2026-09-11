@@ -37,3 +37,20 @@ not publish credentials or sensitive worktree data. Vulnerabilities in the
 installed Codex, MiniMax, AGY, tunnel, or other third-party CLIs should also be
 reported to their respective maintainers. Harbor cannot guarantee the security
 of those tools or their credential stores.
+# macOS host security
+
+The development macOS host uses Security.framework Keychain items under service
+`com.jl066.harness-harbor`; accounts retain the existing CredentialStore target
+names. The Swift app accepts secret replacement/removal and passes values only
+in child environments. The Python compatibility backend has no plaintext fallback.
+
+The bridge is child stdin/stdout NDJSON protocol v1 with a fixed method allowlist,
+strict request validation, bounded messages/log tails, and redacted responses.
+It exposes no arbitrary shell, file write or PID termination method. The runtime
+holds an exclusive state-directory lock and verifies persisted component process
+identities before recovery. POSIX children have isolated process groups and
+TERM/KILL escalation. Diagnostics report local paths; review before sharing them.
+
+Development bundles are ad-hoc signed. They are not notarized public releases.
+Developer ID, notarization credentials and tunnel/provider keys must never be
+committed or included in application resources.
