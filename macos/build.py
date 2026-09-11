@@ -79,7 +79,8 @@ def main():
     scratch = ROOT / "build/swift"
     subprocess.run(["swift", "build", "--package-path", str(ROOT / "macos"), "--scratch-path", str(scratch), "-c", "release",
                     "-Xswiftc", "-file-prefix-map", "-Xswiftc", f"{ROOT}=.",
-                    "-Xswiftc", "-debug-prefix-map", "-Xswiftc", f"{ROOT}=."], env=env, check=True)
+                    "-Xswiftc", "-debug-prefix-map", "-Xswiftc", f"{ROOT}=.",
+                    "-Xlinker", "-S"], env=env, check=True)
     app = output / "Harness Harbor.app"
     contents = app / "Contents"
     (contents / "MacOS").mkdir(parents=True)
