@@ -39,7 +39,7 @@ class ProcessContractTests(unittest.TestCase):
         other = process.spawn_owned([sys.executable, "-c", "import time;time.sleep(60)"])
         try:
             from harbor_platform.host import read_line
-            self.assertEqual(read_line(proc.stdout, timeout=5), b"ready\n")
+            self.assertEqual(read_line(proc.stdout, timeout=5).replace(b"\r\n", b"\n"), b"ready\n")
             identity = getattr(proc, "_harbor_identity", None) or process.settled_identity(proc.pid)
             self.assertGreaterEqual(len(process.descendants(identity)), 3)
             proc.kill()

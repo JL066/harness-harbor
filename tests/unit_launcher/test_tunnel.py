@@ -86,20 +86,18 @@ def test_child_only_env_injection_and_duplicate_prevention(tmp_path):
     manager = TunnelProfileManager(_settings(), profile_path=tmp_path / "p.yaml", runtime_path=tmp_path / "harbor")
     supervisor = ManagedTunnelSupervisor(manager, store, tunnel_executable=tmp_path / "tunnel-client.exe", popen_factory=fake_popen)
     before = os.environ.get("TUNNEL_RUNTIME_KEY")
-    with mock.patch("harbor_platform.process.track", side_effect=lambda proc: proc):
+    with mock.patch("harbor_platform.process.spawn_owned", side_effect=lambda cmd, popen_factory, **kwargs: popen_factory(cmd, **kwargs)) as spawn:
         first = supervisor.start()
         second = supervisor.start()
     assert first is second and len(calls) == 1
     assert calls[0][1]["env"]["TUNNEL_RUNTIME_KEY"] == "runtime-secret"
-    if os.name == "nt":
-        assert "start_new_session" not in calls[0][1]
-    else:
-        assert calls[0][1]["start_new_session"] is True
+    assert spawn.call_count == 1
+    assert spawn.call_args.kwargs["popen_factory"] is fake_popen
     assert os.environ.get("TUNNEL_RUNTIME_KEY") == before
     assert "runtime-secret" not in (tmp_path / "p.yaml").read_text(encoding="utf-8")
 
 
-def test_posix_stop_delegates_to_terminate_tree(tmp_path):
+def test_stop_delegates_to_owned_terminate_tree(tmp_path):
     backend = InMemoryCredentialBackend()
     store = CredentialStore(backend=backend)
     store.store(_settings().connection.credential_ref, "runtime-secret")
@@ -111,8 +109,7 @@ def test_posix_stop_delegates_to_terminate_tree(tmp_path):
     manager = TunnelProfileManager(_settings(), profile_path=tmp_path / "p.yaml", runtime_path=tmp_path / "harbor")
     supervisor = ManagedTunnelSupervisor(manager, store, tunnel_executable=tmp_path / "tunnel-client.exe", popen_factory=lambda *a, **k: proc)
 
-    with mock.patch("launcher.tunnel.os.name", "posix"), \
-         mock.patch("harbor_platform.process.track", side_effect=lambda value: value), \
+    with mock.patch("harbor_platform.process.spawn_owned", return_value=proc), \
          mock.patch("harbor_platform.process.terminate_tree", return_value=True) as terminate_tree:
         supervisor.start()
         assert supervisor.stop(timeout=2.5) is True
