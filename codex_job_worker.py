@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -713,8 +714,29 @@ AGY_EXIT_GRACE = 3.0               # CLI gets this long to exit after result
 AGY_TOTAL_TIMEOUT = 30 * 60.0      # 30 min hard upper bound
 
 
+def _iter_agy_json_objects(stdout_text: object):
+    """Yield one-line JSON objects emitted by agy, with their raw lines."""
+    if not isinstance(stdout_text, str) or not stdout_text:
+        return
+    for raw_line in stdout_text.splitlines():
+        line = raw_line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            yield payload, line
+
+
+_AGY_RESULT_MESSAGE_FIELDS = (
+    "response", "result", "text", "content", "answer", "output", "message"
+)
+
+
 def _extract_agy_result_message(stdout_text: str) -> str:
-    """Locate the last JSON object on stdout and return its ``response`` / ``result`` field.
+    """Extract the agent response from agy's final JSON line.
 
     Agy with ``--output-format json`` emits a JSON object on stdout at the end
     of the turn with shape:
@@ -728,67 +750,84 @@ def _extract_agy_result_message(stdout_text: str) -> str:
     5. ``{"answer": "..."}``   — alt (matches minimax's shape)
     6. ``{"output": "..."}``   — alt
     7. ``{"message": "..."}``  — alt
-    8. A plain string line is returned as-is (best effort)
 
-    If multiple JSON objects appear, the last one wins. If no JSON
-    object can be parsed, the last non-empty stdout line is returned
-    verbatim so the caller's ``final_message`` is still populated.
+    The last non-empty stdout line must be a JSON object. A JSON object
+    without an actual response field is not a result. Non-JSON output is
+    treated as diagnostic text, not an agent response.
     """
     if not isinstance(stdout_text, str) or not stdout_text:
         return ""
-    last_json_obj: dict | None = None
-    last_json_raw: str | None = None
-    for raw_line in stdout_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if not (line.startswith("{") and line.endswith("}")):
-            continue
-        try:
-            payload = json.loads(line)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(payload, dict):
-            last_json_obj = payload
-            last_json_raw = line
-    if last_json_obj is not None:
-        for key in ("response", "result", "text", "content", "answer", "output", "message"):
-            value = last_json_obj.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        # JSON but no recognized field: return the raw JSON so the
-        # caller can still see *something* useful.
-        return last_json_raw or ""
-    # No JSON; fall back to the last non-empty line.
-    for raw_line in reversed(stdout_text.splitlines()):
-        line = raw_line.strip()
-        if line:
-            return line
+    last_line = next(
+        (raw_line.strip() for raw_line in reversed(stdout_text.splitlines()) if raw_line.strip()),
+        "",
+    )
+    if not last_line:
+        return ""
+    try:
+        last_json_obj = json.loads(last_line)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(last_json_obj, dict):
+        return ""
+    for key in _AGY_RESULT_MESSAGE_FIELDS:
+        value = last_json_obj.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # Metadata-only JSON is not an agent response.
     return ""
+
+
+def _agy_denied_actions(stdout_text: object) -> list:
+    """Return all denied action entries reported by agy JSON output."""
+    denied_actions: list = []
+    for payload, _ in _iter_agy_json_objects(stdout_text):
+        value = payload.get("denied_actions")
+        if isinstance(value, list):
+            denied_actions.extend(value)
+        elif value:
+            denied_actions.append(value)
+    return denied_actions
+
+
+def _agy_stderr_has_permission_denial(stderr_text: object) -> bool:
+    """Recognize AGY headless permission denials in stderr diagnostics."""
+    if not isinstance(stderr_text, str) or not stderr_text:
+        return False
+    return bool(
+        re.search(r"(?:permission|approval)[^\n]{0,120}(?:denied|rejected)", stderr_text, re.IGNORECASE)
+        or re.search(r"(?:denied|rejected)[^\n]{0,120}(?:permission|approval)", stderr_text, re.IGNORECASE)
+        or re.search(r"(?:headless|non[- ]interactive)[^\n]{0,200}(?:cannot prompt|auto[- ]denied)", stderr_text, re.IGNORECASE)
+    )
 
 
 
 def _agy_stdout_has_final_result(stdout_text: str) -> tuple[bool, str]:
     """Return (is_final, message).
 
-    The final-result signal is the last JSON object on stdout (or the
-    last non-empty line if no JSON object is present). We do **not**
-    require any specific key here; the lifecycle supervisor only needs
-    to know that *some* terminal output exists so it can grant the
-    exit grace and stop the polling loop. Field extraction is the job
-    of ``_extract_agy_result_message`` and ``collect_agy_lifecycle_result``.
+    Native AGY JSON output is terminal only when the last non-empty line
+    is a JSON object with a status or response field and a usable agent
+    response. Logs, malformed JSON, and metadata-only objects do not end
+    lifecycle supervision.
     """
     if not isinstance(stdout_text, str) or not stdout_text:
         return False, ""
-    # Use the bounded drain: we want a stable tail to compare against.
-    last_line = ""
-    for raw_line in stdout_text.splitlines():
+    for raw_line in reversed(stdout_text.splitlines()):
         line = raw_line.strip()
-        if line:
-            last_line = line
-    if not last_line:
-        return False, ""
-    return True, last_line
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError):
+            return False, ""
+        if not isinstance(payload, dict):
+            return False, ""
+        if "status" not in payload and not any(
+            key in payload for key in _AGY_RESULT_MESSAGE_FIELDS
+        ):
+            return False, ""
+        message = _extract_agy_result_message(line)
+        return (bool(message), message) if message else (False, "")
+    return False, ""
 
 
 def _agy_stdout_stable(
@@ -802,11 +841,15 @@ def _agy_stdout_stable(
     minimax; minimax watches a result file, agy watches the bounded
     stdout drain.
     """
+    is_final, _ = _agy_stdout_has_final_result(stdout_text)
+    if not is_final:
+        return False, ""
     last_line = ""
-    for raw_line in stdout_text.splitlines():
+    for raw_line in reversed(stdout_text.splitlines()):
         line = raw_line.strip()
         if line:
             last_line = line
+            break
     if not last_line:
         return False, ""
     if last_tail is not None and last_line == last_tail:
@@ -977,6 +1020,8 @@ def collect_agy_lifecycle_result(
 
     Semantics (mirror ``collect_minimax_lifecycle_result``):
 
+    * a non-empty ``denied_actions`` result or headless permission denial ->
+      ``failed``, ``failure_type=agy_permission_denied``.
     * ``grace_expired_after_result`` with a usable final message -> ``completed``,
       ``forced_exit_after_result=True``.
     * ``self_exit`` with a usable final message -> ``completed``.
@@ -1003,12 +1048,6 @@ def collect_agy_lifecycle_result(
     }
 
     final_message = _extract_agy_result_message(stdout_full)
-    # If the lifecycle's pre-computed result_text captured the tail but
-    # the post-hoc extractor found nothing (e.g. agy emitted a JSON
-    # object whose key we did not recognize), keep the lifecycle's
-    # pre-computed value as a last-ditch fallback.
-    if not final_message and lifecycle.get("result_text"):
-        final_message = lifecycle["result_text"]
 
     # Always write result.txt so the existing collect_result-style
     # downstream code path can still read it.
@@ -1019,14 +1058,56 @@ def collect_agy_lifecycle_result(
         pass
 
     collected["final_message"] = final_message
+    collected["denied_actions"] = denied_actions = _agy_denied_actions(stdout_full)
     reason = lifecycle.get("termination_reason", "self_exit")
     forced = bool(lifecycle.get("forced_exit", False))
 
+    permission_denied = denied_actions or _agy_stderr_has_permission_denial(
+        lifecycle.get("stderr", "")
+    )
+    if permission_denied:
+        collected["status"] = "failed"
+        collected["failure_type"] = "agy_permission_denied"
+        collected["error"] = "Antigravity CLI permission denied"
+        if stderr_tail:
+            collected["error"] += f": {stderr_tail}"
+        return collected
+
+    canonical_status = None
+    for payload, _ in reversed(list(_iter_agy_json_objects(stdout_full))):
+        status = payload.get("status")
+        if isinstance(status, str):
+            canonical_status = status.strip().lower()
+            collected["agent_task_status"] = canonical_status
+            break
+    non_success_statuses = {"failed", "failure", "error", "cancelled", "canceled"}
+
     if reason == "grace_expired_after_result" and final_message:
+        if canonical_status in non_success_statuses:
+            collected.update(
+                status="failed",
+                failure_type="agy_execution_error",
+                error="Antigravity agent reported non-success status",
+            )
+            return collected
         collected["status"] = "completed"
         collected["forced_exit_after_result"] = True
         return collected
     if reason == "self_exit" and final_message:
+        if collected["exit_code"] not in (None, 0):
+            collected.update(
+                status="failed",
+                failure_type="agy_execution_error",
+                error="Antigravity CLI exited with a non-zero status",
+            )
+            return collected
+        if canonical_status in non_success_statuses:
+            collected.update(
+                status="failed",
+                failure_type="agy_execution_error",
+                error="Antigravity agent reported non-success status",
+            )
+            return collected
         collected["status"] = "completed"
         return collected
     if reason == "hard_timeout":

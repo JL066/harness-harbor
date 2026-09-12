@@ -30,6 +30,9 @@ AGY_HELP = textwrap.dedent(
       --dangerously-skip-permissions
       --output-format text|json|stream-json
       --print-timeout <dur>
+      --mode (accept-edits, plan)
+      --sandbox
+      --add-dir <path>
       --model <id>
       --effort (low|medium|high)
     """

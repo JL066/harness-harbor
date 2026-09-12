@@ -46,16 +46,16 @@ ChatGPT 可以把一个较大的项目拆成多个边界清晰的阶段，每次
 
 ## 下载与平台版本
 
-- **macOS 1.1.0 预览版（Apple Silicon）**：[下载 DMG 与 SHA256 校验文件](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.2)。仅 ad-hoc 签名、未公证，Gatekeeper 可能阻止打开；尚非正式稳定版。
+- **macOS 1.1.0 预览版（Apple Silicon）**：[下载 DMG 与 SHA256 校验文件](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.1)。仅 ad-hoc 签名、未公证，Gatekeeper 可能阻止打开；尚非正式稳定版。
 - **Windows 1.1.0**：Windows Python 3.11／3.12 CI 和 ZIP 构建已通过；真机 launcher／托盘、Credential Manager、Task Scheduler 和已安装 harness 验收尚未完成。当前仅提供源码，不发布 Windows 二进制。
 - 两个平台独立发布：macOS 标签 `macos-v<版本>`，Windows 标签 `windows-v<版本>`。预览版追加 `-preview.N`，不混用 Release 或安装包。共享源码仍在同一仓库维护。
 
 测试范围见 [测试矩阵](docs/convergence/TEST_MATRIX.md)。
 
 
-### macOS 密钥存储（下一次构建）
+### macOS 密钥存储
 
-当前源码已将 Harbor 密钥改为本地独立文件，取消钥匙串访问。下载页的 **preview.2 仍使用钥匙串**，此变更需要安装新构建。
+当前 **preview.1** 使用本地独立文件保存 Harbor 密钥，不再访问钥匙串，并包含 macOS AGY 写入权限和失败终态修复。本预览版替代已撤回的早期测试包，请用 SHA256 校验和区分安装包。
 
 文件位置：`~/Library/Application Support/Harness Harbor/credentials/`
 

@@ -46,16 +46,16 @@ This makes workflows possible that continue far beyond a single interactive chat
 
 ## Downloads and platform versions
 
-- **macOS 1.1.0 preview (Apple Silicon)**: [Download the DMG and SHA256 checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.2). Ad-hoc signed, not notarized; Gatekeeper may block opening it. This is not a stable release.
+- **macOS 1.1.0 preview (Apple Silicon)**: [Download the DMG and SHA256 checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.1). Ad-hoc signed, not notarized; Gatekeeper may block opening it. This is not a stable release.
 - **Windows 1.1.0**: Windows Python 3.11/3.12 CI and ZIP packaging passed. Real-machine launcher/tray, Credential Manager, Task Scheduler and installed-harness acceptance remain incomplete. Source only; no Windows binary release yet.
 - Platforms release independently: `macos-v<version>` and `windows-v<version>` tags, with `-preview.N` for previews. Releases and assets are platform-specific; shared source remains in this repository.
 
 See the [test matrix](docs/convergence/TEST_MATRIX.md) for the acceptance scope.
 
 
-### macOS credential storage (next build)
+### macOS credential storage
 
-The source now stores Harbor credentials in private local files instead of Keychain. The downloadable **preview.2 still uses Keychain**; this change requires a new build.
+The current **preview.1** stores Harbor credentials in private local files instead of Keychain. It includes the macOS AGY workspace-write and permission-denial fixes. This preview replaces the earlier withdrawn test uploads; identify the package by its SHA256 checksum.
 
 Files live under `~/Library/Application Support/Harness Harbor/credentials/`:
 

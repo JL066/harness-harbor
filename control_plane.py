@@ -1654,6 +1654,8 @@ def _agy_cli_status() -> dict:
         ),
         "print_timeout": "--print-timeout" in help_text,
         "sandbox": "--sandbox" in help_text,
+        "accept_edits": bool(re.search(r"--mode[^\n]*accept-edits", help_text)),
+        "add_dir": "--add-dir" in help_text,
     }
     models_result = probes.get("models")
     models, models_structurally_valid = (
@@ -1701,6 +1703,8 @@ def _agy_cli_status() -> dict:
         return base
 
     required = ("print", "dangerously_skip_permissions", "output_format", "model", "effort", "print_timeout")
+    if sys.platform == "darwin":
+        required += ("accept_edits", "add_dir", "sandbox")
     missing = [name for name in required if not capabilities[name]]
     if missing:
         base["blocker"] = "Antigravity CLI capability probes did not pass: missing verified exec capabilities: " + ", ".join(missing)
@@ -1713,7 +1717,7 @@ def _agy_cli_status() -> dict:
         noninteractive_command=[str(executable), "--print"],
         parameter_mappings={
             "model": "--model <id>",
-            "sandbox": "sandbox is a single boolean in agy; read-only is rejected (workspace-write is the only verified mapping).",
+            "sandbox": "macOS workspace-write uses --mode accept-edits --sandbox --add-dir <cwd>; read-only remains unsupported.",
             "reasoning_effort": "--effort <low|medium|high>",
         },
         blocker=None,
@@ -1923,14 +1927,16 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
     if harness == "agy":
         response["parameter_handling"] = {
             "model": "mapped to --model" if model else "not requested",
-            "sandbox": "workspace-write is required; dangerous permission bypass is opt-in",
+            "sandbox": ("mapped to --mode accept-edits --sandbox --add-dir <cwd>; outside-workspace access still requires permission"
+                        if sys.platform == "darwin" else "workspace-write is required; dangerous permission bypass is opt-in"),
             "dangerously_skip_permissions": (
                 f"enabled via {AGY_DANGEROUS_PERMISSIONS_ENV}"
                 if dangerous_permissions_enabled
                 else f"disabled by default; set {AGY_DANGEROUS_PERMISSIONS_ENV}=1 to enable"
             ),
             "reasoning_effort": "mapped to --effort" if reasoning_effort else "not requested",
-            "cwd": "not passed via flag; the worker sets Popen(cwd=...)",
+            "cwd": ("mapped to --add-dir and Popen(cwd=...)" if sys.platform == "darwin"
+                    else "not passed via flag; the worker sets Popen(cwd=...)"),
             "result_path": "not passed via flag; the worker writes result.txt from captured stdout",
         }
     return response
@@ -2331,13 +2337,22 @@ def build_agy_command(state: dict, result_path: Path) -> list[str]:
     if state.get("agy_dangerously_skip_permissions", agy_dangerous_permissions_enabled()):
         command.append("--dangerously-skip-permissions")
     command.extend(["--output-format", "json", "--print-timeout", AGY_DEFAULT_PRINT_TIMEOUT])
+    prompt = state["prompt"]
+    if sys.platform == "darwin":
+        if state.get("sandbox", "workspace-write") != "workspace-write":
+            raise ValueError("AGY has no verified read-only mapping; plan mode is not a sandbox")
+        workspace = state["cwd"]
+        command.extend(["--mode", "accept-edits", "--sandbox", "--add-dir", workspace])
+        # cwd alone does not register an AGY workspace: relative writes can
+        # otherwise land in AGY's scratch directory. No persistent config edits.
+        prompt = f"Harbor task workspace: {workspace}\nResolve relative task paths under this directory. Write task outputs only inside it.\n\n{prompt}"
     if state.get("model"):
         command.extend(["--model", state["model"]])
     if state.get("reasoning_effort"):
         command.extend(["--effort", state["reasoning_effort"]])
     # The prompt must be a value of the ``-p`` flag; a bare positional
     # would be rejected by agy.
-    command.append("--print=" + state["prompt"])
+    command.append("--print=" + prompt)
     # result_path is intentionally unused here. The worker writes it.
     _ = result_path
     return command
