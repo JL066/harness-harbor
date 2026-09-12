@@ -41,13 +41,13 @@ When combined with **ChatGPT Scheduled Tasks**, the Supervisor can also come bac
 
 This makes workflows possible that continue far beyond a single interactive chat turn.
 
-> **Platform status:** Windows 1.1.0 convergence changes have not completed native Windows testing. Earlier validation does not certify this update.
+> **Platform status:** Windows 1.1.0 CI and ZIP build pass; real-machine installation and system integration remain unverified.
 > macOS has an Apple Silicon development implementation: native SwiftUI Lighthouse and a bundled Python runtime. An Apple Silicon DMG preview is available; stable release acceptance and Intel validation remain pending. See [macOS setup and release gates](MACOS.md).
 
 ## Downloads and platform versions
 
-- **macOS 1.1.0 preview (Apple Silicon)**: [Download the DMG and SHA256 checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.1). Ad-hoc signed, not notarized; Gatekeeper may block opening it. This is not a stable release.
-- **Windows 1.1.0**: shared logic and mock tests passed on Mac. Native Windows CI, launcher/tray, Credential Manager, Task Scheduler and real process-tree checks remain incomplete. Source only; no Windows binary release yet.
+- **macOS 1.1.0 preview (Apple Silicon)**: [Download the DMG and SHA256 checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.2). Ad-hoc signed, not notarized; Gatekeeper may block opening it. This is not a stable release.
+- **Windows 1.1.0**: Windows Python 3.11/3.12 CI and ZIP packaging passed. Real-machine launcher/tray, Credential Manager, Task Scheduler and installed-harness acceptance remain incomplete. Source only; no Windows binary release yet.
 - Platforms release independently: `macos-v<version>` and `windows-v<version>` tags, with `-preview.N` for previews. Releases and assets are platform-specific; shared source remains in this repository.
 
 See the [test matrix](docs/convergence/TEST_MATRIX.md) for the acceptance scope.
@@ -585,7 +585,7 @@ The MCP server also exposes `harness_telemetry` for unified, authoritative inspe
 
 ## Quick Start
 
-The Windows entrypoint uses **Windows PowerShell**. Native Windows CI and real-machine acceptance of this 1.1.0 update remain pending. Python 3.11/3.12 are configured CI targets, not evidence that this update passed.
+The Windows entrypoint uses **Windows PowerShell**. Windows CI passed on Python 3.11/3.12. Real-machine acceptance of this 1.1.0 update remains pending.
 
 ### 1. Clone the repository
 
@@ -974,7 +974,7 @@ GitHub Actions is configured to run Core tests on Windows and macOS with Python 
 
 | Platform | Status |
 | --- | --- |
-| Windows | 1.1.0 native CI / real-machine acceptance incomplete; no new binary release |
+| Windows | 1.1.0 CI and ZIP build passed; real-machine acceptance incomplete; no public binary release |
 | macOS | Apple Silicon DMG preview; not notarized; Intel / stable acceptance pending |
 | Linux | Not currently validated |
 

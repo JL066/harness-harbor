@@ -41,13 +41,13 @@ ChatGPT 可以把一个较大的项目拆成多个边界清晰的阶段，每次
 
 这样，一个开发工作流就不必局限在单次交互式聊天里。
 
-> **平台状态：** Windows 1.1.0 的跨平台更新尚未完成 Windows 原生测试；此前版本的验证不代表本次更新已通过。<br>
+> **平台状态：** Windows 1.1.0 CI 和 ZIP 构建已通过；真实安装与系统集成验收仍未完成。<br>
 > macOS 已有 Apple Silicon 开发实现：原生 SwiftUI Lighthouse 和内置 Python Runtime。提供 Apple Silicon DMG 预览版；正式发布验收尚未完成，Intel 未验证，详见 [macOS 说明](MACOS.md)。
 
 ## 下载与平台版本
 
-- **macOS 1.1.0 预览版（Apple Silicon）**：[下载 DMG 与 SHA256 校验文件](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.1)。仅 ad-hoc 签名、未公证，Gatekeeper 可能阻止打开；尚非正式稳定版。
-- **Windows 1.1.0**：共享逻辑和模拟测试已在 Mac 通过，Windows 原生 CI、launcher／托盘、Credential Manager、Task Scheduler 和真实进程树测试尚未完成。当前仅提供源码，不发布 Windows 二进制。
+- **macOS 1.1.0 预览版（Apple Silicon）**：[下载 DMG 与 SHA256 校验文件](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.2)。仅 ad-hoc 签名、未公证，Gatekeeper 可能阻止打开；尚非正式稳定版。
+- **Windows 1.1.0**：Windows Python 3.11／3.12 CI 和 ZIP 构建已通过；真机 launcher／托盘、Credential Manager、Task Scheduler 和已安装 harness 验收尚未完成。当前仅提供源码，不发布 Windows 二进制。
 - 两个平台独立发布：macOS 标签 `macos-v<版本>`，Windows 标签 `windows-v<版本>`。预览版追加 `-preview.N`，不混用 Release 或安装包。共享源码仍在同一仓库维护。
 
 测试范围见 [测试矩阵](docs/convergence/TEST_MATRIX.md)。
@@ -583,7 +583,7 @@ MCP 服务端还暴露 `harness_telemetry`，用于统一、权威地检查安�
 
 ## 快速开始
 
-Windows 入口使用 **Windows PowerShell**。当前 1.1.0 更新的 Windows CI 和真机验收仍待完成；Python 3.11/3.12 为配置的测试矩阵，并非本次已通过证明。
+Windows 入口使用 **Windows PowerShell**。当前 1.1.0 更新已通过 Windows Python 3.11/3.12 CI；真机验收仍待完成。
 
 ### 1. 克隆仓库
 
@@ -968,7 +968,7 @@ GitHub Actions 已配置 Windows/macOS、Python 3.11/3.12 Core 测试以及 macO
 
 | 平台 | 状态 |
 | --- | --- |
-| Windows | 1.1.0 原生 CI／真机测试未完成；暂不提供新版安装包 |
+| Windows | 1.1.0 CI 和 ZIP 构建已通过；真机验收未完成；暂不公开发布安装包 |
 | macOS | Apple Silicon DMG 预览版；未公证；Intel／正式发布验收未完成 |
 | Linux | 目前未验证 |
 
