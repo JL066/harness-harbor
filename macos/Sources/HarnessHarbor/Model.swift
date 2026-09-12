@@ -600,7 +600,7 @@ public final class HarborModel: ObservableObject {
         launched = true
         refreshCredentialState()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+            Task { @MainActor [weak self] in self?.refresh() }
         }
         if settings.macos.openDashboard || !settings.macos.setupComplete { openDashboard() }
         bridge.start { [weak self] result in
