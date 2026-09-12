@@ -39,10 +39,14 @@ reported to their respective maintainers. Harbor cannot guarantee the security
 of those tools or their credential stores.
 # macOS host security
 
-The development macOS host uses Security.framework Keychain items under service
-`com.jl066.harness-harbor`; accounts retain the existing CredentialStore target
-names. The Swift app accepts secret replacement/removal and passes values only
-in child environments. The Python compatibility backend has no plaintext fallback.
+The macOS host stores its two supported keys in separate plaintext files under
+`~/Library/Application Support/Harness Harbor/credentials/` (directory `0700`,
+files `0600`, owned by the current user). Other software running as that user can
+read them. Files are created on explicit save; unused custom credentials are not
+loaded. Swift and Python share the same format. Values pass only through child
+environments, not settings JSON or command-line arguments. Legacy Keychain entries
+are not automatically read, migrated or deleted. Windows retains Credential Manager.
+The existing preview.2 binary predates this change and still uses Keychain.
 
 The bridge is child stdin/stdout NDJSON protocol v1 with a fixed method allowlist,
 strict request validation, bounded messages/log tails, and redacted responses.

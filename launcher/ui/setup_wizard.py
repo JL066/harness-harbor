@@ -6,6 +6,7 @@ delegate persistence to :class:`SettingsController`.
 """
 from __future__ import annotations
 
+import sys
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -152,6 +153,10 @@ class SettingsController:
         """Read and validate the post-apply state before any writes occur."""
         if value is not None and clear:
             raise ValueError(f"{label} cannot be replaced and cleared at the same time.")
+        if sys.platform == "darwin" and value is None and not clear:
+            if required and not self.store.exists(ref):
+                raise ValueError(f"{label} is required and must remain configured.")
+            return None  # No mutation to roll back; do not read an unused secret.
         try:
             present = self.store.exists(ref)
             existing = self.store.read(ref) if present else None

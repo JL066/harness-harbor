@@ -150,3 +150,19 @@ def test_corrupt_settings_still_require_repair_even_with_legacy_evidence(tmp_pat
     path = tmp_path / "settings.json"; path.write_text("{not-json", encoding="utf-8")
     status = first_run_status(settings_path=path, legacy_detector=lambda: True)
     assert status.required is True and status.corrupted is True
+
+
+def test_macos_unmodified_credentials_are_not_read(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+    import launcher.ui.setup_wizard as setup
+
+    monkeypatch.setattr(setup.sys, "platform", "darwin")
+    store = Mock()
+    store.exists.return_value = True
+    controller = SettingsController(credential_store=store, settings_path=tmp_path / "settings.json")
+    assert controller._preflight_secret(CREDENTIAL_TARGET_CODEX_CUSTOM_API_KEY, None, False, required=False, label="Custom API key") is None
+    store.exists.assert_not_called()
+    store.read.assert_not_called()
+    assert controller._preflight_secret(CREDENTIAL_TARGET_TUNNEL_RUNTIME_KEY, None, False, required=True, label="Tunnel Runtime Key") is None
+    store.exists.assert_called_once_with(CREDENTIAL_TARGET_TUNNEL_RUNTIME_KEY)
+    store.read.assert_not_called()

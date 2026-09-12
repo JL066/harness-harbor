@@ -171,7 +171,7 @@ public enum HarborSettingsError: Error, LocalizedError {
         case .invalid(let message): return message
         case .unsupportedVersion(let version): return "Settings schema version \(version) is unsupported."
         case .corrupt: return "The existing settings file is invalid; it was left unchanged."
-        case .secretKey: return "Settings contain a secret field; secrets must remain in Keychain."
+        case .secretKey: return "Settings contain a secret field; secrets must remain in separate local credential files."
         case .io: return "Settings could not be read or written; the existing file was left unchanged."
         }
     }
@@ -519,20 +519,20 @@ fileprivate enum SettingsMutation {
 
         var changed: [String] = []
         do {
-            if let value = tunnelSecret { try HarborKeychain.store(HarborCredentialTarget.tunnel, secret: value); changed.append(HarborCredentialTarget.tunnel) }
-            else if deleteTunnel { try HarborKeychain.delete(HarborCredentialTarget.tunnel); changed.append(HarborCredentialTarget.tunnel) }
-            if let value = customSecret { try HarborKeychain.store(HarborCredentialTarget.codexCustom, secret: value); changed.append(HarborCredentialTarget.codexCustom) }
-            else if deleteCustom { try HarborKeychain.delete(HarborCredentialTarget.codexCustom); changed.append(HarborCredentialTarget.codexCustom) }
+            if let value = tunnelSecret { try HarborCredentials.store(HarborCredentialTarget.tunnel, secret: value); changed.append(HarborCredentialTarget.tunnel) }
+            else if deleteTunnel { try HarborCredentials.delete(HarborCredentialTarget.tunnel); changed.append(HarborCredentialTarget.tunnel) }
+            if let value = customSecret { try HarborCredentials.store(HarborCredentialTarget.codexCustom, secret: value); changed.append(HarborCredentialTarget.codexCustom) }
+            else if deleteCustom { try HarborCredentials.delete(HarborCredentialTarget.codexCustom); changed.append(HarborCredentialTarget.codexCustom) }
             try save()
         } catch {
             var rollbackFailed = false
             for ref in changed {
                 do {
                     let previous = ref == HarborCredentialTarget.tunnel ? oldTunnel : oldCustom
-                    if let previous { try HarborKeychain.store(ref, secret: previous) } else { try HarborKeychain.delete(ref) }
+                    if let previous { try HarborCredentials.store(ref, secret: previous) } else { try HarborCredentials.delete(ref) }
                 } catch { rollbackFailed = true }
             }
-            if rollbackFailed { throw HarborSettingsError.invalid("Settings were not saved and Keychain rollback failed. Re-enter the affected credentials before starting Harbor.") }
+            if rollbackFailed { throw HarborSettingsError.invalid("Settings were not saved and local credential file rollback failed. Re-enter the affected credentials before starting Harbor.") }
             throw error is HarborSettingsError ? error : HarborSettingsError.io
         }
     }
@@ -541,12 +541,12 @@ fileprivate enum SettingsMutation {
         if let replacement { return !replacement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         if delete { return false }
         guard required else { return false }
-        return try HarborKeychain.contains(target)
+        return try HarborCredentials.contains(target)
     }
 
     private static func readIfNeeded(_ ref: String, needed: Bool) throws -> String? {
         guard needed else { return nil }
-        do { return try HarborKeychain.read(ref) } catch { throw HarborSettingsError.invalid("Secure credential store is unavailable; changes were not applied.") }
+        do { return try HarborCredentials.read(ref) } catch { throw HarborSettingsError.invalid("Secure credential store is unavailable; changes were not applied.") }
     }
 }
 
@@ -649,7 +649,7 @@ public final class HarborModel: ObservableObject {
                     }
                 }
             } catch {
-                DispatchQueue.main.async { self.busy = false; completion(.failure(HarborSettingsError.invalid("Draft validation failed. Check paths, connection and Keychain availability."))) }
+                DispatchQueue.main.async { self.busy = false; completion(.failure(HarborSettingsError.invalid("Draft validation failed. Check paths, connection and local credential file availability."))) }
             }
         }
     }
@@ -775,9 +775,11 @@ public final class HarborModel: ObservableObject {
     }
 
     public func refreshCredentialState() {
+        let needsTunnel = settings.connection.requiresCredential
+        let needsCustom = settings.codex.custom.enabled || settings.codex.routingMode == HarborRoute.custom.rawValue || settings.codex.routingMode == HarborRoute.officialThenCustom.rawValue
         DispatchQueue.global(qos: .utility).async {
-            let tunnel = Self.hasCredential(HarborCredentialTarget.tunnel)
-            let custom = Self.hasCredential(HarborCredentialTarget.codexCustom)
+            let tunnel = needsTunnel && Self.hasCredential(HarborCredentialTarget.tunnel)
+            let custom = needsCustom && Self.hasCredential(HarborCredentialTarget.codexCustom)
             DispatchQueue.main.async { [weak self] in
                 self?.tunnelCredentialConfigured = tunnel
                 self?.customCredentialConfigured = custom
@@ -849,6 +851,6 @@ public final class HarborModel: ObservableObject {
     }
 
     nonisolated private static func hasCredential(_ target: String) -> Bool {
-        do { return try HarborKeychain.contains(target) } catch { return false }
+        do { return try HarborCredentials.contains(target) } catch { return false }
     }
 }

@@ -1,21 +1,23 @@
 import Foundation
-import Security
-import LocalAuthentication
 import XCTest
 @testable import HarnessHarbor
 
 final class ModelTests: XCTestCase {
-    func testCredentialPresenceNeverRequestsSecretsOrAuthorizationUI() throws {
-        let exists = try HarborKeychain.contains(HarborCredentialTarget.tunnel) { query, _ in
-            let fields = query as NSDictionary
-            XCTAssertNil(fields[kSecReturnData])
-            XCTAssertEqual(fields[kSecReturnAttributes] as? Bool, true)
-            XCTAssertEqual((fields[kSecUseAuthenticationContext] as? LAContext)?.interactionNotAllowed, true)
-            return errSecSuccess
-        }
-        XCTAssertTrue(exists)
-        XCTAssertFalse(try HarborKeychain.contains(HarborCredentialTarget.tunnel) { _, _ in errSecItemNotFound })
-        XCTAssertThrowsError(try HarborKeychain.contains(HarborCredentialTarget.tunnel) { _, _ in errSecInteractionNotAllowed })
+    func testLocalCredentialsAreLazyPrivateAndRouteSpecific() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("harbor-credentials-\(UUID().uuidString)")
+        XCTAssertNil(try HarborCredentials.read(HarborCredentialTarget.codexCustom, at: root))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+        try HarborCredentials.store(HarborCredentialTarget.tunnel, secret: "fixture", at: root)
+        XCTAssertEqual(try HarborCredentials.read(HarborCredentialTarget.tunnel, at: root), "fixture")
+        XCTAssertFalse(try HarborCredentials.contains(HarborCredentialTarget.codexCustom, at: root))
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent("tunnel-runtime-key.txt").path)[.posixPermissions] as? NSNumber, NSNumber(value: 0o600))
+        XCTAssertTrue(try HarborCredentials.runtimeSecrets(for: HarborSettings()) { _ in XCTFail("Unconfigured credential read"); return nil }.isEmpty)
+        var requested: [String] = []
+        _ = try HarborCredentials.runtimeSecrets(for: HarborSettings(connection: ConnectionSettings(tunnelID: "fixture"))) { requested.append($0); return "fixture" }
+        XCTAssertEqual(requested, [HarborCredentialTarget.tunnel])
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("codex-custom-api-key.txt"), withDestinationURL: root.appendingPathComponent("tunnel-runtime-key.txt"))
+        XCTAssertThrowsError(try HarborCredentials.read(HarborCredentialTarget.codexCustom, at: root))
+        XCTAssertThrowsError(try HarborCredentials.store(HarborCredentialTarget.codexCustom, secret: "fixture", at: root))
     }
 
     func testSettingsSchemaContainsOnlyNonSecretFields() throws {

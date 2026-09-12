@@ -5,7 +5,7 @@ Status: Apple Silicon downloadable preview. Ad-hoc signed, not notarized.
 [Download macOS 1.1.0 preview DMG and checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.2).
 Intel and clean-machine Gatekeeper acceptance remain unvalidated.
 
-The native SwiftUI app has a menu-bar entry, dashboard, setup, settings, Keychain,
+The native SwiftUI app has a menu-bar entry, dashboard, setup, settings, private credential files,
 login item, logs and diagnostics. It owns a bundled `harbor-runtime` sidecar with
 protocol v1. Closing a window leaves the menu app running; Quit stops Harbor.
 
@@ -37,7 +37,7 @@ CI uses Python 3.12 on macos-14 for its separate artifact.
 
 First run: verify runtime → detect CLI → configure tunnel URL/ID/key → choose Codex
 route → run configuration checks → Finish/Start. A connection test submits no
-coding job and does not claim remote connectivity. Keys go into Keychain, never
+coding job and does not claim remote connectivity. Keys go into private local files, never
 settings JSON. Runtime start health and an external MCP round trip are separate
 checks. Missing optional AGY/MiniMax remain unavailable without blocking Codex.
 
@@ -60,7 +60,7 @@ diagnostics and shutdown. Requests require hello and protocol v1. Unsupported
 methods/parameters fail closed. Diagnostics and runtime logs are redacted.
 
 State is under Application Support, logs under Library/Logs, and credentials
-under Keychain service `com.jl066.harness-harbor`. See
+under `~/Library/Application Support/Harness Harbor/credentials/`. See
 [configuration](docs/CONFIGURATION.md) for all path/CLI overrides. App resources
 are immutable. Runtime lock/manifest and worker process registrations enable
 verified recovery. A PID/queue mismatch or unverifiable orphan group fails closed
@@ -83,7 +83,7 @@ submits the signed app, checks Accepted, staples, assesses Gatekeeper, creates a
 notarizes/staples a DMG. It uses an existing credential profile and does not install
 certificates, change keychains, or publish a GitHub Release.
 
-Before stable public distribution: run Windows/macOS CI, real Keychain write/read/delete,
+Before stable public distribution: run Windows/macOS CI, real credential-file save/read/remove,
 login enable/disable, Secure Tunnel → MCP → Codex end-to-end, Developer ID and
 notarization, and a clean-machine drag-to-Applications/Gatekeeper check.
 Do not label macOS Supported until all PRD gates pass. See
