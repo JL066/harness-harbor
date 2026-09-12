@@ -129,6 +129,9 @@ class TestCodexJobDaemon(unittest.TestCase):
         scheduler = HarborScheduler(jobs_dir=self.jobs_dir)
         proc = mock.Mock()
         proc.poll.return_value = 0
+        ownership = mock.patch("harbor_platform.process.owned_tree_alive", return_value=False)
+        ownership.start()
+        self.addCleanup(ownership.stop)
         scheduler.active_workers["codex"][job.name] = ActiveWorker(proc, job, "codex", time.monotonic(), str(job))
         with mock.patch.object(codex_job_daemon, "write_json", side_effect=OSError("disk")), mock.patch.object(codex_job_daemon, "release_workspace_lease") as release:
             self.assertEqual(scheduler.reap_workers(), [])

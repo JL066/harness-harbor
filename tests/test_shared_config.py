@@ -30,6 +30,7 @@ class SharedConfigTests(unittest.TestCase):
 
     def test_environment_precedes_saved_route_and_model(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "HOME": tmp, "USERPROFILE": tmp,
             "HARBOR_USER_SETTINGS_DIR": tmp, "HARBOR_CODEX_DEFAULT_ROUTE": "official",
             "HARBOR_CODEX_CUSTOM_MODEL": "explicit-model", "HARBOR_CODEX_CUSTOM_BASE_URL": "https://env.example/v1",
         }, clear=True), patch("harbor_runtime.config.resolve_executable", return_value=None):
