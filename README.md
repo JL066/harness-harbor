@@ -53,6 +53,27 @@ This makes workflows possible that continue far beyond a single interactive chat
 See the [test matrix](docs/convergence/TEST_MATRIX.md) for the acceptance scope.
 
 
+### macOS Keychain prompt: what is Harbor accessing?
+
+If macOS says **“Harness Harbor wants to use your confidential information stored in ‘com.jl066.harness-harbor’ in your keychain”**, it is requesting access to Harbor's saved connection credentials. Harbor uses only two credential entries under this service name:
+
+| Credential | Purpose |
+| --- | --- |
+| Tunnel Runtime Key | Authenticate your configured Tunnel connection |
+| Custom Codex Provider API Key | Authenticate your configured custom API provider; not saved unless configured |
+
+This request targets these Harbor credential entries, not browser passwords, your Apple ID password or all other applications' keychain items. Ordinary settings such as Tunnel ID, service URL, model and paths live in the settings file; secrets do not. See the [Keychain implementation](macos/Sources/HarnessHarbor/Keychain.swift).
+
+Harbor checks for both credentials at startup and may read them when connecting or saving settings. You may therefore see more than one prompt. Both entries share the service name, so the dialog title alone does not identify which one is being read. Preview builds are ad-hoc signed; replacing a build may also trigger authorization again.
+
+- **Allow / Allow Once** grants this read only; later reads may prompt again.
+- **Always Allow** remembers the application's access to the corresponding credential item. It does not grant access to the entire keychain or guarantee that replacement builds will never prompt.
+- **Deny** prevents the read; the corresponding connection or credential check may not complete.
+
+If you choose to authorize access, enter your login keychain password (usually your Mac user login password) only in the macOS system dialog, not a Tunnel Key or API key. Harbor does not receive or store your Mac login password through this prompt. Do not enter it into Harbor's API-key fields or include it in issue reports. See [Apple's explanation of these choices](https://support.apple.com/guide/mac-help/allow-apps-to-access-your-keychain-kychn002/mac).
+
+
+
 ---
 
 ## Why Harness Harbor?

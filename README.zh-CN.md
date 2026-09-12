@@ -53,6 +53,27 @@ ChatGPT 可以把一个较大的项目拆成多个边界清晰的阶段，每次
 测试范围见 [测试矩阵](docs/convergence/TEST_MATRIX.md)。
 
 
+### macOS 钥匙串弹窗：Harbor 在读取什么？
+
+如果 macOS 提示 **“Harness Harbor 想要使用你储存在钥匙串中的 ‘com.jl066.harness-harbor’ 中的机密信息”**，这是系统在询问是否允许 Harbor 读取它保存的连接凭据。这个服务名下只使用两种凭据：
+
+| 凭据 | 用途 |
+| --- | --- |
+| Tunnel Runtime Key | 认证你配置的 Tunnel 连接 |
+| 自定义 Codex Provider API Key | 认证你配置的自定义 API 服务；未设置时不会保存 |
+
+这次访问针对 Harbor 的上述凭据项，不是在读取浏览器密码、Apple ID 密码或其他应用的全部钥匙串。Tunnel ID、服务地址、模型和路径等普通设置保存在配置文件中，密钥不写入该文件。相关实现可查看 [钥匙串代码](macos/Sources/HarnessHarbor/Keychain.swift)。
+
+Harbor 启动时会检查这两项凭据是否存在，连接或保存设置时也可能读取它们。因此弹窗可能出现多次；两项凭据共用服务名，弹窗标题本身无法区分正在读取哪一项。当前预览版使用 ad-hoc 签名，更换构建后也可能再次要求授权。
+
+- **允许**：仅授权这次读取，后续读取可能再次询问。
+- **始终允许**：记住该应用对相应凭据项的授权，可减少重复询问；不等于允许访问整个钥匙串，也不保证换版本后永不询问。
+- **拒绝**：不读取该项密钥；相关连接或凭据检查可能无法完成。
+
+若决定授权，请只在 macOS 系统弹窗中输入“登录”钥匙串密码（通常是 Mac 用户登录密码），不是 Tunnel Key 或 API Key。Harbor 不会因此获得或保存你的 Mac 登录密码。不要把密码填进 Harbor 的密钥输入框或发到问题反馈中。按钮含义参见 [Apple 官方说明](https://support.apple.com/guide/mac-help/allow-apps-to-access-your-keychain-kychn002/mac)。
+
+
+
 ---
 
 ## 为什么需要 Harness Harbor？
