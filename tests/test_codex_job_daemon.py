@@ -123,6 +123,14 @@ def _write_fake_worker(dir_path: Path) -> Path:
     return script
 
 
+def _wait_for_worker_exit(proc):
+    from harbor_platform.process import wait_owned_tree_exit
+
+    exit_code = proc.wait(timeout=5)
+    assert wait_owned_tree_exit(proc, timeout=5), "Fixture process tree did not exit"
+    return exit_code
+
+
 class TestCodexJobDaemon(unittest.TestCase):
     def test_zero_exit_without_terminal_preserves_original_and_retries_write(self):
         job = _create_job(self.jobs_dir, "zero_exit", status="running")
@@ -240,7 +248,7 @@ class TestCodexJobDaemon(unittest.TestCase):
 
         # Release j1
         (j1 / "exit_trigger").write_text("done", encoding="utf-8")
-        time.sleep(0.12)
+        self.assertEqual(_wait_for_worker_exit(scheduler.active_workers["codex"][j1.name].proc), 0)
 
         # Tick 3: j1 reaped, j4 spawned!
         spawned3 = scheduler.tick()
@@ -640,7 +648,7 @@ class TestCodexJobDaemon(unittest.TestCase):
         spawned = scheduler.tick()
         self.assertEqual(len(spawned), 2)
 
-        time.sleep(0.2)
+        self.assertEqual(_wait_for_worker_exit(scheduler.active_workers["codex"][j_crash.name].proc), 42)
         scheduler.tick()
 
         # Codex slot freed, MiniMax still running
@@ -712,7 +720,7 @@ class TestCodexJobDaemon(unittest.TestCase):
 
         # --- T1: Finish Codex A -> Codex D starts running ---
         (codex_jobs[0] / "exit_trigger").write_text("done", encoding="utf-8")
-        time.sleep(0.15)
+        self.assertEqual(_wait_for_worker_exit(scheduler.active_workers["codex"][codex_jobs[0].name].proc), 0)
 
         spawned_t1 = scheduler.tick()
         self.assertEqual(len(spawned_t1), 1)
@@ -743,7 +751,9 @@ class TestCodexJobDaemon(unittest.TestCase):
         for j in active_t1:
             (j / "exit_trigger").write_text("done", encoding="utf-8")
 
-        time.sleep(0.15)
+        for workers in scheduler.active_workers.values():
+            for worker in workers.values():
+                self.assertEqual(_wait_for_worker_exit(worker.proc), 0)
         # Tick reaps finished workers and dispatches minimax_H and agy_L
         spawned_t2 = scheduler.tick()
         self.assertEqual(len(spawned_t2), 2)
@@ -1090,7 +1100,7 @@ class TestCodexJobDaemon(unittest.TestCase):
         self.assertEqual(len(spawned), 1)
         self.assertEqual(spawned[0][1], j_crash)
 
-        time.sleep(0.2)
+        self.assertEqual(_wait_for_worker_exit(scheduler.active_workers["codex"][j_crash.name].proc), 42)
         # Tick reaps crashed worker, frees workspace lease, and dispatches j_next
         spawned2 = scheduler.tick()
         self.assertEqual(len(spawned2), 1)
