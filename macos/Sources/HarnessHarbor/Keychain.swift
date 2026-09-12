@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import LocalAuthentication
 
 enum HarborKeychain {
     static let service = "com.jl066.harness-harbor"
@@ -14,6 +15,22 @@ enum HarborKeychain {
         guard targets.contains(target) else { throw Failure(status: errSecParam) }
         return [kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service, kSecAttrAccount as String: target]
+    }
+
+    // Presence is not permission to read the secret. Never show auth UI for badges
+    // or draft validation; actual credential use still goes through read().
+    static func contains(_ target: String, copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching) throws -> Bool {
+        var request = try query(target)
+        request[kSecReturnAttributes as String] = true
+        request[kSecMatchLimit as String] = kSecMatchLimitOne
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        request[kSecUseAuthenticationContext as String] = context
+        var result: CFTypeRef?
+        let status = copyMatching(request as CFDictionary, &result)
+        if status == errSecItemNotFound { return false }
+        guard status == errSecSuccess else { throw Failure(status: status) }
+        return true
     }
 
     static func read(_ target: String) throws -> String? {

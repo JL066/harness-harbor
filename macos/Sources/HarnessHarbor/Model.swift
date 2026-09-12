@@ -512,12 +512,10 @@ fileprivate enum SettingsMutation {
         guard customSecret == nil || !deleteCustom else { throw HarborSettingsError.invalid("Custom credential cannot be replaced and deleted in the same change.") }
         let tunnelRequired = requireConnection || candidate.connection.requiresCredential
         let customRequired = candidate.codex.custom.enabled || candidate.codex.routingMode == HarborRoute.custom.rawValue || candidate.codex.routingMode == HarborRoute.officialThenCustom.rawValue
-        let oldTunnel = try readIfNeeded(HarborCredentialTarget.tunnel, needed: tunnelRequired || tunnelSecret != nil || deleteTunnel)
-        let oldCustom = try readIfNeeded(HarborCredentialTarget.codexCustom, needed: customRequired || customSecret != nil || deleteCustom)
-        let finalTunnel = tunnelSecret ?? (deleteTunnel ? nil : oldTunnel)
-        let finalCustom = customSecret ?? (deleteCustom ? nil : oldCustom)
-        if tunnelRequired && !deleteTunnel && (finalTunnel ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { throw HarborSettingsError.invalid("Tunnel Runtime Key is required.") }
-        if customRequired && !deleteCustom && (finalCustom ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { throw HarborSettingsError.invalid("Custom Codex API key is required for this route.") }
+        let oldTunnel = try readIfNeeded(HarborCredentialTarget.tunnel, needed: tunnelSecret != nil || deleteTunnel)
+        let oldCustom = try readIfNeeded(HarborCredentialTarget.codexCustom, needed: customSecret != nil || deleteCustom)
+        if tunnelRequired, !(try candidatePresence(HarborCredentialTarget.tunnel, replacement: tunnelSecret, delete: deleteTunnel, required: true)) { throw HarborSettingsError.invalid("Tunnel Runtime Key is required.") }
+        if customRequired, !(try candidatePresence(HarborCredentialTarget.codexCustom, replacement: customSecret, delete: deleteCustom, required: true)) { throw HarborSettingsError.invalid("Custom Codex API key is required for this route.") }
 
         var changed: [String] = []
         do {
@@ -543,7 +541,7 @@ fileprivate enum SettingsMutation {
         if let replacement { return !replacement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         if delete { return false }
         guard required else { return false }
-        return !((try readIfNeeded(target, needed: true) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        return try HarborKeychain.contains(target)
     }
 
     private static func readIfNeeded(_ ref: String, needed: Bool) throws -> String? {
@@ -851,6 +849,6 @@ public final class HarborModel: ObservableObject {
     }
 
     nonisolated private static func hasCredential(_ target: String) -> Bool {
-        do { return !(try HarborKeychain.read(target) ?? "").isEmpty } catch { return false }
+        do { return try HarborKeychain.contains(target) } catch { return false }
     }
 }

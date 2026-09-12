@@ -1,8 +1,23 @@
 import Foundation
+import Security
+import LocalAuthentication
 import XCTest
 @testable import HarnessHarbor
 
 final class ModelTests: XCTestCase {
+    func testCredentialPresenceNeverRequestsSecretsOrAuthorizationUI() throws {
+        let exists = try HarborKeychain.contains(HarborCredentialTarget.tunnel) { query, _ in
+            let fields = query as NSDictionary
+            XCTAssertNil(fields[kSecReturnData])
+            XCTAssertEqual(fields[kSecReturnAttributes] as? Bool, true)
+            XCTAssertEqual((fields[kSecUseAuthenticationContext] as? LAContext)?.interactionNotAllowed, true)
+            return errSecSuccess
+        }
+        XCTAssertTrue(exists)
+        XCTAssertFalse(try HarborKeychain.contains(HarborCredentialTarget.tunnel) { _, _ in errSecItemNotFound })
+        XCTAssertThrowsError(try HarborKeychain.contains(HarborCredentialTarget.tunnel) { _, _ in errSecInteractionNotAllowed })
+    }
+
     func testSettingsSchemaContainsOnlyNonSecretFields() throws {
         let data = try JSONEncoder().encode(HarborSettings())
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
