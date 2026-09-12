@@ -122,11 +122,11 @@ def parse_settings(data):
         commands = extension.get("executables", {})
         if not isinstance(commands, dict) or set(commands) - set(EXE_KEYS):
             raise ValueError("Unsupported executable settings")
-        from pathlib import PureWindowsPath
+        from pathlib import PureWindowsPath, PurePosixPath
         for name, value in commands.items():
-            if not isinstance(value, str) or (value and not (PureWindowsPath(value).is_absolute() if namespace == "windows" else Path(value).is_absolute())):
+            if not isinstance(value, str) or (value and not (PureWindowsPath(value).is_absolute() if namespace == "windows" else PurePosixPath(value).is_absolute())):
                 raise ValueError("Executable override must be an absolute path")
-            if name == "minimax" and value and (PureWindowsPath(value).name if namespace == "windows" else Path(value).name) not in {"mcode", "mcode.cmd", "mcode.bat"}:
+            if name == "minimax" and value and (PureWindowsPath(value).name if namespace == "windows" else PurePosixPath(value).name) not in {"mcode", "mcode.cmd", "mcode.bat"}:
                 raise ValueError("MiniMax requires the mcode CLI executable")
     return settings
 

@@ -62,7 +62,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(set(found), {"codex", "agy", "minimax", "tunnel"})
         self.assertEqual(found["minimax"], "/opt/bin/mcode")
         self.assertEqual(found["tunnel"], "/opt/bin/tunnel-client")
-        with patch.dict(os.environ, {"HARBOR_MINIMAX_CLI_EXE": "/Applications/MiniMax.app/Contents/MacOS/MiniMax"}), patch("harbor_runtime.config.load_settings", return_value=parse_settings({})):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"HARBOR_MINIMAX_CLI_EXE": str(Path(tmp) / "MiniMax")}), patch("harbor_runtime.config.load_settings", return_value=parse_settings({})):
             with self.assertRaisesRegex(ValueError, "mcode CLI"):
                 configure()
 
