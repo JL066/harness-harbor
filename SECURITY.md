@@ -46,7 +46,7 @@ read them. Files are created on explicit save; unused custom credentials are not
 loaded. Swift and Python share the same format. Values pass only through child
 environments, not settings JSON or command-line arguments. Legacy Keychain entries
 are not automatically read, migrated or deleted. Windows retains Credential Manager.
-The existing preview.2 binary predates this change and still uses Keychain.
+Earlier withdrawn test builds used Keychain; the current preview uses private files.
 
 The bridge is child stdin/stdout NDJSON protocol v1 with a fixed method allowlist,
 strict request validation, bounded messages/log tails, and redacted responses.

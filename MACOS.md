@@ -2,7 +2,7 @@
 
 Status: Apple Silicon downloadable preview. Ad-hoc signed, not notarized.
 
-[Download macOS 1.1.0 preview DMG and checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.2).
+[Download macOS 1.1.0 preview DMG and checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.1).
 Intel and clean-machine Gatekeeper acceptance remain unvalidated.
 
 The native SwiftUI app has a menu-bar entry, dashboard, setup, settings, private credential files,
