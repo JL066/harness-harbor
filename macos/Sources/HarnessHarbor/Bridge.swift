@@ -423,8 +423,10 @@ public final class HarborBridge: ObservableObject {
         environment.removeValue(forKey: "TUNNEL_RUNTIME_KEY")
         environment.removeValue(forKey: "HARBOR_CODEX_CUSTOM_API_KEY")
         do {
-            if let tunnel = try HarborKeychain.read(HarborCredentialTarget.tunnel), !tunnel.isEmpty { environment["TUNNEL_RUNTIME_KEY"] = tunnel }
-            if let custom = try HarborKeychain.read(HarborCredentialTarget.codexCustom), !custom.isEmpty { environment["HARBOR_CODEX_CUSTOM_API_KEY"] = custom }
+            let settings = try SettingsStore.load()
+            if settings.connection.requiresCredential, let tunnel = try HarborKeychain.read(HarborCredentialTarget.tunnel), !tunnel.isEmpty { environment["TUNNEL_RUNTIME_KEY"] = tunnel }
+            let needsCustom = settings.codex.custom.enabled || settings.codex.routingMode == HarborRoute.custom.rawValue || settings.codex.routingMode == HarborRoute.officialThenCustom.rawValue
+            if needsCustom, let custom = try HarborKeychain.read(HarborCredentialTarget.codexCustom), !custom.isEmpty { environment["HARBOR_CODEX_CUSTOM_API_KEY"] = custom }
         } catch {
             throw BridgeError(code: "keychain_unavailable", message: "Secure credential store is unavailable.")
         }

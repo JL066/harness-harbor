@@ -1,4 +1,6 @@
 import Foundation
+import Security
+import LocalAuthentication
 
 // Runnable without full Xcode/XCTest; CI additionally runs the XCTest suite.
 @main struct HarborChecks {
@@ -6,6 +8,23 @@ import Foundation
         do { try operation(); preconditionFailure("Invalid input was accepted") } catch { }
     }
     static func main() async throws {
+        var presenceQueries = 0
+        let present = try HarborKeychain.contains(HarborCredentialTarget.tunnel) { query, _ in
+            presenceQueries += 1
+            let fields = query as NSDictionary
+            precondition(fields[kSecReturnData] == nil)
+            precondition(fields[kSecReturnAttributes] as? Bool == true)
+            precondition((fields[kSecUseAuthenticationContext] as? LAContext)?.interactionNotAllowed == true)
+            precondition(fields[kSecAttrService] as? String == HarborKeychain.service)
+            precondition(fields[kSecAttrAccount] as? String == HarborCredentialTarget.tunnel)
+            return errSecSuccess
+        }
+        precondition(present && presenceQueries == 1)
+        let absent = try HarborKeychain.contains(HarborCredentialTarget.codexCustom) { _, _ in errSecItemNotFound }
+        precondition(!absent)
+        rejects { _ = try HarborKeychain.contains(HarborCredentialTarget.tunnel) { _, _ in errSecInteractionNotAllowed } }
+        rejects { _ = try HarborKeychain.contains("unrelated") { _, _ in preconditionFailure("Invalid target queried") } }
+
         try SettingsValidator.validateURL("https://api.example.test/v1")
         for raw in [#"{}"#, #"{"base_url":""}"#, #"{"base_url":"  "}"#] {
             let connection = try JSONDecoder().decode(ConnectionSettings.self, from: Data(raw.utf8))
