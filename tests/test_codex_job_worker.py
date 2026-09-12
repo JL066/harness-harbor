@@ -10,7 +10,7 @@ These tests cover the MiniMax exec lifecycle:
 
 These tests also cover the Antigravity (agy) lifecycle:
   * normal exit with JSON final line -> completed, result.txt written
-  * normal exit with plain-text final line -> completed, result.txt written
+  * normal exit with plain-text output -> failed, failure_type=agy_execution_error
   * CLI hangs after stable result -> completed, forced_exit_after_result=True
   * CLI hangs with no result -> failed, failure_type=agy_execution_timeout
   * nonzero exit before result -> failed, failure_type=agy_execution_error
@@ -414,11 +414,11 @@ class AgyExtractTests(unittest.TestCase):
         )
 
 
-    def test_alt_text_field(self) -> None:
+    def test_alt_text_field_on_final_json_line(self) -> None:
         self.assertEqual(
             "alt text",
             codex_job_worker._extract_agy_result_message(
-                'noise\n{"text": "alt text"}\nmore noise'
+                'noise\n{"text": "alt text"}'
             ),
         )
 
@@ -438,17 +438,24 @@ class AgyExtractTests(unittest.TestCase):
             ),
         )
 
-    def test_falls_back_to_raw_json_when_no_recognized_key(self) -> None:
+    def test_metadata_json_without_recognized_key_is_not_an_agent_result(self) -> None:
         self.assertEqual(
-            '{"unrecognized": "x"}',
+            "",
             codex_job_worker._extract_agy_result_message(
                 'pre\n{"unrecognized": "x"}\npost'
             ),
         )
 
-    def test_falls_back_to_last_nonempty_line_when_no_json(self) -> None:
+    def test_empty_response_is_not_an_agent_result(self) -> None:
+        payload = json.dumps({"status": "SUCCESS", "response": ""})
         self.assertEqual(
-            "no json at all, just text",
+            "",
+            codex_job_worker._extract_agy_result_message(payload),
+        )
+
+    def test_plain_text_is_not_an_agent_result(self) -> None:
+        self.assertEqual(
+            "",
             codex_job_worker._extract_agy_result_message(
                 "no json at all, just text"
             ),
@@ -457,6 +464,24 @@ class AgyExtractTests(unittest.TestCase):
     def test_empty_input_returns_empty(self) -> None:
         self.assertEqual("", codex_job_worker._extract_agy_result_message(""))
         self.assertEqual("", codex_job_worker._extract_agy_result_message("   \n  "))
+
+    def test_final_result_requires_json_with_a_response(self) -> None:
+        self.assertEqual(
+            (True, "READY"),
+            codex_job_worker._agy_stdout_has_final_result(
+                '{"status": "SUCCESS", "response": "READY"}'
+            ),
+        )
+        self.assertEqual(
+            (False, ""),
+            codex_job_worker._agy_stdout_has_final_result("plain diagnostic"),
+        )
+        self.assertEqual(
+            (False, ""),
+            codex_job_worker._agy_stdout_has_final_result(
+                '{"status": "SUCCESS", "response": ""}'
+            ),
+        )
 
 
 class AgyBuildCommandTests(unittest.TestCase):
@@ -480,7 +505,15 @@ class AgyBuildCommandTests(unittest.TestCase):
         self.assertNotIn("-o", command)
         self.assertNotIn("--output-last-message", command)
         # Prompt is attached to --print so it is never a bare positional.
-        self.assertIn("--print=say hi", command)
+        self.assertTrue(any(arg.startswith("--print=") for arg in command))
+        if sys.platform == "darwin":
+            self.assertIn("--mode", command)
+            self.assertIn("accept-edits", command)
+            self.assertIn("--sandbox", command)
+            self.assertEqual(r"D:\work", command[command.index("--add-dir") + 1])
+            self.assertIn("say hi", command[-1])
+        else:
+            self.assertIn("--print=say hi", command)
         # Base flags are present and in the documented order.
         self.assertEqual(
             r"C:\fake\agy.exe", command[0]
@@ -494,8 +527,10 @@ class AgyBuildCommandTests(unittest.TestCase):
     def test_dangerous_permissions_requires_explicit_job_opt_in(self) -> None:
         state = {
             "agy_executable": r"C:\fake\agy.exe",
+            "cwd": r"D:\work",
             "prompt": "say hi",
             "agy_dangerously_skip_permissions": True,
+            "sandbox": "workspace-write",
         }
         command = control_plane.build_agy_command(state, Path("result.txt"))
         self.assertIn("--dangerously-skip-permissions", command)
@@ -505,7 +540,12 @@ class AgyBuildCommandTests(unittest.TestCase):
         )
 
     def test_named_environment_flag_enables_dangerous_permissions(self) -> None:
-        state = {"agy_executable": r"C:\fake\agy.exe", "prompt": "say hi"}
+        state = {
+            "agy_executable": r"C:\fake\agy.exe",
+            "cwd": r"D:\work",
+            "prompt": "say hi",
+            "sandbox": "workspace-write",
+        }
         with mock.patch.dict(
             os.environ,
             {control_plane.AGY_DANGEROUS_PERMISSIONS_ENV: "1"},
@@ -728,7 +768,7 @@ class AgyLifecycleTests(unittest.TestCase):
                 tmp_path,
                 """\
                 import sys
-                sys.stdout.write('{"result": "AGY_OK"}\\n')
+                sys.stdout.write('{"status": "SUCCESS", "response": "AGY_OK"}\\n')
                 sys.stdout.flush()
                 sys.exit(0)
                 """,
@@ -743,6 +783,7 @@ class AgyLifecycleTests(unittest.TestCase):
             )
             self.assertEqual("completed", collected["status"])
             self.assertEqual("AGY_OK", collected["final_message"])
+            self.assertEqual([], collected["denied_actions"])
             self.assertFalse(collected["forced_exit_after_result"])
     def test_real_agy_json_response_lifecycle_collection(self) -> None:
         """Real agy JSON output with {"status": "SUCCESS", "response": "READY\\n"}
@@ -779,8 +820,116 @@ class AgyLifecycleTests(unittest.TestCase):
             self.assertEqual("READY", result_path.read_text(encoding="utf-8"))
             self.assertNotIn("conversation_id", collected["final_message"])
 
-    def test_normal_exit_with_plain_text_result_is_completed(self) -> None:
-        """Fake agy emits a plain text line and exits 0 -> completed, no force."""
+    def test_denied_actions_fail_even_with_success_status_and_exit_zero(self) -> None:
+        """A successful process with denied actions did not complete the task."""
+        denial = {
+            "conversation_id": "abc-123",
+            "status": "SUCCESS",
+            "response": "",
+            "denied_actions": [{"action": "command", "display_name": "RunCommand"}],
+        }
+        stderr = (
+            'jetski: no output produced — a tool required the "command" '
+            "permission that headless mode cannot prompt for, so it was auto-denied."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result_path = Path(tmp) / "result.txt"
+            collected = codex_job_worker.collect_agy_lifecycle_result(
+                {
+                    "exit_code": 0,
+                    "stdout": json.dumps(denial),
+                    "stderr": stderr,
+                    "termination_reason": "self_exit",
+                    "forced_exit": False,
+                    "result_text": json.dumps(denial),
+                },
+                result_path,
+            )
+            self.assertEqual("failed", collected["status"])
+            self.assertEqual("agy_permission_denied", collected["failure_type"])
+            self.assertEqual(denial["denied_actions"], collected["denied_actions"])
+            self.assertEqual("", collected["final_message"])
+            self.assertEqual(stderr, collected["stderr"])
+            self.assertEqual(stderr, collected["stderr_tail"])
+            self.assertIn(stderr, collected["error"])
+            self.assertEqual("", result_path.read_text(encoding="utf-8"))
+
+    def test_headless_permission_denial_stderr_fails_with_actual_stdout_response(self) -> None:
+        """The diagnostic alone is authoritative even when stdout has text."""
+        stderr = "AGY headless mode: permission denied while running command"
+        with tempfile.TemporaryDirectory() as tmp:
+            result_path = Path(tmp) / "result.txt"
+            collected = codex_job_worker.collect_agy_lifecycle_result(
+                {
+                    "exit_code": 0,
+                    "stdout": json.dumps({"status": "SUCCESS", "response": "READY"}),
+                    "stderr": stderr,
+                    "termination_reason": "self_exit",
+                    "forced_exit": False,
+                },
+                result_path,
+            )
+            self.assertEqual("failed", collected["status"])
+            self.assertEqual("agy_permission_denied", collected["failure_type"])
+            self.assertEqual("READY", collected["final_message"])
+            self.assertEqual(stderr, collected["stderr_tail"])
+
+    def test_nonzero_self_exit_fails_even_with_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result_path = Path(tmp) / "result.txt"
+            collected = codex_job_worker.collect_agy_lifecycle_result(
+                {
+                    "exit_code": 7,
+                    "stdout": json.dumps({"status": "SUCCESS", "response": "READY"}),
+                    "stderr": "",
+                    "termination_reason": "self_exit",
+                    "forced_exit": False,
+                },
+                result_path,
+            )
+            self.assertEqual("failed", collected["status"])
+            self.assertEqual("agy_execution_error", collected["failure_type"])
+
+    def test_non_success_agent_status_fails_even_with_response(self) -> None:
+        for status in ("FAILURE", "ERROR"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                result_path = Path(tmp) / "result.txt"
+                collected = codex_job_worker.collect_agy_lifecycle_result(
+                    {
+                        "exit_code": 0,
+                        "stdout": json.dumps({"status": status, "response": "details"}),
+                        "stderr": "",
+                        "termination_reason": "self_exit",
+                        "forced_exit": False,
+                    },
+                    result_path,
+                )
+                self.assertEqual("failed", collected["status"])
+                self.assertEqual("agy_execution_error", collected["failure_type"])
+                self.assertEqual(status.lower(), collected["agent_task_status"])
+
+    def test_success_without_actual_response_fails_execution_error(self) -> None:
+        """SUCCESS metadata with an empty response is not completion evidence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            result_path = Path(tmp) / "result.txt"
+            collected = codex_job_worker.collect_agy_lifecycle_result(
+                {
+                    "exit_code": 0,
+                    "stdout": json.dumps({"status": "SUCCESS", "response": ""}),
+                    "stderr": "",
+                    "termination_reason": "self_exit",
+                    "forced_exit": False,
+                    "result_text": json.dumps({"status": "SUCCESS", "response": ""}),
+                },
+                result_path,
+            )
+            self.assertEqual("failed", collected["status"])
+            self.assertEqual("agy_execution_error", collected["failure_type"])
+            self.assertEqual("", collected["final_message"])
+            self.assertEqual("", result_path.read_text(encoding="utf-8"))
+
+    def test_normal_exit_with_plain_text_output_is_failed(self) -> None:
+        """Fake agy emits non-JSON output and exits 0 -> failed."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             _, result_path, cwd = _make_state_dir(tmp_path)
@@ -800,8 +949,9 @@ class AgyLifecycleTests(unittest.TestCase):
             collected = codex_job_worker.collect_agy_lifecycle_result(
                 lifecycle, result_path
             )
-            self.assertEqual("completed", collected["status"])
-            self.assertEqual("just plain text answer", collected["final_message"])
+            self.assertEqual("failed", collected["status"])
+            self.assertEqual("agy_execution_error", collected["failure_type"])
+            self.assertEqual("", collected["final_message"])
 
     def test_hang_after_result_is_completed_with_forced_flag(self) -> None:
         """Fake agy emits the result then sleeps -> completed, forced_exit_after_result=True."""
@@ -812,7 +962,7 @@ class AgyLifecycleTests(unittest.TestCase):
                 tmp_path,
                 """\
                 import sys, time
-                sys.stdout.write('{"result": "AGY_HANG_OK"}\\n')
+                sys.stdout.write('{"status": "SUCCESS", "response": "AGY_HANG_OK"}\\n')
                 sys.stdout.flush()
                 time.sleep(30)
                 """,
@@ -928,6 +1078,8 @@ class AgyHarnessRegistrationTests(unittest.TestCase):
               --model <id>
               --effort (low|medium|high)
               --sandbox
+              --mode accept-edits
+              --add-dir <path>
             """)
         version_text = "1.1.22\n"
         with tempfile.TemporaryDirectory() as tmp:
