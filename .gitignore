@@ -68,3 +68,8 @@ scratch/
 # Package initializers and entrypoints are release source, not one-off underscore scripts
 !**/__init__.py
 !**/__main__.py
+
+# Private per-user credential files
+credentials/
+tunnel-runtime-key.txt
+codex-custom-api-key.txt

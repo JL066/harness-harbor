@@ -1,6 +1,4 @@
 import Foundation
-import Security
-import LocalAuthentication
 
 // Runnable without full Xcode/XCTest; CI additionally runs the XCTest suite.
 @main struct HarborChecks {
@@ -8,22 +6,30 @@ import LocalAuthentication
         do { try operation(); preconditionFailure("Invalid input was accepted") } catch { }
     }
     static func main() async throws {
-        var presenceQueries = 0
-        let present = try HarborKeychain.contains(HarborCredentialTarget.tunnel) { query, _ in
-            presenceQueries += 1
-            let fields = query as NSDictionary
-            precondition(fields[kSecReturnData] == nil)
-            precondition(fields[kSecReturnAttributes] as? Bool == true)
-            precondition((fields[kSecUseAuthenticationContext] as? LAContext)?.interactionNotAllowed == true)
-            precondition(fields[kSecAttrService] as? String == HarborKeychain.service)
-            precondition(fields[kSecAttrAccount] as? String == HarborCredentialTarget.tunnel)
-            return errSecSuccess
-        }
-        precondition(present && presenceQueries == 1)
-        let absent = try HarborKeychain.contains(HarborCredentialTarget.codexCustom) { _, _ in errSecItemNotFound }
-        precondition(!absent)
-        rejects { _ = try HarborKeychain.contains(HarborCredentialTarget.tunnel) { _, _ in errSecInteractionNotAllowed } }
-        rejects { _ = try HarborKeychain.contains("unrelated") { _, _ in preconditionFailure("Invalid target queried") } }
+        let credentials = FileManager.default.temporaryDirectory.appendingPathComponent("harbor-credential-check-\(UUID().uuidString)")
+        let tunnelTarget = HarborCredentialTarget.tunnel
+        let customTarget = HarborCredentialTarget.codexCustom
+        let missing = try HarborCredentials.read(customTarget, at: credentials)
+        precondition(missing == nil && !FileManager.default.fileExists(atPath: credentials.path))
+        try HarborCredentials.store(tunnelTarget, secret: "fixture-only", at: credentials)
+        let restored = try HarborCredentials.read(tunnelTarget, at: credentials)
+        precondition(restored == "fixture-only")
+        precondition(!FileManager.default.fileExists(atPath: credentials.appendingPathComponent("codex-custom-api-key.txt").path))
+        let mode = try FileManager.default.attributesOfItem(atPath: credentials.appendingPathComponent("tunnel-runtime-key.txt").path)[.posixPermissions] as? NSNumber
+        precondition(mode?.intValue == 0o600)
+        let noSecrets = try HarborCredentials.runtimeSecrets(for: HarborSettings()) { _ in preconditionFailure("Unconfigured credential read") }
+        precondition(noSecrets.isEmpty)
+        let tunnelOnly = HarborSettings(connection: ConnectionSettings(tunnelID: "fixture"))
+        var requested: [String] = []
+        let environment = try HarborCredentials.runtimeSecrets(for: tunnelOnly) { target in requested.append(target); return "fixture-only" }
+        precondition(requested == [tunnelTarget] && environment["HARBOR_CODEX_CUSTOM_API_KEY"] == nil)
+        try FileManager.default.createSymbolicLink(at: credentials.appendingPathComponent("codex-custom-api-key.txt"), withDestinationURL: credentials.appendingPathComponent("tunnel-runtime-key.txt"))
+        rejects { _ = try HarborCredentials.read(customTarget, at: credentials) }
+        rejects { try HarborCredentials.store(customTarget, secret: "fixture", at: credentials) }
+        rejects { try HarborCredentials.store("unrelated", secret: "fixture", at: credentials) }
+        try HarborCredentials.delete(tunnelTarget, at: credentials)
+        let removed = try HarborCredentials.contains(tunnelTarget, at: credentials)
+        precondition(!removed)
 
         try SettingsValidator.validateURL("https://api.example.test/v1")
         for raw in [#"{}"#, #"{"base_url":""}"#, #"{"base_url":"  "}"#] {

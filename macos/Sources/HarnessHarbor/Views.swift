@@ -102,7 +102,7 @@ struct DashboardView: View {
                 }
 
                 if model.status.setupRequired {
-                    Text("Setup needs attention. Check Connection and Keychain settings before starting Harbor.")
+                    Text("Setup needs attention. Check Connection and local credential file settings before starting Harbor.")
                         .foregroundStyle(.orange)
                         .padding(10)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -380,7 +380,7 @@ struct SettingsView: View {
                     if model.busy { ProgressView().controlSize(.small) }
                     if !message.isEmpty { Text(message).font(.caption).foregroundStyle(.secondary) }
                 }
-                Text("Secrets are replaced or deleted through Keychain and are never displayed or written to settings.json.")
+                Text("Keys are stored in private local files, separately from settings.json. Only save a custom key if you use a custom provider.")
                     .font(.caption).foregroundStyle(.secondary)
                 Text("Saving restarts Harbor and stops active jobs.").font(.caption).foregroundStyle(.secondary)
             }
@@ -469,7 +469,7 @@ struct SetupWizardView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text("A small control surface for Harbor’s tunnel, MCP server, job daemon, and supported harnesses.")
                 Text("Install and sign in to your coding CLIs before starting work. Harbor runs tasks assigned by your supervisor.")
-                Text("This wizard stores connection preferences in settings.json and keeps credentials in macOS Keychain.").foregroundStyle(.secondary)
+                Text("This wizard stores connection preferences in settings.json and saves keys in private local files only when you provide them. Existing Keychain keys are not imported; re-enter them once.").foregroundStyle(.secondary)
             }
         case 1:
             VStack(alignment: .leading, spacing: 12) {
@@ -497,7 +497,7 @@ struct SetupWizardView: View {
         case 5:
             VStack(alignment: .leading, spacing: 14) {
                 Text("Test connection settings").font(.title2.bold())
-                Text("Harbor will validate the settings, Keychain credential, tunnel executable, and runtime configuration before finishing setup.").foregroundStyle(.secondary)
+                Text("Harbor will validate the settings, local credential file credential, tunnel executable, and runtime configuration before finishing setup.").foregroundStyle(.secondary)
                 Button("Run connection test") { runTest() }.disabled(model.busy)
                 if model.busy { ProgressView() }
                 if !testMessage.isEmpty { Text(testMessage).foregroundStyle(testPassed ? .green : .orange) }
