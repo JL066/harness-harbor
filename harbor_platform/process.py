@@ -82,7 +82,10 @@ def terminate_tree(proc, grace=0.5):
         identity = getattr(proc, "_harbor_identity", None) or getattr(proc, "identity", None)
         gone = terminate_owned_tree(identity, grace)
         if gone:
-            proc.wait(timeout=grace)
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                return False
             registry = getattr(proc, "_harbor_registry", None)
             if isinstance(registry, Path):
                 registry.unlink(missing_ok=True)

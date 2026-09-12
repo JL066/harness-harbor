@@ -7,6 +7,7 @@ import ctypes
 from ctypes import wintypes as w
 import subprocess
 import time
+import weakref
 
 
 def api():
@@ -108,6 +109,10 @@ def spawn_owned(argv, *, popen_factory=None, **kwargs):
         if not resumed:
             raise OSError("Owned process has no suspended thread")
         proc._harbor_identity = identity
+        # Keep the named job open for the retained Popen lifetime, including after
+        # its leader exits. Closing the last handle loses name-based observation.
+        proc._harbor_job_finalizer = weakref.finalize(proc, kernel.CloseHandle, job)
+        job = None  # Ownership transferred; failure cleanup must not close it.
         return proc
     except BaseException:
         if assigned:
@@ -129,7 +134,7 @@ def descendants(identity):
     kernel = api()
     handle = kernel.OpenJobObjectW(4, False, identity["job_name"])
     if not handle:
-        return [] if ctypes.get_last_error() == 2 else None
+        return None  # A missing name is not proof that every descendant exited.
     try:
         # ponytail: bound ownership observations to 4096 processes; fail closed above it.
         class Members(ctypes.Structure):
