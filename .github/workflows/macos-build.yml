@@ -23,5 +23,5 @@ jobs:
         with:
           name: Harness-Harbor-macos-release
           path: |
-            dist/**/Harness-Harbor-v*-macos-*.dmg
-            dist/**/SHA256SUMS.txt
+            dist/macos-*/Harness-Harbor-v*-macos-*.dmg
+            dist/macos-*/SHA256SUMS.txt

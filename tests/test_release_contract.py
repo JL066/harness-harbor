@@ -42,7 +42,9 @@ def test_release_workflows_upload_artifacts_without_publishing():
     assert "action-gh-release" not in windows
     assert "softprops" not in windows
     assert "gh release" not in windows
-    assert "Harness-Harbor-v*-macos-*.dmg" in macos
+    assert "dist/macos-*/Harness-Harbor-v*-macos-*.dmg" in macos
+    assert "dist/macos-*/SHA256SUMS.txt" in macos
+    assert "dist/**" not in macos  # Never traverse dmg-root/Applications symlink.
 
 
 def test_release_artifacts_are_ignored():
