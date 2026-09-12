@@ -53,25 +53,22 @@ This makes workflows possible that continue far beyond a single interactive chat
 See the [test matrix](docs/convergence/TEST_MATRIX.md) for the acceptance scope.
 
 
-### macOS Keychain prompt: what is Harbor accessing?
+### macOS credential storage (next build)
 
-If macOS says **“Harness Harbor wants to use your confidential information stored in ‘com.jl066.harness-harbor’ in your keychain”**, it is requesting access to Harbor's saved connection credentials. Harbor uses only two credential entries under this service name:
+The source now stores Harbor credentials in private local files instead of Keychain. The downloadable **preview.2 still uses Keychain**; this change requires a new build.
 
-| Credential | Purpose |
+Files live under `~/Library/Application Support/Harness Harbor/credentials/`:
+
+| File | Purpose |
 | --- | --- |
-| Tunnel Runtime Key | Authenticate your configured Tunnel connection |
-| Custom Codex Provider API Key | Authenticate your configured custom API provider; not saved unless configured |
+| `tunnel-runtime-key.txt` | Your configured Tunnel Runtime Key |
+| `codex-custom-api-key.txt` | Your optional custom Provider API Key |
 
-This request targets these Harbor credential entries, not browser passwords, your Apple ID password or all other applications' keychain items. Ordinary settings such as Tunnel ID, service URL, model and paths live in the settings file; secrets do not. See the [Keychain implementation](macos/Sources/HarnessHarbor/Keychain.swift).
+Each file is created only when you explicitly save that key. Official Codex use does not create or load the custom key file. A saved custom key is loaded only when its provider or routing is enabled, or when replacing/removing it for rollback; disabling the provider retains the saved key.
 
-Harbor checks for both credentials at startup and may read them when connecting or saving settings. You may therefore see more than one prompt. Both entries share the service name, so the dialog title alone does not identify which one is being read. Preview builds are ad-hoc signed; replacing a build may also trigger authorization again.
+The directory uses permissions `0700` and files `0600`. These are plaintext files accessible to your account, separate from `settings.json`, and must not be shared. They are excluded from Git; diagnostics do not export their contents. `HARBOR_USER_SETTINGS_DIR` relocates the settings and credentials directory.
 
-- **Allow / Allow Once** grants this read only; later reads may prompt again.
-- **Always Allow** remembers the application's access to the corresponding credential item. It does not grant access to the entire keychain or guarantee that replacement builds will never prompt.
-- **Deny** prevents the read; the corresponding connection or credential check may not complete.
-
-If you choose to authorize access, enter your login keychain password (usually your Mac user login password) only in the macOS system dialog, not a Tunnel Key or API key. Harbor does not receive or store your Mac login password through this prompt. Do not enter it into Harbor's API-key fields or include it in issue reports. See [Apple's explanation of these choices](https://support.apple.com/guide/mac-help/allow-apps-to-access-your-keychain-kychn002/mac).
-
+Existing Keychain entries are neither read, imported nor deleted. Re-enter previously saved keys once in the new build. Windows continues to use Credential Manager.
 
 
 ---

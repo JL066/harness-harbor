@@ -217,12 +217,12 @@ An invalid explicit path fails rather than silently choosing a different CLI.
 
 The tunnel profile contains `env:TUNNEL_RUNTIME_KEY` and a safely serialized
 `harbor-runtime mcp` command. App users enter credentials in SecureFields backed
-by Keychain. Never put keys in this JSON or in command-line arguments.
+in separate private local credential files. Never put keys in this JSON or in command-line arguments.
 
 The native Connection Base URL defaults to `https://api.openai.com` (without
 `/v1`), matching `tunnel-client init --help`'s `--control-plane-base-url` default.
 New, missing and blank values use this default; existing custom URLs are retained.
-The default URL alone does not require a Keychain credential when saving unrelated
+The default URL alone does not require a stored credential when saving unrelated
 preferences. Completing tunnel setup still requires the Tunnel ID and runtime key.
 # Codex task default and local polling (macOS repair, 2026-09-11)
 
