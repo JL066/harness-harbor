@@ -52,6 +52,8 @@ This makes workflows possible that continue far beyond a single interactive chat
 
 > **Source status:** the current source tree is **1.1.2**. The latest published macOS binary remains **1.1.0-preview.1** until a new prerelease is explicitly published.
 
+See the [v1.1.2 source release notes](docs/releases/v1.1.2.md).
+
 See the [test matrix](docs/convergence/TEST_MATRIX.md) for the acceptance scope.
 
 

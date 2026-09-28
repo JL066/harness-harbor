@@ -52,6 +52,8 @@ ChatGPT 可以把一个较大的项目拆成多个边界清晰的阶段，每次
 
 > **源码状态：** 当前源码树版本为 **1.1.2**。在明确发布新的 prerelease 之前，最新可下载的 macOS 二进制仍为 **1.1.0-preview.1**。
 
+查看 [v1.1.2 源码更新说明](docs/releases/v1.1.2.md)。
+
 测试范围见 [测试矩阵](docs/convergence/TEST_MATRIX.md)。
 
 
