@@ -187,7 +187,7 @@ public enum BridgeProtocol {
     public static func validateHello(_ result: JSONValue) throws -> (runtimeVersion: String, buildVersion: String) {
         guard let object = result.objectValue,
               object["protocol_version"]?.intValue == version,
-              let runtimeVersion = object["runtime_version"]?.stringValue, runtimeVersion == "1.1.0",
+              let runtimeVersion = object["runtime_version"]?.stringValue, runtimeVersion == "1.1.2",
               let buildVersion = object["build_version"]?.stringValue,
               object["platform"]?.stringValue == "darwin",
               let capabilities = object["capabilities"]?.arrayValue?.compactMap(\.stringValue),

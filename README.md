@@ -50,6 +50,8 @@ This makes workflows possible that continue far beyond a single interactive chat
 - **Windows 1.1.0**: Windows Python 3.11/3.12 CI and ZIP packaging passed. Real-machine launcher/tray, Credential Manager, Task Scheduler and installed-harness acceptance remain incomplete. Source only; no Windows binary release yet.
 - Platforms release independently: `macos-v<version>` and `windows-v<version>` tags, with `-preview.N` for previews. Releases and assets are platform-specific; shared source remains in this repository.
 
+> **Source status:** the current source tree is **1.1.2**. The latest published macOS binary remains **1.1.0-preview.1** until a new prerelease is explicitly published.
+
 See the [test matrix](docs/convergence/TEST_MATRIX.md) for the acceptance scope.
 
 
@@ -683,7 +685,7 @@ Packaging uses `harbor_launcher.spec` and bundles brand icon assets from `launch
 
 ## Core + Lighthouse Launcher
 
-This Public RC includes both the Python Core and Lighthouse, a standalone Windows graphical launcher. Lighthouse provides the setup/settings wizard, secure CredentialStore integration, managed tunnel profile/lifecycle, start/stop/restart controls, tray support, log viewing, diagnostics, and a background health monitor. The local development version is `1.1.0`; start it with `run_launcher.py` or `run-launcher.ps1`, and package it with `build_exe.py` or `harbor_launcher.spec`. Harbor/Lighthouse icons and runtime packaging assets are included in `launcher/assets/`.
+This Public RC includes both the Python Core and Lighthouse, a standalone Windows graphical launcher. Lighthouse provides the setup/settings wizard, secure CredentialStore integration, managed tunnel profile/lifecycle, start/stop/restart controls, tray support, log viewing, diagnostics, and a background health monitor. The local development version is `1.1.2`; start it with `run_launcher.py` or `run-launcher.ps1`, and package it with `build_exe.py` or `harbor_launcher.spec`. Harbor/Lighthouse icons and runtime packaging assets are included in `launcher/assets/`.
 
 The wizard persists only non-secret settings. Tunnel runtime keys and custom provider keys are stored in Windows Credential Manager and passed only to the relevant child process environment; plaintext fallback is forbidden. Managed tunnel settings use operator-supplied generic HTTPS control configuration and local paths, with no private endpoint or account binding bundled.
 

@@ -2,7 +2,7 @@
 
 ## Scope
 
-The public checkout receives a tracked-source snapshot of version 1.1.0, preserving
+The public checkout receives a tracked-source snapshot of version 1.1.2, preserving
 its existing Git history. Development commit history and machine author metadata
 are not imported. Publication/push is a separate operation and was not performed.
 

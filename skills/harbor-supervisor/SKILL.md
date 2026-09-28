@@ -42,7 +42,7 @@ Delegate to a background execution Harness when file modifications or intensive 
 When code changes or compute-intensive tasks are necessary:
 
 1. **Pre-Task Check & Launch**:
-   - **Codex default**: use `gpt-5.6-sol` with `medium` reasoning. Omit model/effort to let Harbor apply this default. Only specify another model or reasoning level when the user explicitly requests it; do not autonomously upgrade or downgrade.
+   - **Codex default**: use `gpt-6-luna` with `max` reasoning. Omit model/effort to let Harbor apply this default. Supervising callers may select model/reasoning based on task complexity, execution risk, and cost. Unusually difficult work → `gpt-6-sol`. Exceptional supervisor-level reasoning → `gpt-6-astra`. Harbor itself must not auto-escalate; the supervising caller decides re-dispatch.
    - Query harness availability and health status using `harness_status`.
    - Dispatch the task using `task_start` with the appropriate harness (e.g. `codex`, `minimax`, `agy`), working directory, project identifier, prompt, and sandbox mode.
    - Formulate clear, constrained instructions detailing the goal, boundaries, constraints, and target files.

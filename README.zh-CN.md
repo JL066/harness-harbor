@@ -50,6 +50,8 @@ ChatGPT 可以把一个较大的项目拆成多个边界清晰的阶段，每次
 - **Windows 1.1.0**：Windows Python 3.11／3.12 CI 和 ZIP 构建已通过；真机 launcher／托盘、Credential Manager、Task Scheduler 和已安装 harness 验收尚未完成。当前仅提供源码，不发布 Windows 二进制。
 - 两个平台独立发布：macOS 标签 `macos-v<版本>`，Windows 标签 `windows-v<版本>`。预览版追加 `-preview.N`，不混用 Release 或安装包。共享源码仍在同一仓库维护。
 
+> **源码状态：** 当前源码树版本为 **1.1.2**。在明确发布新的 prerelease 之前，最新可下载的 macOS 二进制仍为 **1.1.0-preview.1**。
+
 测试范围见 [测试矩阵](docs/convergence/TEST_MATRIX.md)。
 
 
@@ -681,7 +683,7 @@ python build_exe.py
 
 ## Core 与 Lighthouse Launcher
 
-此 Public RC 包含 Python Core 与 Lighthouse（独立 Windows 图形启动器）。Lighthouse 提供设置/向导界面、安全的 CredentialStore 集成、托管隧道配置与生命周期、启动/停止/重启控制、系统托盘、日志查看、诊断以及后台健康监测。当前本地开发版本为 `1.1.0`；可通过 `run_launcher.py` 或 `run-launcher.ps1` 启动，并可通过 `build_exe.py` 或 `harbor_launcher.spec` 打包。Harbor/Lighthouse 图标及运行时打包资源位于 `launcher/assets/`。
+此 Public RC 包含 Python Core 与 Lighthouse（独立 Windows 图形启动器）。Lighthouse 提供设置/向导界面、安全的 CredentialStore 集成、托管隧道配置与生命周期、启动/停止/重启控制、系统托盘、日志查看、诊断以及后台健康监测。当前本地开发版本为 `1.1.2`；可通过 `run_launcher.py` 或 `run-launcher.ps1` 启动，并可通过 `build_exe.py` 或 `harbor_launcher.spec` 打包。Harbor/Lighthouse 图标及运行时打包资源位于 `launcher/assets/`。
 
 向导仅持久化非敏感配置。隧道运行时密钥和自定义 provider 密钥存储于 Windows Credential Manager，仅传递给相关子进程环境变量；严禁明文回退。托管隧道设置采用操作者提供的通用 HTTPS 控制配置与本地路径，不捆绑私有端点或账户绑定。
 

@@ -19,7 +19,7 @@ def main():
     if not app.is_dir() or app.suffix != ".app":
         parser.error("Expected the signed Harness Harbor.app directory")
     archive = app.parent / "Harness-Harbor-notary.zip"
-    dmg = app.parent / f"Harness-Harbor-1.1.0-{platform.machine()}.dmg"
+    dmg = app.parent / f"Harness-Harbor-1.1.2-{platform.machine()}.dmg"
     if archive.exists() or dmg.exists():
         parser.error("Release outputs already exist; use a new build directory")
     def run(*command):

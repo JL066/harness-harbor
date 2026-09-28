@@ -227,9 +227,12 @@ preferences. Completing tunnel setup still requires the Tunnel ID and runtime ke
 # Codex task default and local polling (macOS repair, 2026-09-11)
 
 Harbor Codex calls (`task_start`, `codex_start`, and `codex_run`) default to
-`--model gpt-5.6-sol -c model_reasoning_effort="medium"`. Explicit task model
-and reasoning arguments take precedence. Supervisors must not select another
-model/effort without the user's explicit instruction. The task default also
+`--model gpt-6-luna -c model_reasoning_effort="max"`. Explicit task model
+and reasoning arguments take precedence. Supervising callers may select
+model/reasoning based on task complexity, execution risk, and cost. Unusually
+difficult work → `gpt-6-sol`. Exceptional supervisor-level reasoning →
+`gpt-6-astra`. Harbor itself must not auto-escalate; the supervising caller
+decides re-dispatch. The task default also
 applies to custom routes; a legacy provider `default_model` does not silently
 replace it. Pass the desired provider model explicitly for those tasks.
 This does not change the user's global Codex configuration.

@@ -1,4 +1,4 @@
-# macOS native development build — 1.1.0
+# macOS native development build — 1.1.2
 
 Status: Apple Silicon downloadable preview. Ad-hoc signed, not notarized.
 

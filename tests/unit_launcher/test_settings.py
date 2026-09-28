@@ -15,6 +15,7 @@ These tests pin down the public contract of :mod:`launcher.settings`:
 
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 
@@ -41,6 +42,7 @@ def _isolate_settings(monkeypatch):
         if k.startswith("HARBOR_"):
             monkeypatch.delenv(k, raising=False)
     settings.reload()
+    importlib.reload(config)  # Config constants are bound at import time.
     yield
     # Restore (monkeypatch handles teardown of the delenv calls above;
     # anything we set during the test is reverted automatically).
@@ -50,6 +52,7 @@ def _isolate_settings(monkeypatch):
     for k, v in saved.items():
         monkeypatch.setenv(k, v)
     settings.reload()
+    importlib.reload(config)
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +238,7 @@ def test_config_derived_paths_follow_production_path(monkeypatch):
     effect of relaunching the launcher with a different ``HARBOR_HOME``.
     """
     monkeypatch.setenv("HARBOR_HOME", r"F:\alt\harbor")
+    settings.reload()
     import importlib
     reloaded = importlib.reload(config)
     assert reloaded.PRODUCTION_PATH == Path(r"F:\alt\harbor")
@@ -252,6 +256,7 @@ def test_brand_assets_remain_launcher_local(monkeypatch):
     """
     import importlib
     monkeypatch.setenv("HARBOR_HOME", r"Z:\somewhere\else")
+    settings.reload()
     reloaded = importlib.reload(config)
     # Brand paths are still under the launcher's own install dir, not under
     # the production runtime.

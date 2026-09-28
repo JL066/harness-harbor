@@ -47,8 +47,8 @@ BACKUPS_DIR = CONTROL_DIR / "backups"
 CODEX_EXE = Path(os.environ.get("HARBOR_CODEX_EXE") or shutil.which("codex") or ("codex.exe" if os.name == "nt" else "codex"))
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 CODEX_ROUTES = frozenset({"current", "official", "custom", "official_then_custom"})
-CODEX_DEFAULT_MODEL = "gpt-5.6-sol"
-CODEX_DEFAULT_REASONING_EFFORT = "medium"
+CODEX_DEFAULT_MODEL = "gpt-6-luna"
+CODEX_DEFAULT_REASONING_EFFORT = "max"
 CODEX_CUSTOM_BASE_URL_ENV = "HARBOR_CODEX_CUSTOM_BASE_URL"
 CODEX_CUSTOM_API_KEY_ENV = "HARBOR_CODEX_CUSTOM_API_KEY"
 CODEX_CUSTOM_MODEL_ENV = "HARBOR_CODEX_CUSTOM_MODEL"

@@ -51,8 +51,8 @@ def test_custom_command_has_safe_dynamic_overrides_and_default_model(monkeypatch
     assert 'model_providers.harbor_custom.base_url="https://api.acme.test/v1"' in argv
     assert 'model_providers.harbor_custom.wire_api="responses"' in argv
     assert 'model_providers.harbor_custom.env_key="HARBOR_CODEX_CUSTOM_API_KEY"' in argv
-    assert argv[argv.index("--model") + 1] == "gpt-5.6-sol"
-    assert 'model_reasoning_effort="medium"' in argv
+    assert argv[argv.index("--model") + 1] == "gpt-6-luna"
+    assert 'model_reasoning_effort="max"' in argv
     assert all("TEST_TOKEN" not in item for item in argv)
 
 

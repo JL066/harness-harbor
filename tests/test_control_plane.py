@@ -94,6 +94,7 @@ class ControlPlaneTests(unittest.TestCase):
                 {
                     control_plane.CODEX_CUSTOM_BASE_URL_ENV: "https://api.acme.test/v1",
                     control_plane.CODEX_CUSTOM_API_KEY_ENV: "sk-" + "test-secret-value-12345678",
+                    "HARBOR_CODEX_DEFAULT_ROUTE": "current",
                 },
                 clear=False,
             ):
@@ -102,11 +103,11 @@ class ControlPlaneTests(unittest.TestCase):
                     model=None, sandbox="read-only", reasoning_effort=None,
                 )
                 default_state = control_plane.read_json_object(control_plane.JOBS_DIR / cancelled["job_id"] / "status.json")
-                self.assertEqual(default_state["model"], "gpt-5.6-sol")
-                self.assertEqual(default_state["reasoning_effort"], "medium")
+                self.assertEqual(default_state["model"], "gpt-6-luna")
+                self.assertEqual(default_state["reasoning_effort"], "max")
                 default_cmd = control_plane.build_codex_command(default_state, root / "default-result")
-                self.assertEqual(default_cmd[default_cmd.index("--model") + 1], "gpt-5.6-sol")
-                self.assertIn('model_reasoning_effort="medium"', default_cmd)
+                self.assertEqual(default_cmd[default_cmd.index("--model") + 1], "gpt-6-luna")
+                self.assertIn('model_reasoning_effort="max"', default_cmd)
                 self.assertTrue(control_plane.cancel_task(cancelled["job_id"])["ok"])
 
                 started = control_plane.start_task(

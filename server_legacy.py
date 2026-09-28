@@ -194,8 +194,11 @@ async def codex_run(
 ) -> dict:
     """Run a Codex task synchronously and wait for the final result.
 
-    Defaults to gpt-5.6-sol with medium reasoning; only override model/reasoning
-    when explicitly requested by the user.
+    Default worker path: gpt-6-luna with max reasoning effort.
+    Supervising callers may select model/reasoning based on task complexity,
+    execution risk, and cost. Unusually difficult work → gpt-6-sol.
+    Exceptional supervisor-level reasoning → gpt-6-astra.
+    Harbor itself must not auto-escalate; the supervising caller decides re-dispatch.
     Use ONLY for very short tasks expected to finish quickly.
 
     Do NOT use this as a substitute for codex_start.
@@ -281,8 +284,11 @@ async def codex_start(
 ) -> dict:
     """Start a Codex task asynchronously.
 
-    Defaults to gpt-5.6-sol with medium reasoning; only override model/reasoning
-    when explicitly requested by the user.
+    Default worker path: gpt-6-luna with max reasoning effort.
+    Supervising callers may select model/reasoning based on task complexity,
+    execution risk, and cost. Unusually difficult work → gpt-6-sol.
+    Exceptional supervisor-level reasoning → gpt-6-astra.
+    Harbor itself must not auto-escalate; the supervising caller decides re-dispatch.
     This compatibility tool retains the original Codex-only API. For project
     aliases or another harness, use task_start. Jobs created here are unified
     task records and are still read with codex_poll.
@@ -702,8 +708,11 @@ async def task_start(
 ) -> dict:
     """Queue a unified async task using exactly one project alias or explicit cwd.
 
-    Codex defaults to gpt-5.6-sol with medium reasoning. Supervisors must only
-    override model/reasoning when explicitly requested by the user.
+    Default worker path: gpt-6-luna with max reasoning effort.
+    Supervising callers may select model/reasoning based on task complexity,
+    execution risk, and cost. Unusually difficult work → gpt-6-sol.
+    Exceptional supervisor-level reasoning → gpt-6-astra.
+    Harbor itself must not auto-escalate; the supervising caller decides re-dispatch.
     Harness choice remains caller-controlled. MiniMax uses its verified
     headless `mcode exec` interface. Codex supports the four public route
     values; MiniMax and AGY accept only `current`.

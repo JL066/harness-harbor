@@ -582,6 +582,24 @@ class AgyBuildCommandTests(unittest.TestCase):
 class AgyStartTaskValidationTests(unittest.TestCase):
     """Validation rules for ``start_task(harness='agy', ...)``."""
 
+    def _configure_temp_project(self, project: Path) -> Path:
+        control_dir = project / ".control"
+        control_dir.mkdir()
+        cfg = control_dir / "projects.json"
+        cfg.write_text(
+            json.dumps({"projects": {"tmpproj": {"path": str(project)}}}),
+            encoding="utf-8",
+        )
+        patcher = mock.patch.multiple(
+            control_plane,
+            CONTROL_DIR=control_dir,
+            PROJECTS_FILE=cfg,
+            JOBS_DIR=project / ".jobs",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return cfg
+
     def _state(self):
         with mock.patch.object(
             control_plane, "harness_status",
@@ -611,12 +629,7 @@ class AgyStartTaskValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             proj = Path(tmp)
             jobs_dir = proj / ".jobs"
-            cfg = control_plane.CONTROL_DIR / "projects.json"
-            cfg.parent.mkdir(parents=True, exist_ok=True)
-            cfg.write_text(
-                json.dumps({"projects": {"tmpproj": {"path": str(proj)}}}),
-                encoding="utf-8",
-            )
+            cfg = self._configure_temp_project(proj)
             try:
                 with mock.patch.object(
                     control_plane, "harness_status",
@@ -630,9 +643,7 @@ class AgyStartTaskValidationTests(unittest.TestCase):
                         "parameter_mappings": {}, "blocker": None,
                         "session_behavior": "", "output_behavior": "",
                     },
-                ), mock.patch.object(control_plane, "JOBS_DIR", jobs_dir), mock.patch.object(
-                    control_plane, "CONTROL_DIR", proj / ".control"
-                ), mock.patch.object(control_plane, "PROJECTS_FILE", cfg):
+                ):
                     r = control_plane.start_task(
                         harness="agy", prompt="hi", project="tmpproj", cwd=None,
                         model="gemini-3.7-flash-medium", sandbox="workspace-write",
@@ -660,12 +671,7 @@ class AgyStartTaskValidationTests(unittest.TestCase):
     def test_read_only_sandbox_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             proj = Path(tmp)
-            cfg = control_plane.CONTROL_DIR / "projects.json"
-            cfg.parent.mkdir(parents=True, exist_ok=True)
-            cfg.write_text(
-                json.dumps({"projects": {"tmpproj": {"path": str(proj)}}}),
-                encoding="utf-8",
-            )
+            cfg = self._configure_temp_project(proj)
             try:
                 with mock.patch.object(
                     control_plane, "harness_status",
@@ -692,12 +698,7 @@ class AgyStartTaskValidationTests(unittest.TestCase):
     def test_non_current_route_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             proj = Path(tmp)
-            cfg = control_plane.CONTROL_DIR / "projects.json"
-            cfg.parent.mkdir(parents=True, exist_ok=True)
-            cfg.write_text(
-                json.dumps({"projects": {"tmpproj": {"path": str(proj)}}}),
-                encoding="utf-8",
-            )
+            cfg = self._configure_temp_project(proj)
             try:
                 with mock.patch.object(
                     control_plane, "harness_status",
@@ -725,12 +726,7 @@ class AgyStartTaskValidationTests(unittest.TestCase):
     def test_invalid_reasoning_effort_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             proj = Path(tmp)
-            cfg = control_plane.CONTROL_DIR / "projects.json"
-            cfg.parent.mkdir(parents=True, exist_ok=True)
-            cfg.write_text(
-                json.dumps({"projects": {"tmpproj": {"path": str(proj)}}}),
-                encoding="utf-8",
-            )
+            cfg = self._configure_temp_project(proj)
             try:
                 with mock.patch.object(
                     control_plane, "harness_status",
@@ -1131,12 +1127,12 @@ class AgyHarnessRegistrationTests(unittest.TestCase):
 
 
 class CodexRoutingTests(unittest.TestCase):
-    def test_default_sol_medium_and_explicit_model_effort_precedence(self):
+    def test_default_luna_max_and_explicit_model_effort_precedence(self):
         base = {"cwd": ".", "sandbox": "read-only", "prompt": "hello"}
         for model, effort, expected_model, expected_effort in (
-            (None, None, "gpt-5.6-sol", "medium"),
-            (None, "high", "gpt-5.6-sol", "high"),
-            ("gpt-5.6-sol", None, "gpt-5.6-sol", "medium"),
+            (None, None, "gpt-6-luna", "max"),
+            (None, "high", "gpt-6-luna", "high"),
+            ("gpt-6-luna", None, "gpt-6-luna", "max"),
             ("other-model", "low", "other-model", "low"),
             ("other-model", None, "other-model", None),
         ):
@@ -1198,7 +1194,7 @@ class CodexRoutingTests(unittest.TestCase):
             current = control_plane.build_codex_command(state, Path("out"), route="current")
             official = control_plane.build_codex_command(state, Path("out"), route="official")
             custom = control_plane.build_codex_command(state, Path("out"), route="custom")
-        self.assertIn('model_reasoning_effort="medium"', current)
+        self.assertIn('model_reasoning_effort="max"', current)
         self.assertNotIn('model_provider="openai"', current)
         self.assertIn('model_provider="openai"', official)
         self.assertIn('model_provider="harbor_custom"', custom)
@@ -1206,7 +1202,7 @@ class CodexRoutingTests(unittest.TestCase):
         self.assertIn('model_providers.harbor_custom.base_url="https://api.acme.test/v1"', custom)
         self.assertIn('model_providers.harbor_custom.wire_api="responses"', custom)
         self.assertIn('model_providers.harbor_custom.env_key="HARBOR_CODEX_CUSTOM_API_KEY"', custom)
-        self.assertEqual(custom[custom.index("--model") + 1], "gpt-5.6-sol")
+        self.assertEqual(custom[custom.index("--model") + 1], "gpt-6-luna")
         self.assertNotIn(env[control_plane.CODEX_CUSTOM_API_KEY_ENV], custom)
         self.assertEqual(env[control_plane.CODEX_CUSTOM_API_KEY_ENV], child_env[control_plane.CODEX_CUSTOM_API_KEY_ENV])
         self.assertEqual(before, os.environ.get(control_plane.CODEX_CUSTOM_API_KEY_ENV))

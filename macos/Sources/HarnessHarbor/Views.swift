@@ -115,6 +115,7 @@ struct DashboardView: View {
                 harnesses
                 logs
                 diagnostics
+                versionFooter
             }
             .padding(24)
         }
@@ -232,6 +233,19 @@ struct DashboardView: View {
                 .background(.black.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
             }
         }
+    }
+
+    private var versionFooter: some View {
+        HStack {
+            Spacer()
+            if let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
+                let runtimeVersion = model.bridge.runtimeVersion
+                Text("Harness Harbor v\(appVersion) · Runtime \(runtimeVersion.isEmpty ? "checking…" : runtimeVersion)")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.top, 4)
     }
 }
 
