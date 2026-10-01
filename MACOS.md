@@ -99,35 +99,15 @@ The previous source launcher remains available. The full MCP implementation is `
 ./start-harbor.sh tunnel
 ```
 
-Run each command in its own terminal. These are foreground processes; keep them running.
-The MCP listener defaults to `http://127.0.0.1:8765/mcp` and binds loopback only.
-The launcher loads the private `.env` if present and uses `.venv/bin/python`.
-Use absolute CLI executable overrides and include the Codex Node runtime on PATH.
-Set `NO_PROXY=127.0.0.1,localhost` for local HTTP clients when a proxy is inherited.
+Run each command in its own terminal; these are foreground processes. The MCP
+listener defaults to `http://127.0.0.1:8765/mcp` and binds to loopback only. The
+launcher loads an optional local `.env` and uses `.venv/bin/python`. Use absolute
+CLI executable overrides and include the Codex Node runtime on `PATH`. Set
+`NO_PROXY=127.0.0.1,localhost` when a proxy is inherited.
 
-The private tunnel profile is `.control/tunnel/harness_harbor_mac.yaml`.
-Keep credentials, tunnel IDs and runtime state under ignored `.control/` or `.env`.
-The launcher clears inherited tunnel identity/key overrides so the private profile
-is authoritative. Harbor uses its own tunnel identity and the standard `main`
-channel, with the full MCP server launched over stdio.
-Never point Harbor at Coot's `main` channel on a shared tunnel.
-ChatGPT's tunnel selector does not expose a custom channel field; a separate tunnel
-identity is needed unless the client explicitly supports selecting Harbor's channel.
-Local readiness alone does not prove ChatGPT is connected.
+Keep credentials, tunnel IDs and runtime state in ignored `.control/` or `.env`
+files. Use an operator-managed tunnel profile dedicated to Harbor. Do not commit
+credentials or reuse another service's private settings. Local readiness alone
+does not prove that a remote client is connected.
 
-Codex CLI 0.147.0 rejected the current global `gpt-6-astra` model. The read-only
-smoke succeeded with a task-level `model="gpt-5.5"` override; global config is unchanged.
-AGY supports the existing `workspace-write` mapping only. Its smoke prompt prohibits
-all tool use and file changes; dangerous permission bypass stays disabled.
-MiniMax remains unavailable and is not installed for this stage.
-
-Validation:
-
-```sh
-. .venv/bin/activate
-python3 -m unittest discover -s tests -v
-git diff --check
-```
-
-The system Python lacks `mcp`; use the existing project virtual environment.
-Local smoke evidence is in `.control/mac-smoke.json` and `.jobs/`.
+For automated and opt-in acceptance commands, see the [test matrix](docs/convergence/TEST_MATRIX.md).
