@@ -1,6 +1,6 @@
-# macOS native development build — 1.1.2
+# macOS native build — 1.1.2
 
-Status: Apple Silicon downloadable preview. Ad-hoc signed, not notarized.
+Status: Apple Silicon v1.1.2 DMG published. Ad-hoc signed, not notarized; Intel validation pending.
 
 [Download macOS 1.1.0 preview DMG and checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.1).
 Intel and clean-machine Gatekeeper acceptance remain unvalidated.

@@ -42,24 +42,24 @@ ChatGPT 可以把一个较大的项目拆成多个边界清晰的阶段，每次
 这样，一个开发工作流就不必局限在单次交互式聊天里。
 
 > **平台状态：** Windows 1.1.0 CI 和 ZIP 构建已通过；真实安装与系统集成验收仍未完成。<br>
-> macOS 已有 Apple Silicon 开发实现：原生 SwiftUI Lighthouse 和内置 Python Runtime。提供 Apple Silicon DMG 预览版；正式发布验收尚未完成，Intel 未验证，详见 [macOS 说明](MACOS.md)。
+> macOS v1.1.2 已发布 Apple Silicon（arm64）版本，包含原生 SwiftUI Lighthouse 与内置 Python Runtime。DMG 采用 ad-hoc 签名且未公证；Intel 验证仍待完成，详见 [macOS 说明](MACOS.md)。
 
 ## 下载与平台版本
 
-- **macOS 1.1.0 预览版（Apple Silicon）**：[下载 DMG 与 SHA256 校验文件](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.1)。仅 ad-hoc 签名、未公证，Gatekeeper 可能阻止打开；尚非正式稳定版。
+- **macOS 1.1.2（Apple Silicon / arm64）**：[下载 DMG 与 SHA256 校验文件](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.2)。采用 ad-hoc 签名且未公证；Gatekeeper 可能需要手动放行。
 - **Windows 1.1.0**：Windows Python 3.11／3.12 CI 和 ZIP 构建已通过；真机 launcher／托盘、Credential Manager、Task Scheduler 和已安装 harness 验收尚未完成。当前仅提供源码，不发布 Windows 二进制。
 - 两个平台独立发布：macOS 标签 `macos-v<版本>`，Windows 标签 `windows-v<版本>`。预览版追加 `-preview.N`，不混用 Release 或安装包。共享源码仍在同一仓库维护。
 
-> **源码状态：** 当前源码树版本为 **1.1.2**。在明确发布新的 prerelease 之前，最新可下载的 macOS 二进制仍为 **1.1.0-preview.1**。
+> **源码状态：** 当前公开源码树版本为 **1.1.2**，最新已发布的 macOS 二进制也是 **macOS v1.1.2**。
 
-查看 [v1.1.2 源码更新说明](docs/releases/v1.1.2.md)。
+查看 [v1.1.2 发布说明](docs/releases/v1.1.2.md)。
 
 测试范围见 [测试矩阵](docs/convergence/TEST_MATRIX.md)。
 
 
 ### macOS 密钥存储
 
-当前 **preview.1** 使用本地独立文件保存 Harbor 密钥，不再访问钥匙串，并包含 macOS AGY 写入权限和失败终态修复。本预览版替代已撤回的早期测试包，请用 SHA256 校验和区分安装包。
+当前 **macOS v1.1.2** 使用本地独立文件保存 Harbor 密钥，不再访问钥匙串，并包含 macOS AGY 写入权限和失败终态修复。已发布 DMG 的 SHA-256 为 `318ea0e85286e87cbac4fac1bee2a4bdcd4e82463d3165fef98a42844067163c`。
 
 文件位置：`~/Library/Application Support/Harness Harbor/credentials/`
 
@@ -991,7 +991,7 @@ GitHub Actions 已配置 Windows/macOS、Python 3.11/3.12 Core 测试以及 macO
 | 平台 | 状态 |
 | --- | --- |
 | Windows | 1.1.0 CI 和 ZIP 构建已通过；真机验收未完成；暂不公开发布安装包 |
-| macOS | Apple Silicon DMG 预览版；未公证；Intel／正式发布验收未完成 |
+| macOS | v1.1.2 Apple Silicon DMG 已发布；ad-hoc 签名、未公证；Intel 验证待完成 |
 | Linux | 目前未验证 |
 
 当前实现以 Windows 为首要平台，包括其 PowerShell 启动脚本、Windows Credential Manager 集成、Lighthouse 图形界面以及进程行为。

@@ -42,24 +42,24 @@ When combined with **ChatGPT Scheduled Tasks**, the Supervisor can also come bac
 This makes workflows possible that continue far beyond a single interactive chat turn.
 
 > **Platform status:** Windows 1.1.0 CI and ZIP build pass; real-machine installation and system integration remain unverified.
-> macOS has an Apple Silicon development implementation: native SwiftUI Lighthouse and a bundled Python runtime. An Apple Silicon DMG preview is available; stable release acceptance and Intel validation remain pending. See [macOS setup and release gates](MACOS.md).
+> macOS v1.1.2 is published for Apple Silicon (arm64) with native SwiftUI Lighthouse and a bundled Python runtime. The DMG is ad-hoc signed and not notarized; Intel validation remains pending. See [macOS setup and release gates](MACOS.md).
 
 ## Downloads and platform versions
 
-- **macOS 1.1.0 preview (Apple Silicon)**: [Download the DMG and SHA256 checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.0-preview.1). Ad-hoc signed, not notarized; Gatekeeper may block opening it. This is not a stable release.
+- **macOS 1.1.2 (Apple Silicon / arm64)**: [Download the DMG and SHA256 checksums](https://github.com/JL066/harness-harbor/releases/tag/macos-v1.1.2). Ad-hoc signed and not notarized; Gatekeeper may require manual approval.
 - **Windows 1.1.0**: Windows Python 3.11/3.12 CI and ZIP packaging passed. Real-machine launcher/tray, Credential Manager, Task Scheduler and installed-harness acceptance remain incomplete. Source only; no Windows binary release yet.
 - Platforms release independently: `macos-v<version>` and `windows-v<version>` tags, with `-preview.N` for previews. Releases and assets are platform-specific; shared source remains in this repository.
 
-> **Source status:** the current source tree is **1.1.2**. The latest published macOS binary remains **1.1.0-preview.1** until a new prerelease is explicitly published.
+> **Source status:** the current public source tree is **1.1.2**, and the latest published macOS binary is **macOS v1.1.2**.
 
-See the [v1.1.2 source release notes](docs/releases/v1.1.2.md).
+See the [v1.1.2 release notes](docs/releases/v1.1.2.md).
 
 See the [test matrix](docs/convergence/TEST_MATRIX.md) for the acceptance scope.
 
 
 ### macOS credential storage
 
-The current **preview.1** stores Harbor credentials in private local files instead of Keychain. It includes the macOS AGY workspace-write and permission-denial fixes. This preview replaces the earlier withdrawn test uploads; identify the package by its SHA256 checksum.
+The current **macOS v1.1.2** release stores Harbor credentials in private local files instead of Keychain. It includes the macOS AGY workspace-write and permission-denial fixes. The published DMG SHA-256 is `318ea0e85286e87cbac4fac1bee2a4bdcd4e82463d3165fef98a42844067163c`.
 
 Files live under `~/Library/Application Support/Harness Harbor/credentials/`:
 
@@ -997,7 +997,7 @@ GitHub Actions is configured to run Core tests on Windows and macOS with Python 
 | Platform | Status |
 | --- | --- |
 | Windows | 1.1.0 CI and ZIP build passed; real-machine acceptance incomplete; no public binary release |
-| macOS | Apple Silicon DMG preview; not notarized; Intel / stable acceptance pending |
+| macOS | v1.1.2 Apple Silicon DMG published; ad-hoc signed, not notarized; Intel validation pending |
 | Linux | Not currently validated |
 
 The current implementation is Windows-first, including its PowerShell launchers, Windows Credential Manager integration, Lighthouse GUI, and process behavior.
