@@ -151,7 +151,7 @@ def query_windows_processes() -> list[ProcessInfo]:
 # ---------------------------------------------------------------------------
 
 def is_production_harbor_path(cmd: str) -> bool:
-    """Check if command line references production Harness Harbor or codex-mcp junction."""
+    """Check if command line references production chatgpt-harbor or codex-mcp junction."""
     cmd_lower = cmd.lower().replace("/", "\\")
     prod_norm = str(PRODUCTION_PATH).lower().replace("/", "\\")
     junc_norm = str(JUNCTION_PATH).lower().replace("/", "\\")
@@ -170,7 +170,7 @@ def find_tunnel_supervisors(processes: Sequence[ProcessInfo]) -> list[ProcessInf
 
 
 def find_tunnel_clients(processes: Sequence[ProcessInfo]) -> list[ProcessInfo]:
-    """Find tunnel-client.exe processes configured for harness-harbor profile."""
+    """Find tunnel-client.exe processes configured for chatgpt-harbor profile."""
     results: list[ProcessInfo] = []
     for p in processes:
         if p.name.lower() == "tunnel-client.exe":

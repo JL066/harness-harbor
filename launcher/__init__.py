@@ -1,6 +1,6 @@
 """Harness Harbor Windows Launcher package."""
 
-__version__ = "1.0.0"
+from harbor_runtime import RUNTIME_VERSION as __version__
 
 from launcher.credential_store import CredentialStore
 from launcher.user_settings import UserSettings, load_user_settings, save_user_settings

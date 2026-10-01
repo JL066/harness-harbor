@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 import customtkinter as ctk
 
@@ -12,8 +13,9 @@ from launcher.log_reader import read_log_tail
 class LogDialog(ctk.CTkToplevel):
     """Modern rounded log viewer dialog."""
 
-    def __init__(self, master=None):
+    def __init__(self, master=None, *, backend=None):
         super().__init__(master)
+        self.backend = backend
 
         self.title("Harbor Runtime Logs")
         self.geometry("780x560")
@@ -25,9 +27,10 @@ class LogDialog(ctk.CTkToplevel):
             y = master.winfo_y() + (master.winfo_height() // 2) - 280
             self.geometry(f"+{max(50, x)}+{max(50, y)}")
 
-        self.current_log_type = "tunnel"
-        self.max_lines = 300
+        self.current_log_type = "runtime" if self._is_packaged() else "tunnel"
+        self.max_lines = 200 if self._is_packaged() else 300
         self.auto_refresh_job = None
+        self._refresh_token = 0
 
         self._init_ui()
         self.refresh_log()
@@ -46,23 +49,23 @@ class LogDialog(ctk.CTkToplevel):
         # Log selector segmented button
         self.log_seg = ctk.CTkSegmentedButton(
             top_frame,
-            values=["Tunnel Supervisor", "Job Daemon"],
+            values=["Runtime", "Tunnel Supervisor", "Job Daemon"] if self._is_packaged() else ["Tunnel Supervisor", "Job Daemon"],
             command=self._on_log_type_change,
             corner_radius=8,
             font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
         )
-        self.log_seg.set("Tunnel Supervisor")
+        self.log_seg.set("Runtime" if self._is_packaged() else "Tunnel Supervisor")
         self.log_seg.grid(row=0, column=0, sticky="w")
 
         # Lines selector
         self.lines_seg = ctk.CTkSegmentedButton(
             top_frame,
-            values=["100", "300", "500"],
+            values=["100", "200"] if self._is_packaged() else ["100", "300", "500"],
             command=self._on_lines_change,
             corner_radius=8,
             font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
         )
-        self.lines_seg.set("300")
+        self.lines_seg.set("200" if self._is_packaged() else "300")
         self.lines_seg.grid(row=0, column=1, padx=(12, 0), sticky="w")
 
         # Actions on right
@@ -116,26 +119,72 @@ class LogDialog(ctk.CTkToplevel):
         self.info_label.grid(row=2, column=0, sticky="w", padx=20, pady=(4, 12))
 
     def _on_log_type_change(self, val: str):
-        self.current_log_type = "tunnel" if val == "Tunnel Supervisor" else "daemon"
+        self.current_log_type = ({"Runtime": "runtime", "Tunnel Supervisor": "tunnel", "Job Daemon": "daemon"}.get(val, "daemon") if self._is_packaged() else ("tunnel" if val == "Tunnel Supervisor" else "daemon"))
         self.refresh_log()
 
     def _on_lines_change(self, val: str):
-        self.max_lines = int(val)
+        self.max_lines = min(int(val), 200) if self._is_packaged() else int(val)
         self.refresh_log()
 
-    def refresh_log(self):
-        target_path = TUNNEL_LOG if self.current_log_type == "tunnel" else DAEMON_LOG
-        lines, encoding = read_log_tail(target_path, max_lines=self.max_lines)
+    def _is_packaged(self) -> bool:
+        return getattr(self.backend, "mode", "legacy") == "packaged"
 
+    def _post_result(self, *args):
+        try:
+            self.after(0, self._apply_log_result, *args)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _apply_log_result(self, token: int, component: str, result=None, error=None):
+        if token != self._refresh_token:
+            return
+        if error is not None:
+            lines, encoding = [f"[Error reading packaged runtime log: {error}]"], "error"
+        elif isinstance(result, tuple) and len(result) == 2:
+            lines, encoding = result
+        elif isinstance(result, dict):
+            text = result.get("text", "")
+            lines, encoding = str(text).splitlines(), "runtime"
+        else:
+            lines, encoding = str(result or "").splitlines(), "runtime"
+        lines = [str(line) for line in lines]
         self.text_box.configure(state="normal")
         self.text_box.delete("1.0", "end")
         self.text_box.insert("1.0", "\n".join(lines))
         self.text_box.see("end")
         self.text_box.configure(state="disabled")
+        if self._is_packaged():
+            self.info_label.configure(
+                text=f"Log: {component} | Detected Encoding: {encoding} | Lines Shown: {len(lines)}"
+            )
 
-        self.info_label.configure(
-            text=f"Log: {target_path.name} | Detected Encoding: {encoding} | Lines Shown: {len(lines)}"
-        )
+    def refresh_log(self):
+        component = self.current_log_type
+        if self.backend is None:
+            target_path = TUNNEL_LOG if component == "tunnel" else DAEMON_LOG
+            lines, encoding = read_log_tail(target_path, max_lines=self.max_lines)
+            self.text_box.configure(state="normal")
+            self.text_box.delete("1.0", "end")
+            self.text_box.insert("1.0", "\n".join(lines))
+            self.text_box.see("end")
+            self.text_box.configure(state="disabled")
+            self.info_label.configure(
+                text=f"Log: {target_path.name} | Detected Encoding: {encoding} | Lines Shown: {len(lines)}"
+            )
+            return
+
+        self._refresh_token += 1
+        token = self._refresh_token
+        limit = min(max(1, int(self.max_lines)), 200) if self._is_packaged() else int(self.max_lines)
+
+        def worker():
+            try:
+                result = self.backend.logs.tail(component, max_lines=limit)
+                self._post_result(token, component, result, None)
+            except Exception as exc:
+                self._post_result(token, component, None, str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _copy_log(self):
         self.clipboard_clear()
@@ -144,6 +193,7 @@ class LogDialog(ctk.CTkToplevel):
         self.after(1500, lambda: self.copy_btn.configure(text="Copy Tail"))
 
     def _on_close(self):
+        self._refresh_token += 1
         if self.auto_refresh_job:
             self.after_cancel(self.auto_refresh_job)
         self.destroy()

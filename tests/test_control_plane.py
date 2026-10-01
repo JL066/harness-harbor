@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -23,6 +22,8 @@ class ControlPlaneTests(unittest.TestCase):
             mock.patch.object(control_plane, "JOBS_DIR", root / ".jobs"),
             mock.patch.object(control_plane, "CONTROL_DIR", root / ".control"),
             mock.patch.object(control_plane, "PROJECTS_FILE", root / ".control" / "projects.json"),
+            mock.patch.object(control_plane, "ROUTE_STATE_FILE", root / ".control" / "route-state.json"),
+            mock.patch.object(control_plane, "ROUTE_LOCK_FILE", root / ".control" / "route.lock"),
             mock.patch.object(control_plane, "BACKUPS_DIR", root / ".control" / "backups"),
             mock.patch.object(control_plane, "CODEX_CONFIG", root / "user-config.toml"),
         ]
@@ -89,14 +90,7 @@ class ControlPlaneTests(unittest.TestCase):
             fake_codex = root / "codex.exe"
             fake_codex.write_text("placeholder", encoding="utf-8")
 
-            with mock.patch.object(control_plane, "CODEX_EXE", fake_codex), mock.patch.dict(
-                os.environ,
-                {
-                    control_plane.CODEX_CUSTOM_BASE_URL_ENV: "https://api.acme.test/v1",
-                    control_plane.CODEX_CUSTOM_API_KEY_ENV: "sk-" + "test-secret-value-12345678",
-                },
-                clear=False,
-            ):
+            with mock.patch.object(control_plane, "CODEX_EXE", fake_codex):
                 cancelled = control_plane.start_task(
                     harness="codex", prompt="cancel", project="fixture", cwd=None,
                     model=None, sandbox="read-only", reasoning_effort=None,
@@ -114,7 +108,7 @@ class ControlPlaneTests(unittest.TestCase):
                     result_path.write_text("done", encoding="utf-8")
                     return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
-                with mock.patch.object(codex_job_worker.subprocess, "run", side_effect=fake_run):
+                with mock.patch.object(codex_job_worker, "run_codex_with_lifecycle", side_effect=fake_run):
                     codex_job_worker.main(job_dir)
 
                 polled = control_plane.poll_task(started["job_id"])
@@ -123,83 +117,9 @@ class ControlPlaneTests(unittest.TestCase):
                 self.assertEqual("codex", polled["harness"])
                 self.assertEqual("fixture", polled["project"])
                 self.assertEqual("done", polled["final_message"])
-                self.assertEqual("current", polled["route_requested"])
-                self.assertEqual("current", polled["route_used"])
-                self.assertFalse(polled["fallback_used"])
-                self.assertIsNone(polled["fallback_reason"])
-                self.assertEqual(["current"], [item["route"] for item in polled["attempts"]])
                 argv = polled["native_process"]["argv"]
                 self.assertIn("--model", argv)
                 self.assertIn('model_reasoning_effort="high"', argv)
-
-    def test_codex_routes_are_accepted_and_non_codex_routes_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            self.configure_temp_control(root)
-            project = root / "project"
-            project.mkdir()
-            self.write_projects(project)
-            fake_codex = root / "codex.exe"
-            fake_codex.write_text("placeholder", encoding="utf-8")
-            with mock.patch.object(control_plane, "CODEX_EXE", fake_codex), mock.patch.dict(
-                os.environ,
-                {
-                    control_plane.CODEX_CUSTOM_BASE_URL_ENV: "https://api.acme.test/v1",
-                    control_plane.CODEX_CUSTOM_API_KEY_ENV: "sk-" + "test-secret-value-12345678",
-                },
-                clear=False,
-            ):
-                for route in ("current", "official", "custom", "official_then_custom"):
-                    result = control_plane.start_task(
-                        harness="codex", prompt="route", project="fixture", cwd=None,
-                        model=None, sandbox="read-only", reasoning_effort=None, route=route,
-                    )
-                    self.assertTrue(result["ok"], result)
-                    state = json.loads(
-                        (control_plane.JOBS_DIR / result["job_id"] / "status.json").read_text(
-                            encoding="utf-8"
-                        )
-                    )
-                    self.assertEqual(route, state["route_requested"])
-                    self.assertEqual(control_plane.codex_route_attempts(route)[0], state["route_used"])
-                refused = control_plane.start_task(
-                    harness="minimax", prompt="route", project="fixture", cwd=None,
-                    model=None, sandbox="workspace-write", reasoning_effort=None, route="custom",
-                )
-            self.assertFalse(refused["ok"])
-            self.assertIn("route=current", refused["error"])
-
-    def test_custom_route_fails_closed_when_configuration_is_missing_or_invalid(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            self.configure_temp_control(root)
-            project = root / "project"
-            project.mkdir()
-            self.write_projects(project)
-            fake_codex = root / "codex.exe"
-            fake_codex.write_text("placeholder", encoding="utf-8")
-            with mock.patch.object(control_plane, "CODEX_EXE", fake_codex), mock.patch.dict(
-                os.environ,
-                {
-                    control_plane.CODEX_CUSTOM_BASE_URL_ENV: "not-a-url",
-                    control_plane.CODEX_CUSTOM_API_KEY_ENV: "",
-                },
-                clear=False,
-            ):
-                missing = control_plane.start_task(
-                    harness="codex", prompt="route", project="fixture", cwd=None,
-                    model=None, sandbox="read-only", reasoning_effort=None, route="custom",
-                )
-                self.assertFalse(missing["ok"])
-                self.assertIn("custom route requires", missing["error"])
-
-                os.environ[control_plane.CODEX_CUSTOM_API_KEY_ENV] = "sk-" + "test-secret-value-12345678"
-                invalid = control_plane.start_task(
-                    harness="codex", prompt="route", project="fixture", cwd=None,
-                    model=None, sandbox="read-only", reasoning_effort=None, route="official_then_custom",
-                )
-                self.assertFalse(invalid["ok"])
-                self.assertIn("must be an http(s) URL", invalid["error"])
 
     @staticmethod
     def minimax_probe(argv, **_kwargs) -> subprocess.CompletedProcess:
@@ -217,6 +137,7 @@ class ControlPlaneTests(unittest.TestCase):
                     "  --cwd <path>\n"
                     "  --model <provider/model>\n"
                     "  --permission <policy>\n"
+                    "  --input <value> use - to read stdin\n"
                     "  --output-format <format> text, json, or stream-json\n"
                     "  -o, --output-last-message <path>\n"
                 ),
@@ -272,10 +193,11 @@ class ControlPlaneTests(unittest.TestCase):
             [
                 r"C:\fixture\mcode.cmd", "exec", "--cwd", r"C:\fixture\repo",
                 "--output-format", "json", "--output-last-message", str(result_path),
-                "--model", "provider/model", "--input", "-",
+                "--input", "-", "--model", "provider/model",
             ],
             command,
         )
+        self.assertNotIn("finish", command)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -288,18 +210,26 @@ class ControlPlaneTests(unittest.TestCase):
             with mock.patch.object(control_plane, "MINIMAX_CLI_EXE", fake_mcode), mock.patch.object(
                 control_plane.shutil, "which", return_value=None
             ), mock.patch.object(control_plane, "run_safe_subprocess", side_effect=self.minimax_probe):
-                reasoning = control_plane.start_task(
+                started = control_plane.start_task(
                     harness="minimax", prompt="x", project="fixture", cwd=None,
-                    model=None, sandbox="workspace-write", reasoning_effort="high",
+                    model=None, sandbox="workspace-write", reasoning_effort=None,
                 )
                 read_only = control_plane.start_task(
                     harness="minimax", prompt="x", project="fixture", cwd=None,
                     model=None, sandbox="read-only", reasoning_effort=None,
                 )
-            self.assertFalse(reasoning["ok"])
-            self.assertIn("reasoning_effort", reasoning["error"])
-            self.assertFalse(read_only["ok"])
-            self.assertIn("read-only sandbox", read_only["error"])
+                self.assertTrue(started["ok"])
+                self.assertFalse(read_only["ok"])
+                self.assertIn("read-only sandbox", read_only["error"])
+                self.assertEqual("workspace-write", started["sandbox_requested"])
+                self.assertEqual("unenforced", started["sandbox_effective"])
+                self.assertFalse(started["sandbox_enforced"])
+                state = json.loads(
+                    (control_plane.JOBS_DIR / started["job_id"] / "status.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual("workspace-write", state["sandbox_requested"])
+                self.assertEqual("unenforced", state["sandbox_effective"])
+                self.assertFalse(state["sandbox_enforced"])
 
     def test_minimax_task_success_and_nonzero_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -382,6 +312,107 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertLessEqual(len(failure["stdout_tail"]), codex_job_worker.OUTPUT_TAIL_CHARS)
             self.assertLessEqual(len(failure["stderr_tail"]), codex_job_worker.OUTPUT_TAIL_CHARS)
 
+    def test_minimax_packaged_mode_keeps_sandbox_contract_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            project = root / "project"
+            project.mkdir()
+            self.write_projects(project)
+            fake_mcode = root / "mcode.cmd"
+            fake_mcode.write_text("placeholder", encoding="utf-8")
+            missing_agy = root / "missing" / "agy.exe"
+            with mock.patch.object(control_plane, "MINIMAX_CLI_EXE", fake_mcode), mock.patch.object(
+                control_plane, "run_safe_subprocess", side_effect=self.minimax_probe
+            ), mock.patch.object(control_plane, "AGY_EXE", missing_agy
+            ), mock.patch.object(control_plane.shutil, "which", return_value=None), mock.patch.dict(
+                control_plane.os.environ, {"HARBOR_RUNTIME_MODE": "packaged"}
+            ):
+                started = control_plane.start_task(
+                    harness="minimax", prompt="packaged status", project="fixture", cwd=None,
+                    model="provider/model", sandbox="workspace-write", reasoning_effort=None,
+                )
+            self.assertTrue(started["ok"])
+
+            job_dir = control_plane.JOBS_DIR / started["job_id"]
+            state = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual("workspace-write", state["sandbox_requested"])
+            self.assertEqual("unenforced", state["sandbox_effective"])
+            self.assertFalse(state["sandbox_enforced"])
+
+    def test_minimax_task_canonical_success_with_cleanup_exit_is_normalized_in_poll(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            project = root / "project"
+            project.mkdir()
+            self.write_projects(project)
+            fake_mcode = root / "mcode.cmd"
+            fake_mcode.write_text("placeholder", encoding="utf-8")
+            missing_agy = root / "missing" / "agy.exe"
+            probe_patch = mock.patch.object(control_plane, "run_safe_subprocess", side_effect=self.minimax_probe)
+            with mock.patch.object(control_plane, "MINIMAX_CLI_EXE", fake_mcode), mock.patch.object(
+                control_plane, "AGY_EXE", missing_agy
+            ), mock.patch.object(control_plane.shutil, "which", return_value=None
+            ), probe_patch:
+                started = control_plane.start_task(
+                    harness="minimax", prompt="packaged cleanup", project="fixture", cwd=None,
+                    model="provider/model", sandbox="workspace-write", reasoning_effort=None,
+                )
+
+            def cleanup_force_exit_lifecycle(command, result_path, **_kwargs):
+                result_path.write_text("MINIMAX_CLEANUP_DONE", encoding="utf-8")
+                stdout = json.dumps(
+                    {"schemaVersion": 1, "type": "exec.result", "status": "succeeded", "output": "MINIMAX_CLEANUP_DONE"},
+                )
+                return {
+                    "exit_code": 1,
+                    "stdout": stdout,
+                    "stderr": "",
+                    "termination_reason": "grace_expired_after_result",
+                    "forced_exit": True,
+                    "result_completed_at": 0.0,
+                    "result_text": "MINIMAX_CLEANUP_DONE",
+                }
+
+            job_dir = control_plane.JOBS_DIR / started["job_id"]
+            with mock.patch.object(codex_job_worker, "run_minimax_with_lifecycle", side_effect=cleanup_force_exit_lifecycle):
+                codex_job_worker.main(job_dir)
+            completed = control_plane.poll_task(started["job_id"])
+            self.assertEqual("completed", completed["status"])
+            self.assertEqual("MINIMAX_CLEANUP_DONE", completed["final_message"])
+            self.assertEqual(0, completed["exit_code"])
+            self.assertEqual(1, completed["process_exit_code"])
+            self.assertTrue(completed["forced_exit_after_result"])
+            self.assertEqual("minimax_cleanup_after_result", completed["cleanup_anomaly"])
+
+    def test_quota_classifier_and_route_state(self) -> None:
+        self.assertTrue(control_plane.is_official_quota_exhausted("OpenAI Codex usage limit exhausted"))
+        self.assertFalse(control_plane.is_official_quota_exhausted("HTTP 429 from upstream"))
+        self.assertFalse(control_plane.is_official_quota_exhausted("OpenAI Codex rate limit; retry after 30 seconds"))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            control_plane.record_official_quota_exhausted("OpenAI Codex quota exceeded")
+            state = json.loads(control_plane.ROUTE_STATE_FILE.read_text(encoding="utf-8"))
+            self.assertEqual("quota_exhausted", state["official"]["status"])
+            self.assertIsNone(state["official"]["unavailable_until"])
+
+    def test_route_lock_and_snapshot_restore_use_temporary_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = root / "config.toml"
+            config.write_text("model = 'before'\n", encoding="utf-8")
+            snapshot = control_plane.ConfigSnapshot(config)
+            lock = root / "route.lock"
+            with control_plane.route_lock(lock):
+                self.assertTrue(lock.exists())
+                config.write_text("model = 'changed'\n", encoding="utf-8")
+            self.assertFalse(lock.exists())
+            self.assertFalse(snapshot.unchanged())
+            snapshot.restore()
+            self.assertTrue(snapshot.unchanged())
+
     def test_git_tools_on_temporary_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = Path(temporary_directory) / "repo"
@@ -409,6 +440,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertTrue({"codex_status", "codex_run", "codex_start", "codex_poll"}.issubset(names))
         self.assertTrue({
             "harness_list", "harness_status", "task_start", "task_poll", "task_cancel",
+            "harness_telemetry",
             "project_list", "project_resolve", "file_read", "file_write", "file_append",
             "file_stat", "directory_list", "git_status", "git_diff", "git_branch", "git_log",
             "git_worktree_list", "git_rev_parse", "git_add", "git_commit", "git_ls_remote",

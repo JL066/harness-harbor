@@ -4,7 +4,7 @@ from launcher.diagnostics import format_diagnostics_markdown, redact_secrets
 
 
 def test_redact_secrets_flags():
-    cmd = 'tunnel-client.exe --api-key sk-test123456 --profile harness-harbor --token secret_token_xyz'
+    cmd = 'tunnel-client.exe --api-key sk-test123456 --profile chatgpt-harbor --token secret_token_xyz'
     redacted = redact_secrets(cmd)
     assert "sk-test123456" not in redacted
     assert "secret_token_xyz" not in redacted
@@ -35,37 +35,37 @@ def test_redact_env_tunnel_runtime_key():
 def test_format_diagnostics_markdown_no_secrets():
     diag = {
         "timestamp": "2026-09-03 21:00:00",
-        "production_path": "C:\\Users\\Example\\HarnessHarbor",
-        "git_commit": "abc1234",
+        "production_path": "X:\\Example\\chatgpt-harbor",
+        "git_commit": "3c0659a",
         "git_branch": "master",
-        "tunnel_executable": "C:\\Users\\Example\\HarnessHarbor\\tools\\tunnel-client.exe",
+        "tunnel_executable": "X:\\Example\\tunnel-client\\v0.0.12\\tunnel-client.exe",
         "tunnel_executable_exists": True,
-        "tunnel_profile_path": "C:\\Users\\Example\\AppData\\Roaming\\tunnel-client\\harness-harbor.yaml",
+        "tunnel_profile_path": "C:\\Users\\ExampleUser\\AppData\\Roaming\\tunnel-client\\chatgpt-harbor.yaml",
         "tunnel_profile_exists": True,
         "tunnel_health_url": "http://127.0.0.1:51260",
         "tunnel_probe_status": "HTTP 200 (OK)",
         "tunnel_probe_latency": "1.2ms",
-        "tunnel_pids": [1234],
+        "tunnel_pids": [14724],
         "tunnel_status": "Healthy",
         "mcp_script": "server_legacy.py",
-        "mcp_pids": [2345],
+        "mcp_pids": [16112],
         "mcp_status": "Healthy",
         "daemon_script": "codex_job_daemon.py",
-        "daemon_pids": [3456],
+        "daemon_pids": [14748],
         "daemon_status": "Running",
-        "python_executable": "C:\\Users\\Example\\HarnessHarbor\\.venv\\Scripts\\python.exe",
+        "python_executable": "X:\\Example\\chatgpt-harbor\\.venv-legacy\\Scripts\\python.exe",
         "python_executable_exists": True,
         "overall_status": "All systems healthy",
         "os_platform": "win32",
         "python_version": "3.11.9",
-        "jobs_dir": "C:\\Users\\Example\\HarnessHarbor\\.jobs",
+        "jobs_dir": "X:\\Example\\chatgpt-harbor\\.jobs",
         "source": "environment",
-        "canonical_path": "c:\\users\\example\\harnessharbor\\.jobs",
+        "canonical_path": "x:\\example\\chatgpt-harbor\\.jobs",
         "fingerprint": "0123456789abcdef",
     }
     md = format_diagnostics_markdown(diag)
     assert "# Harness Harbor Diagnostics" in md
-    assert "abc1234" in md
+    assert "3c0659a" in md
     assert "server_legacy.py" in md
     assert "never server.py" in md
     assert "0123456789abcdef" in md

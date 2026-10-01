@@ -3,9 +3,9 @@
 # Configuration: every deployment-specific path is resolved at startup from
 # HARBOR_* environment variables (e.g. HARBOR_HOME, HARBOR_TUNNEL_EXE). See
 # docs/CONFIGURATION.md for the full list. Set them in this shell before
-# invoking the launcher to override checkout-relative defaults:
+# invoking the launcher to override the portable source-tree defaults:
 #
-#   $env:HARBOR_HOME = "C:\Users\Example\HarnessHarbor"
+#   $env:HARBOR_HOME = "E:\harbor\prod"
 #   .\run-launcher.ps1
 #
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition

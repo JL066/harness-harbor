@@ -24,8 +24,8 @@ import sys
 # Stable namespaced credential identities
 # ---------------------------------------------------------------------------
 
-CREDENTIAL_TARGET_TUNNEL_RUNTIME_KEY = "Harness-Harbor:tunnel:runtime_key"
-CREDENTIAL_TARGET_CODEX_CUSTOM_API_KEY = "Harness-Harbor:codex:custom_api_key"
+CREDENTIAL_TARGET_TUNNEL_RUNTIME_KEY = "ChatGPT-Harbor:tunnel:runtime_key"
+CREDENTIAL_TARGET_CODEX_CUSTOM_API_KEY = "ChatGPT-Harbor:codex:custom_api_key"
 
 
 # ---------------------------------------------------------------------------

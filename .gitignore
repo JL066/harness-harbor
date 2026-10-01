@@ -59,3 +59,4 @@ scratch/
 
 # Package initializers are release source, not one-off underscore scripts
 !**/__init__.py
+!**/__main__.py

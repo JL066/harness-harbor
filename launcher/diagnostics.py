@@ -102,6 +102,8 @@ def collect_diagnostics() -> dict[str, Any]:
     health = get_harbor_health()
     git_info = get_git_head_info(PRODUCTION_PATH)
     health_url = read_tunnel_health_url()
+    from launcher.build_info import get_build_info
+    build_info = get_build_info()
 
     probe_status = "N/A"
     probe_latency = None
@@ -127,6 +129,8 @@ def collect_diagnostics() -> dict[str, Any]:
     diag = {
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "production_path": str(PRODUCTION_PATH),
+        "product_version": build_info.get("display_version", "unknown"),
+        "build_id": build_info.get("build_id", "unknown"),
         "git_commit": git_info["commit"],
         "git_branch": git_info["branch"],
         "tunnel_executable": str(TUNNEL_EXE),
@@ -163,6 +167,7 @@ def format_diagnostics_markdown(diag: dict[str, Any]) -> str:
         "",
         "## Environment",
         f"- **Production Path**: `{diag['production_path']}`",
+        f"- **Harbor Version**: `{diag.get('product_version', 'unknown')}` (build: `{diag.get('build_id', 'unknown')}`)",
         f"- **Git HEAD**: `{diag['git_commit']}` (branch: `{diag['git_branch']}`)",
         f"- **Python Runtime**: `{diag['python_executable']}` (exists: {diag['python_executable_exists']})",
         f"- **OS / Python**: {diag['os_platform']} / Python {diag['python_version']}",

@@ -52,7 +52,7 @@ class TunnelProfileManager:
     ) -> None:
         self.settings = settings
         conn = settings.connection
-        self.profile_name = conn.profile_name or "harness-harbor"
+        self.profile_name = conn.profile_name or "chatgpt-harbor"
         self.runtime_path = Path(runtime_path) if runtime_path is not None else Path(PRODUCTION_PATH)
         runtime_root = self.runtime_path.parent if self.runtime_path.suffix.lower() == ".py" else self.runtime_path
         # tunnel-client launches the windowless legacy interpreter.  Resolve

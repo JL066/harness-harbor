@@ -30,7 +30,7 @@ def test_decode_mixed_powershell_redirection():
     # Line 1: UTF-8 Add-Content
     p1 = "[2026-09-03] Starting Harness Harbor daemon\r\n".encode("utf-8")
     # Line 2: PowerShell >> UTF-16 LE redirection
-    p2 = "Harness Harbor daemon started: C:\\Users\\Example\\HarnessHarbor\\.jobs\r\n".encode("utf-16-le")
+    p2 = "Harness Harbor daemon started: D:\\jobs\r\n".encode("utf-16-le")
 
     mixed = p1 + p2
     lines, enc = decode_log_bytes(mixed)

@@ -62,6 +62,15 @@ When code changes or compute-intensive tasks are necessary:
    - Analyze root cause directly as Supervisor rather than blindly re-dispatching identical prompts.
    - Formulate specific, corrective follow-up prompts addressing the identified failure point.
 
+### Codex Execution & Routing Policy
+- **Primary Codex Entry Points** (`codex_run`, `codex_start`): Default to `gpt-6-sol` + `medium` reasoning effort.
+- **Delegated Worker Entry Points** (`task_start(harness="codex", ...)`): Default to `gpt-6-luna` + `max` reasoning effort.
+- **Explicit Overrides**: Explicit caller-provided `model` and `reasoning_effort` overrides always take precedence over defaults.
+- **Provider Route Rules**:
+  - Auto GPT-6 defaults apply only when the effective route resolves to OpenAI (`route="official"`, the initial attempt of `official_then_*`, or `route="current"` when current config provider is OpenAI).
+  - Custom (`route="custom"`) and CodeFlow (`route="codeflow"`) routes never receive auto GPT-6 injection when model/effort is omitted; custom routes preserve their configured `default_model`.
+  - For fallback routes (`official_then_custom`, `official_then_codeflow`), the initial official attempt receives the role default, but fallback attempts do not inherit automatically injected OpenAI defaults.
+
 ---
 
 ## 4. Safety & Operational Discipline

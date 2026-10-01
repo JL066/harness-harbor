@@ -65,8 +65,6 @@ class HarborTrayManager:
         self._thread.start()
 
     def _handle_exit(self):
-        if self.icon:
-            self.icon.stop()
         self.on_exit()
 
     def stop(self):

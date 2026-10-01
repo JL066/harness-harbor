@@ -189,12 +189,12 @@ class TestSSRFAndNetworkAllowlist(unittest.TestCase):
         self.assertTrue(host_diagnostics.is_ip_allowed(ipaddress.ip_address("172.16.0.1")))
         self.assertTrue(host_diagnostics.is_ip_allowed(ipaddress.ip_address("172.31.255.255")))
         self.assertTrue(host_diagnostics.is_ip_allowed(ipaddress.ip_address("192.168.1.1")))
-        self.assertTrue(host_diagnostics.is_ip_allowed(ipaddress.ip_address("192.168.0.1")))
+        self.assertTrue(host_diagnostics.is_ip_allowed(ipaddress.ip_address("192.168.31.205")))
 
         # Link-local & CGNAT / Tailscale
         self.assertTrue(host_diagnostics.is_ip_allowed(ipaddress.ip_address("169.254.1.1")))
         self.assertTrue(host_diagnostics.is_ip_allowed(ipaddress.ip_address("100.64.0.1")))
-        self.assertTrue(host_diagnostics.is_ip_allowed(ipaddress.ip_address("100.64.0.2")))
+        self.assertTrue(host_diagnostics.is_ip_allowed(ipaddress.ip_address("100.104.145.36")))
 
         # IPv6 ULA & Link-local
         self.assertTrue(host_diagnostics.is_ip_allowed(ipaddress.ip_address("fc00::1")))
@@ -386,8 +386,8 @@ class TestTLSSemanticsAndParse(unittest.TestCase):
         self.assertFalse(host_diagnostics._match_hostname_or_ip("nested.sub.example.local", ["*.example.local"], []))
 
         # IP SAN match
-        self.assertTrue(host_diagnostics._match_hostname_or_ip("192.168.0.1", [], ["192.168.0.1"]))
-        self.assertFalse(host_diagnostics._match_hostname_or_ip("192.168.0.2", [], ["192.168.0.1"]))
+        self.assertTrue(host_diagnostics._match_hostname_or_ip("192.168.31.205", [], ["192.168.31.205"]))
+        self.assertFalse(host_diagnostics._match_hostname_or_ip("192.168.31.1", [], ["192.168.31.205"]))
 
         # Mismatch
         self.assertFalse(host_diagnostics._match_hostname_or_ip("wrong.local", ["correct.local"], []))
@@ -545,7 +545,7 @@ class TestFirewallQueryLogic(unittest.TestCase):
             "ok": True,
             "rules": [
                 {
-                    "name": "Example Web (5173)",
+                    "name": "Polaris Web (5173)",
                     "enabled": True,
                     "direction": "Inbound",
                     "action": "Allow",
@@ -563,7 +563,7 @@ class TestFirewallQueryLogic(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(len(res["rules"]), 1)
         rule = res["rules"][0]
-        self.assertEqual(rule["name"], "Example Web (5173)")
+        self.assertEqual(rule["name"], "Polaris Web (5173)")
         self.assertEqual(rule["program"], "C:\\Program Files\\nodejs\\node.exe")
 
     @mock.patch("host_diagnostics._run_powershell_script")
@@ -671,7 +671,7 @@ class TestProcessSecretsRedaction(unittest.TestCase):
         self.assertNotIn("==", redacted_bearer)
 
     def test_preserves_benign_commands(self) -> None:
-        normal = 'node "C:\\Users\\Example\\ExampleProject\\node_modules\\vite\\bin\\vite.js" --host 0.0.0.0'
+        normal = 'node "D:\\cc\\polaris-stable\\node_modules\\vite\\bin\\vite.js" --host 0.0.0.0'
         self.assertEqual(host_diagnostics.redact_command_line(normal), normal)
 
 
@@ -839,7 +839,7 @@ Active Connections
   TCP    127.0.0.1:5173         0.0.0.0:0              LISTENING       5555
   TCP    [::]:5173              [::]:0                 LISTENING       5555
   TCP    [::1]:5173             [::]:0                 LISTENING       5555
-  TCP    192.168.0.1:5173       192.168.0.2:12345       ESTABLISHED     5555
+  TCP    192.168.31.205:5173    192.168.31.100:12345   ESTABLISHED     5555
   TCP    0.0.0.0:8790           0.0.0.0:0              LISTENING       6666
   UDP    0.0.0.0:5353           *:*                                    7777
   UDP    [::]:5353              *:*                                    7777

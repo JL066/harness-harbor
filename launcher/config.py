@@ -12,7 +12,7 @@ Override examples
 
 Redirect the launcher at a different production install::
 
-    $env:HARBOR_HOME = "C:\\Users\\Example\\HarnessHarbor"
+    $env:HARBOR_HOME = "E:\\harbor\\prod"
     python run_launcher.py
 
 Move the tunnel-client to a custom path::

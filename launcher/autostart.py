@@ -25,7 +25,7 @@ def is_autostart_enabled() -> bool:
 
 
 def set_autostart_enabled(enabled: bool, target_cmd: str | None = None) -> bool:
-    """Enable or disable autostart with Windows. Only touches HarnessHarborLauncher key."""
+    """Enable or disable autostart with Windows. Only touches ChatGPTHarborLauncher key."""
     if sys.platform != "win32":
         return False
     try:

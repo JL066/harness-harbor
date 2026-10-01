@@ -1,7 +1,8 @@
-"""Harness Harbor — a local harness control plane for upstream supervisors."""
+"""ChatGPT Harbor — a local agent control plane for ChatGPT."""
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -11,19 +12,28 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
+import tomllib
 import uuid
-import copy
+from urllib.parse import urlsplit
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
-from typing import Any, Iterator, Literal, Mapping
-from urllib.parse import urlsplit
+from typing import IO, Any, Iterator, Literal
 
+from launcher.credential_store import CredentialStore
+from launcher.user_settings import load_user_settings
 from harness_process_adapter import default_process_activity_adapter
 from harness_telemetry import HarnessTelemetryProvider
-from runtime_queue import QueueRoot, queue_root_matches, resolve_queue_root
+from runtime_queue import (
+    QueueRoot,
+    describe_queue_root,
+    queue_root_fingerprint,
+    queue_root_matches,
+    resolve_queue_root,
+)
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -65,43 +75,59 @@ def _is_pid_alive(pid: int) -> bool:
 PROJECT_ROOT = Path(__file__).resolve().parent
 QUEUE_ROOT: QueueRoot = resolve_queue_root(PROJECT_ROOT)
 JOBS_DIR = QUEUE_ROOT.path
-CONTROL_DIR = PROJECT_ROOT / ".control"
+CONTROL_DIR = Path(os.environ.get("HARBOR_CONTROL_DIR", str(PROJECT_ROOT / ".control"))).expanduser().resolve()
+if os.environ.get("HARBOR_CONTROL_DIR") and not Path(os.environ["HARBOR_CONTROL_DIR"]).is_absolute():
+    raise ValueError("HARBOR_CONTROL_DIR must be absolute")
 PROJECTS_FILE = CONTROL_DIR / "projects.json"
+ROUTE_STATE_FILE = CONTROL_DIR / "route-state.json"
+ROUTE_LOCK_FILE = CONTROL_DIR / "route.lock"
 BACKUPS_DIR = CONTROL_DIR / "backups"
 
-CODEX_EXE = Path(os.environ.get("HARBOR_CODEX_EXE") or shutil.which("codex") or ("codex.exe" if os.name == "nt" else "codex"))
+CODEX_EXE = Path(os.environ.get("HARBOR_CODEX_EXE") or shutil.which("codex") or "codex.exe")
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
-CODEX_ROUTES = frozenset({"current", "official", "custom", "official_then_custom"})
-CODEX_CUSTOM_BASE_URL_ENV = "HARBOR_CODEX_CUSTOM_BASE_URL"
-CODEX_CUSTOM_API_KEY_ENV = "HARBOR_CODEX_CUSTOM_API_KEY"
-CODEX_CUSTOM_MODEL_ENV = "HARBOR_CODEX_CUSTOM_MODEL"
-CODEX_CUSTOM_PROVIDER_ID = "harbor_custom"
-CODEX_CUSTOM_PROVIDER_NAME = "Harbor Custom"
-CODEX_CUSTOM_WIRE_API = "responses"
-CODEX_ROUTE_FAILURES = frozenset({"subscription_quota_exhausted"})
-_CODEX_SECRET_DIAGNOSTIC_PATTERNS = (
-    re.compile(r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth(?:entication)?[_-]?token|password|secret)\b\s*[:=]\s*)[^\s,;]+"),
-    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
-    re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}\b"),
+_LOCAL_APPDATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+_APPDATA = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+MINIMAX_EXE = _LOCAL_APPDATA / "Programs" / "MiniMax Code" / "MiniMax Code.exe"
+MINIMAX_CLI_EXE = Path(os.environ.get("HARBOR_MINIMAX_CLI_EXE") or shutil.which("mcode") or "mcode.cmd")
+MINIMAX_CONFIG = _APPDATA / "MiniMax" / "minimax-agent-cn-config.json"
+CC_SWITCH_EXE = _LOCAL_APPDATA / "Programs" / "CC Switch" / "cc-switch.exe"
+AGY_EXE = Path(
+    os.environ.get("HARBOR_AGY_EXE")
+    or shutil.which("agy.exe")
+    or _LOCAL_APPDATA / "agy" / "bin" / "agy.exe"
 )
-MINIMAX_EXE = Path(os.environ.get("HARBOR_MINIMAX_EXE") or shutil.which("minimax") or ("minimax.exe" if os.name == "nt" else "minimax"))
-MINIMAX_CLI_EXE = Path(os.environ.get("HARBOR_MINIMAX_CLI_EXE") or shutil.which("mcode") or ("mcode.cmd" if os.name == "nt" else "mcode"))
-MINIMAX_CONFIG = Path(os.environ.get("HARBOR_MINIMAX_CONFIG") or Path.home() / ".minimax-code" / "config.json")
-AGY_EXE = Path(os.environ.get("HARBOR_AGY_EXE") or shutil.which("agy") or ("agy.exe" if os.name == "nt" else "agy"))
-AGY_DEFAULT_PRINT_TIMEOUT = "5m"
+if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
+    def _packaged_executable(key, name):
+        value = os.environ.get(key) or shutil.which(name)
+        return Path(value) if value else CONTROL_DIR / "missing-executables" / name
+    CODEX_EXE = _packaged_executable("HARBOR_CODEX_EXE", "codex")
+    AGY_EXE = _packaged_executable("HARBOR_AGY_EXE", "agy")
+    MINIMAX_CLI_EXE = _packaged_executable("HARBOR_MINIMAX_CLI_EXE", "mcode")
+
+AGY_DEFAULT_PRINT_TIMEOUT = "1h"
 AGY_EFFORTS = {"low", "medium", "high"}
-AGY_DANGEROUS_PERMISSIONS_ENV = "HARBOR_AGY_DANGEROUSLY_SKIP_PERMISSIONS"
 AGY_PROBE_CACHE_TTL_SECONDS = 15.0
+# Generic OpenAI-compatible Codex route identifiers.  These are deliberately
+# stable and contain no credential material; the key itself is supplied only
+# to the spawned child environment.
+CUSTOM_CODEX_PROVIDER_ID = "harbor_custom"
+CUSTOM_CODEX_ENV_KEY = "HARBOR_CODEX_CUSTOM_API_KEY"
+CODEX_PRIMARY_DEFAULT_MODEL = "gpt-6-sol"
+CODEX_PRIMARY_DEFAULT_REASONING_EFFORT = "medium"
+CODEX_WORKER_DEFAULT_MODEL = "gpt-6-luna"
+CODEX_WORKER_DEFAULT_REASONING_EFFORT = "max"
+
+SANDBOXES = {"read-only", "workspace-write"}
+MAX_TEXT_BYTES = 200_000
+MAX_DIRECTORY_ENTRIES = 5_000
+MAX_GIT_OUTPUT = 50_000
+MAX_SUBPROCESS_OUTPUT_BYTES = 2_000_000
+GIT_DELIVERY_TIMEOUT_SECONDS = 30
+BINARY_SNIFF_BYTES = 8_192
+JOB_ID_RE = re.compile(r"^[0-9a-zA-Z_\-]+$")
+POLL_THROTTLE_INTERVAL_SECONDS: float = 600.0
+TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
 AGY_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-AGY_PROBE_BLOCKER_RE = re.compile(r"\b(?:error|fatal|unauthori[sz]ed|forbidden|sign\s*in|required|timed?\s*out|failed)\b", re.I)
-# Stderr is a diagnostic channel, so its model-row parser must be narrower
-# than the historical stdout parser.  A model id emitted by AGY has a
-# provider/model shape (for example ``gemini-3.8-flash-high`` or
-# ``openai/gpt-oss-120b-medium``); a bare diagnostic word must not become a
-# model merely because it happens to match AGY_MODEL_ID_RE.
-AGY_STDERR_MODEL_ID_RE = re.compile(
-    r"^[A-Za-z][A-Za-z0-9]*(?:[-/][A-Za-z0-9][A-Za-z0-9._/-]*)+$"
-)
 AGY_MODELS_BLOCKER_RE = re.compile(
     r"(?:"
     r"(?:^|\n)\s*(?:\[\s*(?:error|fatal|exception)\s*\]|(?:error|fatal|exception)\b)|"
@@ -115,18 +141,7 @@ AGY_MODELS_BLOCKER_RE = re.compile(
     r"\b(?:failed|unable)\s+to\s+(?:connect|fetch|reach|resolve)\b|"
     r"\bconnection\s+(?:failed|refused|reset|error|closed|timed?\s*out)\b|"
     r"\b(?:network|proxy|dns)\s+(?:error|failure|unreachable|unavailable|timeout|timed?\s*out|failed)\b|"
-    r"\b(?:timed\s+out|timeout\s+(?:exceeded|error|occurred))\b|"
-    # Generic / library-level error diagnostics such as ``Unexpected error
-    # occurred`` or ``An error was thrown`` carry no recoverable signal
-    # about a valid model catalogue — they must fail closed regardless of
-    # any catalogue AGY may have emitted on stdout.
-    r"\b(?:unexpected|an?|internal|unknown|critical|fatal|generic|some)\s+"
-    r"error\s+(?:occurred|happened|was\s+thrown|has\s+occurred|encountered|raised)\b|"
-    r"\berror\s+(?:occurred|happened|was\s+thrown|has\s+occurred|encountered|raised)\b|"
-    # DNS / hostname resolution failures invalidate any catalogue emitted
-    # in the same probe, even when stdout already contains one.
-    r"\b(?:dns|host|hostname|server|domain(?:\s+name)?)\s+"
-    r"resolution\s+(?:failed|failure|error|timeout|timed?\s*out)\b"
+    r"\b(?:timed\s+out|timeout\s+(?:exceeded|error|occurred))\b"
     r")",
     re.IGNORECASE,
 )
@@ -146,29 +161,6 @@ AGY_INFO_OR_BANNER_RE = re.compile(
     r")$",
     re.IGNORECASE,
 )
-
-
-def agy_dangerous_permissions_enabled(environ: Mapping[str, str] | None = None) -> bool:
-    """Return whether AGY's dangerous permission bypass was explicitly enabled.
-
-    The public default is deliberately off. Unknown values are treated as off
-    so a typo cannot silently enable the bypass.
-    """
-    env = os.environ if environ is None else environ
-    return env.get(AGY_DANGEROUS_PERMISSIONS_ENV, "").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
-
-SANDBOXES = {"read-only", "workspace-write"}
-MAX_TEXT_BYTES = 200_000
-MAX_DIRECTORY_ENTRIES = 5_000
-MAX_GIT_OUTPUT = 50_000
-GIT_DELIVERY_TIMEOUT_SECONDS = 30
-MAX_SUBPROCESS_OUTPUT_BYTES = 2_000_000
-BINARY_SNIFF_BYTES = 8_192
-JOB_ID_RE = re.compile(r"^[0-9a-zA-Z_\-]+$")
-POLL_THROTTLE_INTERVAL_SECONDS: float = 600.0
-TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
 
 IS_WINDOWS = sys.platform == "win32"
 _WIN_CREATION_FLAGS = (
@@ -197,145 +189,6 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def codex_custom_route_config(
-    environ: Mapping[str, str] | None = None,
-    *,
-    include_secret: bool = False,
-) -> dict[str, str]:
-    """Return the validated, generic process-local custom provider settings."""
-    env = os.environ if environ is None else environ
-    base_url = env.get(CODEX_CUSTOM_BASE_URL_ENV, "").strip()
-    api_key = env.get(CODEX_CUSTOM_API_KEY_ENV, "").strip()
-    if not base_url or not api_key:
-        raise ValueError(
-            "custom route requires HARBOR_CODEX_CUSTOM_BASE_URL and "
-            "HARBOR_CODEX_CUSTOM_API_KEY"
-        )
-    if any(ord(char) < 0x20 or char.isspace() for char in base_url) or any(
-        ord(char) < 0x20 for char in api_key
-    ):
-        raise ValueError("custom route configuration contains invalid control characters")
-    parsed = urlsplit(base_url)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("HARBOR_CODEX_CUSTOM_BASE_URL must be an http(s) URL without credentials or query data")
-    config = {
-        "provider_id": CODEX_CUSTOM_PROVIDER_ID,
-        "provider_name": CODEX_CUSTOM_PROVIDER_NAME,
-        "base_url": base_url,
-        "wire_api": CODEX_CUSTOM_WIRE_API,
-        "env_key": CODEX_CUSTOM_API_KEY_ENV,
-    }
-    default_model = env.get(CODEX_CUSTOM_MODEL_ENV, "").strip()
-    if default_model:
-        config["default_model"] = default_model
-    if include_secret:
-        config["api_key"] = api_key
-    return config
-
-
-def codex_route_attempts(route: str) -> list[str]:
-    """Return the ordered route attempts for a validated request."""
-    if route == "official_then_custom":
-        return ["official", "custom"]
-    if route in CODEX_ROUTES:
-        return [route]
-    raise ValueError(f"unsupported Codex route: {route}")
-
-
-def validate_codex_route(route: str) -> list[str]:
-    """Validate route names and all configuration needed by their attempts."""
-    routes = codex_route_attempts(route)
-    for attempt_route in routes:
-        if attempt_route == "custom":
-            codex_custom_route_config()
-    return routes
-
-
-def is_official_quota_exhausted(text: str) -> bool:
-    """Recognize only explicit OpenAI/Codex subscription usage exhaustion."""
-    lower = (text or "").lower()
-    if not lower or re.search(r"\b429\b|rate[- ]limit|too\s+many\s+requests|retry[- ]after", lower):
-        return False
-    if not re.search(r"\b(?:openai|codex)\b", lower):
-        return False
-    exhaustion = (
-        r"\b(?:subscription\s+)?(?:quota|usage(?:\s+limit)?|plan\s+limit|subscription\s+limit)\b"
-        r"[^\n]{0,80}\b(?:exhausted|exceeded|reached|depleted|used\s+up)\b"
-        r"|\b(?:exhausted|exceeded|depleted|used\s+up)\b[^\n]{0,80}"
-        r"\b(?:quota|usage(?:\s+limit)?|plan\s+limit|subscription\s+limit)\b"
-    )
-    return bool(re.search(exhaustion, lower))
-
-
-def classify_codex_route_failure(result: subprocess.CompletedProcess) -> str | None:
-    """Classify only failures safe for the v0.1 official-to-custom fallback."""
-    if result.returncode == 0:
-        return None
-    text = "\n".join(
-        value for value in (result.stdout, result.stderr) if isinstance(value, str)
-    )
-    return "subscription_quota_exhausted" if is_official_quota_exhausted(text) else None
-
-
-def sanitize_codex_diagnostic(
-    value: object,
-    limit: int = 4000,
-    *,
-    redact_values: tuple[str, ...] = (),
-) -> str:
-    """Bound Codex diagnostics and redact common credential-shaped values."""
-    text = value[-limit:].strip() if isinstance(value, str) else ""
-    for index, sensitive_value in enumerate(redact_values):
-        if sensitive_value:
-            replacement = "[REDACTED_BASE_URL]" if index == 0 else "[REDACTED]"
-            text = text.replace(sensitive_value, replacement)
-    for pattern in _CODEX_SECRET_DIAGNOSTIC_PATTERNS:
-        text = pattern.sub(
-            lambda match: (
-                f"{match.group(1)}[REDACTED]"
-                if match.lastindex else "[REDACTED]"
-            ),
-            text,
-        )
-    return text
-
-
-def sanitize_codex_argv(argv: list[str], route: str = "current") -> list[str]:
-    """Return a persisted-safe representation of a Codex command."""
-    redact_values: tuple[str, ...] = ()
-    if route == "custom":
-        try:
-            redact_values = (codex_custom_route_config()["base_url"],)
-        except ValueError:
-            pass
-    return [sanitize_codex_diagnostic(value, redact_values=redact_values) for value in argv]
-
-
-def codex_route_redaction_values(route: str) -> tuple[str, ...]:
-    """Return transient custom route values that must not reach observability."""
-    if route != "custom":
-        return ()
-    config = codex_custom_route_config(include_secret=True)
-    return (config["base_url"], config["api_key"])
-
-
-def codex_process_environment(route: str) -> dict[str, str] | None:
-    """Build a child-only environment for a custom Codex route."""
-    if route != "custom":
-        return None
-    config = codex_custom_route_config(include_secret=True)
-    child_env = os.environ.copy()
-    child_env[config["env_key"]] = config["api_key"]
-    return child_env
-
-
 # ---------------------------------------------------------------------------
 # Safe subprocess helper
 # ---------------------------------------------------------------------------
@@ -343,9 +196,10 @@ def codex_process_environment(route: str) -> dict[str, str] | None:
 # All Git, MiniMax capability probe, and Codex diagnostics subprocesses MUST
 # go through ``run_safe_subprocess``. This helper enforces:
 #
-# * stdio isolation: child stdin is DEVNULL (never inherits the MCP transport
-#   pipe), stdout/stderr are PIPE, and child stdout/stderr never leak to the
-#   parent's MCP transport.
+# * stdio isolation: child stdin is DEVNULL unless the caller supplies an
+#   explicit bytes payload, in which case it is PIPE only for that payload.
+#   Parent stdin is never inherited; stdout/stderr are PIPE and never leak to
+#   the parent's MCP transport.
 # * Windows process isolation: CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 #   so the child cannot accidentally attach to the parent's console or share
 #   a process group.
@@ -389,6 +243,20 @@ def _make_safe_popen_kwargs(
     return kwargs
 
 
+def spawn_runtime_child(argv, **kwargs):
+    """Packaged children have verified ownership; legacy retains its contract."""
+    if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
+        from harbor_platform.process import spawn_owned
+        explicit_env = kwargs.get("env")
+        child_env = dict(os.environ if explicit_env is None else explicit_env)
+        child_env.pop("TUNNEL_RUNTIME_KEY", None)
+        if explicit_env is None:
+            child_env.pop(CUSTOM_CODEX_ENV_KEY, None)
+        kwargs["env"] = child_env
+        return spawn_owned(argv, popen_factory=subprocess.Popen, **kwargs)
+    return subprocess.Popen(argv, **kwargs)
+
+
 def _escalate_terminate(proc: subprocess.Popen, argv: list[str]) -> None:
     """Terminate ``proc`` and (on Windows) its entire process tree.
 
@@ -406,6 +274,11 @@ def _escalate_terminate(proc: subprocess.Popen, argv: list[str]) -> None:
     guarantee no orphan node or shell is left behind.
     """
     if proc is None:
+        return
+    if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
+        from harbor_platform.process import terminate_tree
+        if not terminate_tree(proc):
+            raise RuntimeError("Owned process tree could not be stopped")
         return
     pid = proc.pid
     if pid is None:
@@ -448,11 +321,61 @@ def _escalate_terminate(proc: subprocess.Popen, argv: list[str]) -> None:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=2.0,
+                timeout=5.0,
                 check=False,
                 creationflags=_WIN_CREATION_FLAGS,
             )
         except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        # Some locked-down Windows hosts deny taskkill even for descendants
+        # owned by this process.  Fall back to the Win32 snapshot API and
+        # terminate descendants deepest-first before terminating the root.
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESSENTRY32W(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+            if snapshot not in (0, ctypes.c_void_p(-1).value):
+                try:
+                    entry = PROCESSENTRY32W()
+                    entry.dwSize = ctypes.sizeof(entry)
+                    children: dict[int, list[int]] = {}
+                    ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+                    while ok:
+                        children.setdefault(int(entry.th32ParentProcessID), []).append(int(entry.th32ProcessID))
+                        ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+
+                    ordered: list[int] = []
+
+                    def _walk(parent: int) -> None:
+                        for child in children.get(parent, []):
+                            _walk(child)
+                            ordered.append(child)
+                    _walk(pid)
+                    ordered.append(pid)
+                    for target_pid in ordered:
+                        handle = kernel32.OpenProcess(0x0001 | 0x00100000, False, target_pid)
+                        if handle:
+                            try:
+                                kernel32.TerminateProcess(handle, 1)
+                                kernel32.WaitForSingleObject(handle, 1000)
+                            finally:
+                                kernel32.CloseHandle(handle)
+                finally:
+                    kernel32.CloseHandle(snapshot)
+        except Exception:  # noqa: BLE001
             pass
         try:
             proc.wait(timeout=1.0)
@@ -504,11 +427,14 @@ def run_safe_subprocess(
     """Run ``argv`` in a child process with strict stdio isolation.
 
     Returns a ``subprocess.CompletedProcess`` whose ``stdout``/``stderr`` are
-    decoded text (best effort, ``errors="replace"``) and truncated to
-    ``max_output_bytes`` per stream.
+    decoded text (best effort, ``errors="replace"``).  Each stream is
+    drained concurrently into a buffer capped at ``max_output_bytes``;
+    excess bytes are discarded while the child is still running.
 
     Contract:
-    * Child stdin is DEVNULL (MCP transport pipe is never inherited).
+    * Child stdin is DEVNULL unless explicit bytes ``input`` is supplied, when
+      it is PIPE only for delivery by a dedicated writer thread. The MCP transport pipe
+      is never inherited.
     * Child stdout/stderr are PIPE and never reach the parent's stdout/stderr.
     * On Windows: ``CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP``.
     * On timeout: terminate -> wait grace -> kill -> wait grace ->
@@ -522,37 +448,58 @@ def run_safe_subprocess(
         raise ValueError("argv must be a list of non-empty strings")
     if input is not None and not isinstance(input, bytes):
         raise ValueError("input must be bytes or None")
+    if not isinstance(max_output_bytes, int) or max_output_bytes < 0:
+        raise ValueError("max_output_bytes must be a non-negative integer")
 
     popen_kwargs = _make_safe_popen_kwargs(env=env, cwd=cwd)
     if input is not None:
         popen_kwargs["stdin"] = subprocess.PIPE
-    proc = subprocess.Popen(argv, **popen_kwargs)
+    proc = spawn_runtime_child(argv, **popen_kwargs)
 
-    stdout_bytes = bytearray()
-    stderr_bytes = bytearray()
-    def _drain(stream, target):
-        if stream is None:
-            return
-        try:
-            while True:
-                chunk = stream.read(64 * 1024)
-                if not chunk:
-                    return
-                if len(target) < max_output_bytes:
-                    target.extend(chunk[: max_output_bytes - len(target)])
-        except (OSError, ValueError):
-            return
-    stdout_stream = getattr(proc, "stdout", None)
-    stderr_stream = getattr(proc, "stderr", None)
-    out_thread = threading.Thread(target=_drain, args=(stdout_stream, stdout_bytes), daemon=True)
-    err_thread = threading.Thread(target=_drain, args=(stderr_stream, stderr_bytes), daemon=True)
-    out_thread.start(); err_thread.start()
-    if input is not None and proc.stdin is not None:
-        try:
-            proc.stdin.write(input)
-            proc.stdin.close()
-        except (BrokenPipeError, OSError, ValueError):
-            pass
+    class _BoundedReader:
+        def __init__(self, stream: IO[bytes] | None):
+            self.stream = stream
+            self.data = bytearray()
+            self.thread = threading.Thread(target=self._run, daemon=True)
+
+        def _run(self) -> None:
+            if self.stream is None:
+                return
+            try:
+                while True:
+                    chunk = self.stream.read(64 * 1024)
+                    if not chunk:
+                        return
+                    remaining = max_output_bytes - len(self.data)
+                    if remaining > 0:
+                        self.data.extend(chunk[:remaining])
+            except (OSError, ValueError):
+                pass
+
+    stdout_reader = _BoundedReader(proc.stdout)
+    stderr_reader = _BoundedReader(proc.stderr)
+    stdout_reader.thread.start()
+    stderr_reader.thread.start()
+
+    writer: threading.Thread | None = None
+    if input is not None:
+        def _write_input() -> None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write(input)
+                    proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            finally:
+                try:
+                    if proc.stdin is not None:
+                        proc.stdin.close()
+                except (OSError, ValueError):
+                    pass
+
+        writer = threading.Thread(target=_write_input, daemon=True)
+        writer.start()
+
     try:
         try:
             proc.wait(timeout=timeout)
@@ -561,32 +508,37 @@ def run_safe_subprocess(
     finally:
         # Defensive final reap; safe to call even after a clean return.
         try:
-            if proc.poll() is None:
+            if proc.poll() is None or os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
                 _escalate_terminate(proc, list(argv))
-                proc.wait(timeout=0.5)
         except Exception:
             pass
-    out_thread.join(timeout=1.0)
-    err_thread.join(timeout=1.0)
-    for stream in (stdout_stream, stderr_stream):
-        try:
-            if stream is not None and not stream.closed:
-                stream.close()
-        except (OSError, ValueError):
-            pass
+
+        if writer is not None:
+            writer.join(timeout=0.5)
+        stdout_reader.thread.join(timeout=0.5)
+        stderr_reader.thread.join(timeout=0.5)
+        handles = [(proc.stdin, writer)] if writer is not None else []
+        handles.extend(((proc.stdout, stdout_reader.thread), (proc.stderr, stderr_reader.thread)))
+        for handle, owner_thread in handles:
+            try:
+                # Closing a Windows pipe while another thread is blocked in
+                # read/write can itself block.  The daemon thread owns it
+                # until EOF in that rare last-ditch case.
+                if (owner_thread is None or not owner_thread.is_alive()) and handle is not None and not handle.closed:
+                    handle.close()
+            except (OSError, ValueError):
+                pass
 
     def _decode_truncate(data: bytes) -> str:
         if not data:
             return ""
-        if len(data) > max_output_bytes:
-            data = data[:max_output_bytes]
         return data.decode("utf-8", errors="replace")
 
     return subprocess.CompletedProcess(
         args=list(argv),
         returncode=proc.returncode if proc.returncode is not None else -1,
-        stdout=_decode_truncate(bytes(stdout_bytes)),
-        stderr=_decode_truncate(bytes(stderr_bytes)),
+        stdout=_decode_truncate(bytes(stdout_reader.data)),
+        stderr=_decode_truncate(bytes(stderr_reader.data)),
     )
 
 
@@ -620,7 +572,14 @@ def _atomic_write_text(path: Path, content: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(content)
-        os.replace(temporary_name, path)
+        for attempt in range(10):
+            try:
+                os.replace(temporary_name, path)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
     except Exception:
         Path(temporary_name).unlink(missing_ok=True)
         raise
@@ -1041,6 +1000,14 @@ def git_commit_result(repo: str, message: str) -> dict:
 # ---------------------------------------------------------------------------
 # Constrained host-side Git delivery
 # ---------------------------------------------------------------------------
+#
+# These helpers deliberately do not extend ``git_command``.  They expose a
+# small, fixed operation set instead of caller-supplied Git arguments.  The
+# remote argument must name an existing remote in the selected repository;
+# arbitrary URLs are not accepted as tool input.  This makes the existing Git
+# configuration the explicit network authority and avoids adding a generic
+# host-side network executor.
+# ---------------------------------------------------------------------------
 
 _GIT_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _GIT_REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -1058,6 +1025,7 @@ _GIT_TOKEN_SHAPE_RE = re.compile(
 
 
 def _redact_git_delivery_text(value: str) -> str:
+    """Remove credential-shaped material from Git delivery diagnostics."""
     if not isinstance(value, str):
         return ""
     value = _GIT_CREDENTIAL_URL_RE.sub(r"\1<redacted>@", value)
@@ -1067,14 +1035,31 @@ def _redact_git_delivery_text(value: str) -> str:
 
 
 def _sanitize_git_delivery_argv(argv: list[str]) -> list[str]:
+    """Return operation argv without exposing configured remote URLs."""
     return ["<configured-https-remote>" if arg.lower().startswith("https://") else arg for arg in argv]
 
 
-def _git_delivery_failure(message: str, *, operation: str, dry_run: bool = False, pushed: bool = False, **extra: Any) -> dict:
-    return {**extra, "ok": False, "error": _redact_git_delivery_text(message), "operation": operation, "dry_run": dry_run, "pushed": pushed}
+def _git_delivery_failure(
+    message: str,
+    *,
+    operation: str,
+    dry_run: bool = False,
+    pushed: bool = False,
+    **extra: Any,
+) -> dict:
+    return {
+        **extra,
+        "ok": False,
+        "error": _redact_git_delivery_text(message),
+        "operation": operation,
+        "dry_run": dry_run,
+        "pushed": pushed,
+    }
 
 
 class _GitDeliveryError(ValueError):
+    """A validation failure that preserves sanitized subprocess diagnostics."""
+
     def __init__(self, message: str, result: dict):
         super().__init__(message)
         self.result = result
@@ -1099,6 +1084,14 @@ def _validate_git_delivery_remote_name(value: str) -> str:
 
 
 def _validate_git_delivery_https_url(value: str) -> str:
+    """Validate a configured remote URL without accepting URL input from MCP.
+
+    HTTPS is the only accepted transport.  Userinfo, query/fragment data,
+    literal IP addresses, localhost-style names, and non-default ports are
+    rejected so local/file/SSH/scp-style transports cannot become a host-side
+    escape hatch.  We do not DNS-resolve here: Git/GCM must resolve and use
+    the already configured HTTPS endpoint naturally.
+    """
     if not isinstance(value, str) or not value or len(value) > 2048 or any(ord(ch) < 32 or ch.isspace() for ch in value):
         raise ValueError("configured remote URL is invalid")
     try:
@@ -1107,22 +1100,40 @@ def _validate_git_delivery_https_url(value: str) -> str:
     except ValueError as exc:
         raise ValueError("configured remote URL is invalid") from exc
     host = parsed.hostname
-    lower_host = host.lower().rstrip(".") if host else ""
-    if (parsed.scheme.lower() != "https" or not host or parsed.username is not None or parsed.password is not None
-            or parsed.query or parsed.fragment or port not in (None, 443)
-            or lower_host == "localhost" or lower_host.endswith(".localhost") or lower_host.endswith(".local")
-            or re.fullmatch(r"\d+(?:\.\d+){3}", lower_host) or ":" in lower_host
-            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", lower_host)):
+    if (
+        parsed.scheme.lower() != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (port not in (None, 443))
+    ):
         raise ValueError("configured remote must use a credential-free HTTPS URL")
+    lower_host = host.lower().rstrip(".")
+    if (
+        lower_host == "localhost"
+        or lower_host.endswith(".localhost")
+        or lower_host.endswith(".local")
+        or re.fullmatch(r"\d+(?:\.\d+){3}", lower_host)
+        or ":" in lower_host
+        or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", lower_host)
+    ):
+        raise ValueError("configured remote host is not an allowed public DNS hostname")
     return value
 
 
 def _git_delivery_command(args: list[str], root: Path) -> dict:
+    """Run a fixed delivery Git command and redact its externally returned data."""
     raw = _run_git(args, root, timeout=GIT_DELIVERY_TIMEOUT_SECONDS)
-    result = {"ok": bool(raw.get("ok")), "argv": _sanitize_git_delivery_argv(list(raw.get("argv", []))),
-              "stdout": _redact_git_delivery_text(str(raw.get("stdout", ""))),
-              "stderr": _redact_git_delivery_text(str(raw.get("stderr", ""))), "exit_code": raw.get("exit_code"),
-              "truncated": bool(raw.get("truncated", False))}
+    result = {
+        "ok": bool(raw.get("ok")),
+        "argv": _sanitize_git_delivery_argv(list(raw.get("argv", []))),
+        "stdout": _redact_git_delivery_text(str(raw.get("stdout", ""))),
+        "stderr": _redact_git_delivery_text(str(raw.get("stderr", ""))),
+        "exit_code": raw.get("exit_code"),
+        "truncated": bool(raw.get("truncated", False)),
+    }
     if raw.get("error"):
         result["error"] = _redact_git_delivery_text(str(raw["error"]))
     return result
@@ -1141,6 +1152,8 @@ def _resolve_git_delivery_remote(root: Path, remote: str) -> tuple[str, dict]:
 def _read_exact_git_delivery_head(root: Path, remote_url: str, dst_ref: str) -> tuple[str | None, dict]:
     result = _git_delivery_command(["ls-remote", "--refs", "--exit-code", remote_url, dst_ref], root)
     if not result["ok"]:
+        # Git uses exit status 2 for a clean no-match.  New branch creation is
+        # intentionally unsupported in v1, so represent it as a missing head.
         if result.get("exit_code") == 2:
             return None, result
         raise _GitDeliveryError(result.get("error") or "remote ref lookup failed", result)
@@ -1167,27 +1180,54 @@ def _resolve_git_delivery_source(root: Path, src_ref: str) -> tuple[str, dict]:
 
 
 def git_ls_remote_result(repo: str, remote: str, ref: str) -> dict:
+    """Read one configured remote branch ref from the normal host Git context."""
     operation = "git_ls_remote"
     try:
-        root = resolve_repo(repo); remote = _validate_git_delivery_remote_name(remote); ref = _validate_git_delivery_ref(ref, field="ref")
-        remote_url, _ = _resolve_git_delivery_remote(root, remote); before_head, command = _read_exact_git_delivery_head(root, remote_url, ref)
+        root = resolve_repo(repo)
+        remote = _validate_git_delivery_remote_name(remote)
+        ref = _validate_git_delivery_ref(ref, field="ref")
+        remote_url, _ = _resolve_git_delivery_remote(root, remote)
+        before_head, command = _read_exact_git_delivery_head(root, remote_url, ref)
         if before_head is None:
-            return _git_delivery_failure("remote branch does not exist; new branches are not supported", operation=operation, repo_root=str(root), remote=remote, ref=ref, before_head=None, after_head=None, **command)
-        return {"ok": True, "operation": operation, "dry_run": False, "pushed": False, "repo_root": str(root), "remote": remote, "ref": ref, "before_head": before_head, "after_head": before_head, **command}
+            return _git_delivery_failure(
+                "remote branch does not exist; new branches are not supported",
+                operation=operation,
+                repo_root=str(root), remote=remote, ref=ref,
+                before_head=None, after_head=None, **command,
+            )
+        return {
+            "ok": True, "operation": operation, "dry_run": False, "pushed": False,
+            "repo_root": str(root), "remote": remote, "ref": ref,
+            "before_head": before_head, "after_head": before_head, **command,
+        }
     except _GitDeliveryError as exc:
         return _git_delivery_failure(str(exc), operation=operation, **exc.result)
     except (OSError, ValueError) as exc:
         return _git_delivery_failure(str(exc), operation=operation)
 
 
-def _prepare_git_push(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str, *, operation: str):
+def _prepare_git_push(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str, *, operation: str) -> tuple[Path, str, str, str, str, str, dict] | dict:
     try:
-        root = resolve_repo(repo); remote = _validate_git_delivery_remote_name(remote); src_ref = _validate_git_delivery_ref(src_ref, field="src_ref"); dst_ref = _validate_git_delivery_ref(dst_ref, field="dst_ref"); expected_remote_head = _validate_expected_remote_head(expected_remote_head)
-        remote_url, _ = _resolve_git_delivery_remote(root, remote); before_head, lookup = _read_exact_git_delivery_head(root, remote_url, dst_ref)
+        root = resolve_repo(repo)
+        remote = _validate_git_delivery_remote_name(remote)
+        src_ref = _validate_git_delivery_ref(src_ref, field="src_ref")
+        dst_ref = _validate_git_delivery_ref(dst_ref, field="dst_ref")
+        expected_remote_head = _validate_expected_remote_head(expected_remote_head)
+        remote_url, _ = _resolve_git_delivery_remote(root, remote)
+        before_head, lookup = _read_exact_git_delivery_head(root, remote_url, dst_ref)
         if before_head != expected_remote_head:
-            return _git_delivery_failure("remote destination head differs from expected_remote_head (concurrent drift or new branch)", operation=operation, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, expected_remote_head=expected_remote_head, before_head=before_head, after_head=before_head, **lookup)
+            return _git_delivery_failure(
+                "remote destination head differs from expected_remote_head (concurrent drift or new branch)",
+                operation=operation,
+                repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref,
+                expected_remote_head=expected_remote_head, before_head=before_head, after_head=before_head,
+                **lookup,
+            )
         source_head, _ = _resolve_git_delivery_source(root, src_ref)
-        return root, remote, remote_url, src_ref, dst_ref, source_head, {"expected_remote_head": expected_remote_head, "before_head": before_head}
+        return root, remote, remote_url, src_ref, dst_ref, source_head, {
+            "expected_remote_head": expected_remote_head,
+            "before_head": before_head,
+        }
     except _GitDeliveryError as exc:
         return _git_delivery_failure(str(exc), operation=operation, **exc.result)
     except (OSError, ValueError) as exc:
@@ -1195,46 +1235,273 @@ def _prepare_git_push(repo: str, remote: str, src_ref: str, dst_ref: str, expect
 
 
 def git_push_dry_run_result(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str) -> dict:
-    operation = "git_push_dry_run"; prepared = _prepare_git_push(repo, remote, src_ref, dst_ref, expected_remote_head, operation=operation)
-    if isinstance(prepared, dict): return prepared
+    """Safely dry-run exactly one non-force branch update to a configured HTTPS remote."""
+    operation = "git_push_dry_run"
+    prepared = _prepare_git_push(repo, remote, src_ref, dst_ref, expected_remote_head, operation=operation)
+    if isinstance(prepared, dict):
+        return prepared
     root, remote, remote_url, src_ref, dst_ref, source_head, metadata = prepared
     command = _git_delivery_command(["push", "--dry-run", remote_url, f"{src_ref}:{dst_ref}"], root)
     if not command["ok"]:
-        return _git_delivery_failure(command.get("error") or "git push --dry-run failed", operation=operation, dry_run=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=metadata["before_head"], **metadata, **command)
-    return {"ok": True, "operation": operation, "dry_run": True, "pushed": False, "repo_root": str(root), "remote": remote, "src_ref": src_ref, "dst_ref": dst_ref, "source_head": source_head, "after_head": metadata["before_head"], **metadata, **command}
+        return _git_delivery_failure(
+            command.get("error") or "git push --dry-run failed",
+            operation=operation, dry_run=True, repo_root=str(root), remote=remote,
+            src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=metadata["before_head"],
+            **metadata, **command,
+        )
+    return {
+        "ok": True, "operation": operation, "dry_run": True, "pushed": False,
+        "repo_root": str(root), "remote": remote, "src_ref": src_ref, "dst_ref": dst_ref,
+        "source_head": source_head, "after_head": metadata["before_head"], **metadata, **command,
+    }
 
 
 def git_push_ref_result(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str) -> dict:
-    operation = "git_push_ref"; prepared = _prepare_git_push(repo, remote, src_ref, dst_ref, expected_remote_head, operation=operation)
-    if isinstance(prepared, dict): return prepared
+    """Push one fast-forward branch update after two fresh exact-head checks."""
+    operation = "git_push_ref"
+    prepared = _prepare_git_push(repo, remote, src_ref, dst_ref, expected_remote_head, operation=operation)
+    if isinstance(prepared, dict):
+        return prepared
     root, remote, remote_url, src_ref, dst_ref, source_head, metadata = prepared
     dry_run = _git_delivery_command(["push", "--dry-run", remote_url, f"{src_ref}:{dst_ref}"], root)
     if not dry_run["ok"]:
-        return _git_delivery_failure(dry_run.get("error") or "git push --dry-run failed", operation=operation, dry_run=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=metadata["before_head"], **metadata, **dry_run)
+        return _git_delivery_failure(
+            dry_run.get("error") or "git push --dry-run failed",
+            operation=operation, dry_run=True, repo_root=str(root), remote=remote,
+            src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=metadata["before_head"],
+            **metadata, **dry_run,
+        )
+    # Bound review-to-write TOCTOU: re-resolve the configured endpoint and
+    # re-read the exact destination immediately before the real non-force push.
     try:
         fresh_remote_url, _ = _resolve_git_delivery_remote(root, remote)
-        if fresh_remote_url != remote_url: raise ValueError("configured remote URL changed during delivery")
+        if fresh_remote_url != remote_url:
+            raise ValueError("configured remote URL changed during delivery")
         fresh_head, fresh_lookup = _read_exact_git_delivery_head(root, fresh_remote_url, dst_ref)
         if fresh_head != metadata["expected_remote_head"]:
-            return _git_delivery_failure("remote destination head differs from expected_remote_head immediately before push", operation=operation, dry_run=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, expected_remote_head=metadata["expected_remote_head"], before_head=fresh_head, after_head=fresh_head, **fresh_lookup)
+            return _git_delivery_failure(
+                "remote destination head differs from expected_remote_head immediately before push",
+                operation=operation, dry_run=True, repo_root=str(root), remote=remote,
+                src_ref=src_ref, dst_ref=dst_ref, source_head=source_head,
+                expected_remote_head=metadata["expected_remote_head"], before_head=fresh_head, after_head=fresh_head,
+                **fresh_lookup,
+            )
     except _GitDeliveryError as exc:
         return _git_delivery_failure(str(exc), operation=operation, dry_run=True, **exc.result)
-    except (OSError, ValueError):
-        return _git_delivery_failure("pre-push remote validation failed", operation=operation, dry_run=True)
+    except (OSError, ValueError) as exc:
+        return _git_delivery_failure(str(exc), operation=operation, dry_run=True)
     command = _git_delivery_command(["push", fresh_remote_url, f"{src_ref}:{dst_ref}"], root)
     if not command["ok"]:
-        return _git_delivery_failure(command.get("error") or "git push failed", operation=operation, dry_run=False, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=fresh_head, **metadata, **command)
-    try: after_head, verification = _read_exact_git_delivery_head(root, fresh_remote_url, dst_ref)
-    except (_GitDeliveryError, OSError, ValueError) as exc:
-        details = exc.result if isinstance(exc, _GitDeliveryError) else {}
-        return _git_delivery_failure(str(exc), operation=operation, dry_run=False, pushed=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=None, **metadata, **details)
+        return _git_delivery_failure(
+            command.get("error") or "git push failed",
+            operation=operation, dry_run=True, repo_root=str(root), remote=remote,
+            src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=fresh_head,
+            **metadata, **command,
+        )
+    try:
+        after_head, verification = _read_exact_git_delivery_head(root, fresh_remote_url, dst_ref)
+    except _GitDeliveryError as exc:
+        return _git_delivery_failure(
+            str(exc), operation=operation, dry_run=True, pushed=True, repo_root=str(root), remote=remote,
+            src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=None, **metadata, **exc.result,
+        )
+    except (OSError, ValueError) as exc:
+        return _git_delivery_failure(
+            str(exc), operation=operation, dry_run=True, pushed=True, repo_root=str(root), remote=remote,
+            src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=None, **metadata,
+        )
     if after_head != source_head:
-        return _git_delivery_failure("push completed but post-push remote head verification did not match source_head", operation=operation, dry_run=False, pushed=True, repo_root=str(root), remote=remote, src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=after_head, **metadata, **verification)
-    return {"ok": True, "operation": operation, "dry_run": False, "pushed": True, "repo_root": str(root), "remote": remote, "src_ref": src_ref, "dst_ref": dst_ref, "source_head": source_head, "after_head": after_head, **metadata, **command}
+        return _git_delivery_failure(
+            "push completed but post-push remote head verification did not match source_head",
+            operation=operation, dry_run=True, pushed=True, repo_root=str(root), remote=remote,
+            src_ref=src_ref, dst_ref=dst_ref, source_head=source_head, after_head=after_head,
+            **metadata, **verification,
+        )
+    return {
+        "ok": True, "operation": operation, "dry_run": True, "pushed": True,
+        "repo_root": str(root), "remote": remote, "src_ref": src_ref, "dst_ref": dst_ref,
+        "source_head": source_head, "after_head": after_head, **metadata, **command,
+    }
+
+
+def _load_route_state() -> dict:
+    if not ROUTE_STATE_FILE.is_file():
+        return {}
+    try:
+        return read_json_object(ROUTE_STATE_FILE)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def record_official_quota_exhausted(detail: str, unavailable_until: str | None = None) -> None:
+    state = _load_route_state()
+    state["official"] = {
+        "status": "quota_exhausted",
+        "recorded_at": utc_now(),
+        "unavailable_until": unavailable_until,
+        "detail": detail[-1000:],
+    }
+    write_json(ROUTE_STATE_FILE, state)
+
+
+def is_official_quota_exhausted(text: str) -> bool:
+    """Return true only for explicit official Codex quota/usage exhaustion, not 429/rate limits."""
+    lower = (text or "").lower()
+    if not lower or "rate limit" in lower or "retry-after" in lower or "retry after" in lower:
+        return False
+    if re.search(r"\b429\b", lower) and not re.search(r"(?:quota|usage)[^\n]{0,50}(?:exhausted|exceeded|limit|reached)", lower):
+        return False
+    official = "openai" in lower or "codex" in lower
+    exhausted = re.search(r"(?:quota|usage(?:\s+limit)?|plan\s+limit)[^\n]{0,80}(?:exhausted|exceeded|reached|used\s+up)", lower)
+    return bool(official and exhausted)
+
+
+def _get_codex_config_provider(path: Path | None = None) -> str:
+    """Return the current provider name in the Codex config, or 'unknown'."""
+    target_path = path or CODEX_CONFIG
+    try:
+        text = target_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "unknown"
+    try:
+        parsed = tomllib.loads(text)
+        mp = parsed.get("model_provider")
+        if mp == "custom":
+            custom = parsed.get("providers", {}).get("custom", {})
+            if custom.get("base_url") == "https://codeflow.asia/v1":
+                return "codeflow"
+            return "custom"
+        elif mp == "openai":
+            return "official"
+        elif mp:
+            return str(mp)
+    except Exception:
+        pass
+    if 'model_provider = "custom"' in text and "https://codeflow.asia/v1" in text:
+        return "codeflow"
+    return "official"
+
+
+def is_stale_harbor_managed_codex_config(path: Path | None = None) -> tuple[bool, str | None]:
+    """Check if the Codex config is a stale Harbor-managed minimal config or left in an unsafe state."""
+    target_path = path or CODEX_CONFIG
+    state = _load_route_state()
+    if state.get("config_unsafe"):
+        restore_err = state.get("config_restore_error")
+        err_msg = restore_err.get("error", "unknown error") if isinstance(restore_err, dict) else str(restore_err)
+        return True, f"Codex config is marked unsafe due to restore failure: {err_msg}"
+
+    try:
+        if target_path.is_file():
+            text = target_path.read_text(encoding="utf-8", errors="replace")
+            if "managed by MCP control plane fallback machinery" in text:
+                return True, "Codex config contains legacy temporary management header but no active route lock/snapshot context is active"
+    except OSError:
+        pass
+    return False, None
+
+
+def codex_route_status() -> dict:
+    provider = _get_codex_config_provider()
+    stale, stale_reason = is_stale_harbor_managed_codex_config()
+    blocker = None
+    has_codeflow_key = bool(os.environ.get("CODEFLOW_API_KEY"))
+
+    if stale:
+        blocker = f"stale_harbor_managed_codex_config: {stale_reason}"
+        fallback_available = False
+    elif not has_codeflow_key:
+        blocker = "missing_codeflow_api_key: CODEFLOW_API_KEY environment variable is not set"
+        fallback_available = False
+    else:
+        fallback_available = True
+
+    custom = _custom_codex_route_definition(include_secret=False)
+    return {
+        "current_provider": provider,
+        "process_local_override_supported": True,
+        "automatic_fallback_available": fallback_available,
+        "codeflow_credential_configured": has_codeflow_key,
+        "blocker": blocker,
+        "state": _load_route_state().get("official"),
+        "custom_route_enabled": custom.get("enabled", False),
+        "custom_route_configured": custom.get("ok", False),
+        "custom_route_blocker": custom.get("blocker"),
+    }
+
+
+def _custom_codex_route_definition(*, include_secret: bool = False) -> dict[str, Any]:
+    """Resolve persisted generic Codex custom-route settings.
+
+    The returned mapping is safe to record unless ``include_secret`` is true;
+    callers must keep the latter strictly local to child-process creation.
+    """
+    try:
+        settings = load_user_settings()
+        custom = settings.codex.custom
+    except Exception:
+        return {"ok": False, "enabled": False, "blocker": "custom_route_settings_unavailable"}
+    if not custom.enabled:
+        return {"ok": False, "enabled": False, "blocker": "custom_route_disabled"}
+    profile_name = (custom.profile_name or "").strip()
+    base_url = (custom.base_url or "").strip()
+    credential_ref = (custom.credential_ref or "").strip()
+    if not profile_name:
+        return {"ok": False, "enabled": True, "blocker": "custom_route_missing_profile_name"}
+    if not re.match(r"^https?://[^\s]+$", base_url, re.IGNORECASE):
+        return {"ok": False, "enabled": True, "blocker": "custom_route_invalid_base_url"}
+    if not credential_ref:
+        return {"ok": False, "enabled": True, "blocker": "custom_route_missing_credential_ref"}
+    result: dict[str, Any] = {
+        "ok": True,
+        "enabled": True,
+        "provider_id": CUSTOM_CODEX_PROVIDER_ID,
+        "provider_name": profile_name,
+        "base_url": base_url,
+        "wire_api": "responses",
+        "env_key": CUSTOM_CODEX_ENV_KEY,
+        "default_model": (custom.default_model or "").strip(),
+        "credential_ref": credential_ref,
+    }
+    if include_secret:
+        try:
+            secret = (os.environ.get(CUSTOM_CODEX_ENV_KEY) if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged"
+                      else CredentialStore().read(credential_ref))
+        except Exception:
+            return {"ok": False, "enabled": True, "blocker": "custom_route_credential_unavailable"}
+        if not isinstance(secret, str) or not secret.strip():
+            return {"ok": False, "enabled": True, "blocker": "custom_route_missing_credential"}
+        result["api_key"] = secret
+    return result
+
+
+def resolve_custom_codex_route(*, include_secret: bool = False) -> dict[str, Any]:
+    """Public testable wrapper for custom route resolution."""
+    return _custom_codex_route_definition(include_secret=include_secret)
+
+
+def codex_child_environment(route: str) -> dict[str, str] | None:
+    """Return a child-only environment for a Codex route.
+
+    Legacy routes inherit the existing environment unchanged.  Custom routes
+    receive a copied environment with the vault secret injected under the
+    deterministic provider env key; the parent environment is never mutated.
+    """
+    if route != "custom":
+        return None
+    resolved = _custom_codex_route_definition(include_secret=True)
+    if not resolved.get("ok"):
+        raise ValueError(str(resolved.get("blocker", "custom_route_invalid")))
+    env = {k: v for k, v in os.environ.items() if v is not None}
+    env[CUSTOM_CODEX_ENV_KEY] = resolved["api_key"]
+    return env
+
 
 
 def _minimax_cli_candidates() -> list[Path]:
     candidates = [MINIMAX_CLI_EXE]
+    if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged" and os.environ.get("HARBOR_MINIMAX_CLI_EXE"):
+        return candidates
     for name in ("mcode.cmd", "mcode"):
         discovered = shutil.which(name)
         if discovered:
@@ -1322,7 +1589,7 @@ def _minimax_cli_status() -> dict:
         "version": None,
         "capabilities": {},
         "noninteractive_command": None,
-        "session_behavior": "mcode exec runs one headless task through the existing local job queue.",
+        "session_behavior": "mcode exec reads the exact UTF-8 prompt from stdin for one headless task through the existing local job queue.",
         "output_behavior": "mcode exec --output-format json emits a machine-readable ExecResult; --output-last-message writes the final answer.",
     }
     if executable is None:
@@ -1354,10 +1621,11 @@ def _minimax_cli_status() -> dict:
         "output_format_json": bool(re.search(r"--output-format[\s\S]{0,160}\bjson\b", exec_help)),
         "output_format_stream_json": bool(re.search(r"--output-format[\s\S]{0,160}\bstream-json\b", exec_help)),
         "output_last_message": "--output-last-message" in exec_help,
+        "stdin_input": "--input" in exec_help,
         "reasoning_effort": False,
         "sandbox": False,
     }
-    required = ("exec", "cwd", "output_format", "output_format_json", "output_last_message")
+    required = ("exec", "cwd", "output_format", "output_format_json", "output_last_message", "stdin_input")
     missing = [name for name in required if not capabilities[name]]
     base.update(version=version, capabilities=capabilities)
     if probe_errors or missing:
@@ -1370,6 +1638,7 @@ def _minimax_cli_status() -> dict:
         supports_async=True,
         noninteractive_command=[str(executable), "exec"],
         parameter_mappings={
+            "prompt": "UTF-8 stdin via --input -",
             "model": "--model <provider/model>",
             "sandbox": None,
             "reasoning_effort": None,
@@ -1379,7 +1648,40 @@ def _minimax_cli_status() -> dict:
     return base
 
 
-def _run_agy_probe(command: list[str], *, cwd: str | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+_AGY_PROBE_LOCK = threading.Lock()
+_AGY_PROBE_CACHE: tuple[tuple[Any, ...], float, dict] | None = None
+
+
+def _agy_probe_context() -> tuple[Path, str, dict[str, str], tuple[Any, ...]]:
+    """Capture the executable and process context shared by all agy probes.
+
+    Passing an explicit environment and cwd makes the three subprocesses use
+    one identity/profile/proxy snapshot even when the caller is running in an
+    executor thread.  The fingerprint invalidates the short-lived cache when
+    any inherited environment value or executable identity changes without
+    retaining or exposing environment values in the cache key.
+    """
+    executable = Path(AGY_EXE)
+    cwd = os.getcwd()
+    environment = {key: value for key, value in os.environ.items() if value is not None}
+    environment_fingerprint = hashlib.sha256(
+        json.dumps(sorted(environment.items()), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    try:
+        stat = executable.stat()
+        executable_identity: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        executable_identity = None
+    cache_key = (str(executable), executable_identity, cwd, environment_fingerprint)
+    return executable, cwd, environment, cache_key
+
+
+def _run_agy_probe(
+    command: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess:
     """Run an agy CLI probe command via the safe subprocess helper.
 
     Probes are short-lived (``--version``, ``--help``, ``models``) but they
@@ -1392,24 +1694,9 @@ def _run_agy_probe(command: list[str], *, cwd: str | None = None, env: dict[str,
         command,
         cwd=cwd,
         env=env,
-        timeout=5.0,
+        timeout=15.0,
         max_output_bytes=MAX_SUBPROCESS_OUTPUT_BYTES,
     )
-
-
-def _parse_agy_models(result: subprocess.CompletedProcess) -> tuple[list[str], bool]:
-    """Parse a model probe without treating banners or diagnostics as models."""
-    text = _probe_text(result)
-    if result.returncode != 0 or AGY_PROBE_BLOCKER_RE.search(text):
-        return [], False
-    models: list[str] = []
-    for line in text.splitlines():
-        token = line.strip().split()[0] if line.strip() else ""
-        token = token.strip("`[](),")
-        if AGY_MODEL_ID_RE.fullmatch(token) and (token.startswith("gemini-") or "/" in token):
-            if token not in models:
-                models.append(token)
-    return models, bool(models)
 
 
 def _parse_agy_model_enumeration(result: subprocess.CompletedProcess) -> tuple[list[str], bool]:
@@ -1462,36 +1749,6 @@ def _parse_agy_model_enumeration(result: subprocess.CompletedProcess) -> tuple[l
     return models, bool(models and structurally_valid)
 
 
-def _parse_agy_stderr_model_enumeration(
-    result: subprocess.CompletedProcess,
-) -> tuple[list[str], bool]:
-    """Extract only a strict model catalogue accidentally written to stderr.
-
-    Unlike stdout, stderr is primarily diagnostic output.  Every non-banner
-    line must therefore be either a complete model id with a provider-like
-    separator or a model row whose first field is such an id.  Any unknown
-    diagnostic line invalidates the fallback catalogue.
-    """
-    stderr_text = result.stderr if isinstance(result.stderr, str) else ""
-    if not stderr_text.strip():
-        return [], False
-
-    models: list[str] = []
-    structurally_valid = True
-    for raw_line in stderr_text.splitlines():
-        line = raw_line.strip()
-        if not line or AGY_INFO_OR_BANNER_RE.fullmatch(line):
-            continue
-        model_id = line.split(None, 1)[0]
-        if not AGY_STDERR_MODEL_ID_RE.fullmatch(model_id):
-            structurally_valid = False
-            continue
-        if model_id not in models:
-            models.append(model_id)
-
-    return models, bool(models and structurally_valid)
-
-
 def _is_valid_agy_model_catalogue(
     result: subprocess.CompletedProcess,
     *,
@@ -1500,7 +1757,8 @@ def _is_valid_agy_model_catalogue(
 ) -> bool:
     """Verify that ``agy models`` emitted a valid, unblocked Gemini-ready catalogue.
 
-    The public capability probe requires:
+    Harbor AGY executes Gemini models only.  The capability probe therefore
+    requires:
       1. A non-empty, structurally valid model enumeration.
       2. At least one ``gemini-*`` model present in the catalogue.
       3. No authentication, login, network, or explicit error diagnostics.
@@ -1518,34 +1776,20 @@ def _is_valid_agy_model_catalogue(
     )
 
 
-_AGY_PROBE_LOCK = threading.Lock()
-_AGY_PROBE_CACHE: tuple[tuple[str, str, str, bool], float, dict] | None = None
-
-
-def _agy_cli_status() -> dict:
+def _probe_agy_capabilities(
+    executable: Path,
+    *,
+    cwd: str,
+    env: dict[str, str],
+) -> dict:
     """Return the canonical agy harness status record.
 
     The shape mirrors ``_minimax_cli_status`` so the listing/registry
     surface is consistent. Agy is treated as a peer lifecycle-supervised
-    harness: a single ``agy --print`` invocation is supervised by the
+    harness: a single ``agy`` invocation via ``--print=<prompt>`` is supervised by the
     worker, not by the MCP transport, so ``supports_async`` is True
     once the CLI is verified.
     """
-    global _AGY_PROBE_CACHE
-    executable = AGY_EXE
-    cwd = str(Path.cwd())
-    env = {k: v for k, v in os.environ.items() if v is not None}
-    dangerous_permissions_enabled = agy_dangerous_permissions_enabled(env)
-    cache_key = (
-        str(executable),
-        cwd,
-        hashlib.sha256(json.dumps(env, sort_keys=True).encode()).hexdigest(),
-        dangerous_permissions_enabled,
-    )
-    with _AGY_PROBE_LOCK:
-        cached = _AGY_PROBE_CACHE
-        if cached and cached[0] == cache_key and time.monotonic() - cached[1] <= AGY_PROBE_CACHE_TTL_SECONDS:
-            return copy.deepcopy(cached[2])
     reported_executable = str(executable)
     base = {
         "name": "agy",
@@ -1558,10 +1802,18 @@ def _agy_cli_status() -> dict:
         "supports_reasoning_effort": True,
         "version": None,
         "capabilities": {},
+        "models": [],
+        "workspace_capability": {
+            "verified": False,
+            "status": "unverified",
+            "reason": (
+                "CLI/help/models probes do not verify workspace tool permissions in "
+                "headless execution."
+            ),
+        },
         "noninteractive_command": None,
-        "dangerously_skip_permissions_enabled": dangerous_permissions_enabled,
         "session_behavior": (
-            "agy --print runs one headless single-shot turn; the worker "
+            "agy runs one headless single-shot turn via --print=<prompt>; the worker "
             "supervises the lifecycle and reads the final result from "
             "captured stdout."
         ),
@@ -1573,7 +1825,7 @@ def _agy_cli_status() -> dict:
     }
     if not executable.is_file():
         base["blocker"] = (
-            f"Antigravity CLI not found at {AGY_EXE}. Install Antigravity "
+            f"Antigravity CLI not found at {executable}. Install Antigravity "
             "or update AGY_EXE to the correct path."
         )
         return base
@@ -1586,7 +1838,11 @@ def _agy_cli_status() -> dict:
         ("models", ["models"]),
     ):
         try:
-            result = _run_agy_probe([str(executable), *args], cwd=cwd, env=env)
+            result = _run_agy_probe(
+                [str(executable), *args],
+                cwd=cwd,
+                env=env,
+            )
             probes[label] = result
             # ``agy models`` is assessed below after its output has been
             # structurally validated.  Version/help remain conventional
@@ -1604,39 +1860,12 @@ def _agy_cli_status() -> dict:
     version = version_match.group(0) if version_match else (version_text or None)
 
     help_text = _probe_text(probes["help"]) if "help" in probes else ""
-    capabilities = {
-        "print": bool(re.search(r"(?:^|\s)(?:-p|--print|--prompt)(?:\s|\b)", help_text)),
-        "print_interactive": bool(re.search(r"(?:^|\s)(?:-i|--prompt-interactive)(?:\s|\b)", help_text)),
-        "dangerously_skip_permissions": "--dangerously-skip-permissions" in help_text,
-        "output_format": "--output-format" in help_text,
-        "output_format_json": bool(re.search(r"--output-format[\s\S]{0,160}\bjson\b", help_text)),
-        "output_format_stream_json": bool(re.search(r"--output-format[\s\S]{0,160}\bstream-json\b", help_text)),
-        "model": "--model" in help_text,
-        "effort": "--effort" in help_text,
-        "effort_low_medium_high": bool(
-            re.search(r"--effort.{0,120}low.{0,3}\|.{0,3}medium.{0,3}\|.{0,3}high", help_text)
-        ),
-        "print_timeout": "--print-timeout" in help_text,
-        "sandbox": "--sandbox" in help_text,
-    }
     models_result = probes.get("models")
     models, models_structurally_valid = (
         _parse_agy_model_enumeration(models_result)
         if models_result is not None
         else ([], False)
     )
-    if models_result is not None and not (
-        models and models_structurally_valid
-    ):
-        # AGY 1.1.27 can write the otherwise valid catalogue to stderr while
-        # reporting progress there as well.  Keep stdout authoritative when
-        # it yields a valid catalogue; only then consider the strict stderr
-        # fallback, which treats unknown diagnostic lines as structural noise.
-        stderr_models, stderr_structurally_valid = _parse_agy_stderr_model_enumeration(
-            models_result
-        )
-        if stderr_models and stderr_structurally_valid:
-            models, models_structurally_valid = stderr_models, stderr_structurally_valid
     if models_result is None:
         probe_errors.append("models probe returned no result")
     elif _is_valid_agy_model_catalogue(
@@ -1656,25 +1885,45 @@ def _agy_cli_status() -> dict:
                 f"models returned incomplete or blocked output{': ' + detail if detail else ''}"
             )
         models = []
-    base["models"] = models
-    base.update(version=version, capabilities=capabilities)
+    capabilities = {
+        "print": bool(re.search(r"(?:^|\s)(?:-p|--print|--prompt)(?:\s|\b)", help_text)),
+        "print_interactive": bool(re.search(r"(?:^|\s)(?:-i|--prompt-interactive)(?:\s|\b)", help_text)),
+        "dangerously_skip_permissions": "--dangerously-skip-permissions" in help_text,
+        "output_format": "--output-format" in help_text,
+        "output_format_json": bool(re.search(r"--output-format[\s\S]{0,160}\bjson\b", help_text)),
+        "output_format_stream_json": bool(re.search(r"--output-format[\s\S]{0,160}\bstream-json\b", help_text)),
+        "model": "--model" in help_text,
+        "effort": "--effort" in help_text,
+        "effort_low_medium_high": bool(
+            re.search(r"--effort.{0,120}low.{0,3}\|.{0,3}medium.{0,3}\|.{0,3}high", help_text)
+        ),
+        "print_timeout": "--print-timeout" in help_text,
+        "sandbox": "--sandbox" in help_text,
+    }
+    base.update(version=version, capabilities=capabilities, models=models)
 
     if probe_errors:
         base["blocker"] = "Antigravity CLI capability probes did not pass: " + "; ".join(probe_errors)
-        with _AGY_PROBE_LOCK: _AGY_PROBE_CACHE = (cache_key, time.monotonic(), copy.deepcopy(base))
         return base
 
     required = ("print", "dangerously_skip_permissions", "output_format", "model", "effort", "print_timeout")
     missing = [name for name in required if not capabilities[name]]
     if missing:
         base["blocker"] = "Antigravity CLI capability probes did not pass: missing verified exec capabilities: " + ", ".join(missing)
-        with _AGY_PROBE_LOCK: _AGY_PROBE_CACHE = (cache_key, time.monotonic(), copy.deepcopy(base))
         return base
 
     base.update(
         available=True,
         supports_async=True,
-        noninteractive_command=[str(executable), "--print"],
+        noninteractive_command=[
+            str(executable),
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "json",
+            "--print-timeout",
+            AGY_DEFAULT_PRINT_TIMEOUT,
+            "--print=<prompt>",
+        ],
         parameter_mappings={
             "model": "--model <id>",
             "sandbox": "sandbox is a single boolean in agy; read-only is rejected (workspace-write is the only verified mapping).",
@@ -1682,13 +1931,31 @@ def _agy_cli_status() -> dict:
         },
         blocker=None,
     )
-    if dangerous_permissions_enabled:
-        base["noninteractive_command"].append("--dangerously-skip-permissions")
-    base["noninteractive_command"].extend(
-        ["--output-format", "json", "--print-timeout", AGY_DEFAULT_PRINT_TIMEOUT]
-    )
-    with _AGY_PROBE_LOCK: _AGY_PROBE_CACHE = (cache_key, time.monotonic(), copy.deepcopy(base))
     return base
+
+
+def _agy_cli_status() -> dict:
+    """Return the canonical, context-bound agy capability probe result.
+
+    Status and task preflight intentionally share this short-lived snapshot.
+    This prevents a second immediate ``agy models`` invocation from disagreeing
+    with the capability result that was just reported, while context changes
+    and expired snapshots still force a fresh, fail-closed probe.
+    """
+    global _AGY_PROBE_CACHE
+    executable, cwd, environment, cache_key = _agy_probe_context()
+    with _AGY_PROBE_LOCK:
+        now = time.monotonic()
+        if _AGY_PROBE_CACHE is not None:
+            cached_key, cached_at, cached_status = _AGY_PROBE_CACHE
+            if (
+                cached_key == cache_key
+                and now - cached_at <= AGY_PROBE_CACHE_TTL_SECONDS
+            ):
+                return copy.deepcopy(cached_status)
+        status = _probe_agy_capabilities(executable, cwd=cwd, env=environment)
+        _AGY_PROBE_CACHE = (cache_key, time.monotonic(), copy.deepcopy(status))
+        return copy.deepcopy(status)
 
 
 def harnesses() -> list[dict]:
@@ -1699,6 +1966,7 @@ def harnesses() -> list[dict]:
             "executable": str(CODEX_EXE),
             "supports_async": True,
             "supports_reasoning_effort": True,
+            "route": codex_route_status(),
         },
         _minimax_cli_status(),
         _agy_cli_status(),
@@ -1714,6 +1982,7 @@ def harness_status(name: str) -> dict:
             "executable": str(CODEX_EXE),
             "supports_async": True,
             "supports_reasoning_effort": True,
+            "route": codex_route_status(),
         }
     if name == "minimax":
         return {"ok": True, **_minimax_cli_status()}
@@ -1722,38 +1991,183 @@ def harness_status(name: str) -> dict:
     return {"ok": False, "error": f"unknown harness: {name}"}
 
 
-_HARNESS_TELEMETRY_PROVIDER: HarnessTelemetryProvider | None = None
+def queue_diagnostics(jobs_dir: Path | None = None) -> dict[str, str]:
+    """Return secret-free queue identity diagnostics."""
+    path = Path(jobs_dir or JOBS_DIR)
+    source = (
+        QUEUE_ROOT.source
+        if queue_root_fingerprint(path) == QUEUE_ROOT.fingerprint
+        else "runtime_override"
+    )
+    return describe_queue_root(path, source).as_dict()
 
 
-def _harness_job_activity() -> dict[str, dict[str, int | str]]:
-    counts = {name: {"running": 0, "queued": 0, "source": "Harbor job queue"} for name in ("codex", "minimax", "agy")}
-    if not JOBS_DIR.is_dir():
+def _normalise_codex_rate_limits(payload: object) -> dict:
+    """Map the documented app-server response to telemetry windows.
+
+    Only backend-provided percentages are emitted.  Invalid or incomplete
+    entries are omitted rather than guessed, and the raw response is never
+    retained because it is not a telemetry contract.
+    """
+    result = payload if isinstance(payload, dict) else {}
+    rate_limits = result.get("rateLimits") if isinstance(result.get("rateLimits"), dict) else {}
+    selected_bucket: str | None = None
+    by_limit = result.get("rateLimitsByLimitId") if isinstance(result.get("rateLimitsByLimitId"), dict) else {}
+    if not rate_limits and by_limit:
+        for bucket, item in by_limit.items():
+            if isinstance(item, dict):
+                rate_limits = item
+                selected_bucket = str(bucket)
+                break
+    windows: list[dict] = []
+
+    def label(minutes: object, fallback: str) -> str:
+        if not isinstance(minutes, (int, float)) or minutes <= 0:
+            return fallback
+        total = int(minutes)
+        if total % 10080 == 0:
+            return "Weekly" if total == 10080 else f"{total // 10080}w"
+        if total % 1440 == 0:
+            return f"{total // 1440}d"
+        if total % 60 == 0:
+            return f"{total // 60}h"
+        return f"{total}m"
+
+    def add(window: object, bucket: object, fallback: str) -> None:
+        if not isinstance(window, dict) or not isinstance(window.get("usedPercent"), (int, float)):
+            return
+        reset = window.get("resetsAt")
+        windows.append({
+            "label": label(window.get("windowDurationMins"), fallback),
+            "bucket": str(bucket or "default"),
+            "used_percent": window["usedPercent"],
+            "window_minutes": window.get("windowDurationMins"),
+            "resets_at": reset if isinstance(reset, (int, float)) else None,
+        })
+
+    if isinstance(rate_limits, dict):
+        bucket = rate_limits.get("limitId") or selected_bucket
+        add(rate_limits.get("primary"), bucket, "Primary")
+        add(rate_limits.get("secondary"), bucket, "Secondary")
+    for bucket, limit in by_limit.items():
+        if not isinstance(limit, dict):
+            continue
+        if selected_bucket is not None and str(bucket) == selected_bucket:
+            continue
+        add(limit.get("primary"), bucket, "Primary")
+        add(limit.get("secondary"), bucket, "Secondary")
+    if not windows:
+        return {
+            "state": "unavailable",
+            "source": "Codex app-server account/rateLimits/read",
+            "error": "Codex app-server returned no quota windows",
+        }
+    return {
+        "state": "available",
+        "source": "Codex app-server account/rateLimits/read",
+        "windows": windows,
+        "quota_scope": "codex_account",
+    }
+
+
+def _codex_rate_limits_snapshot() -> dict:
+    """Use Harbor's sole authoritative Codex app-server status path.
+
+    The request is short-lived, read-only JSON-RPC over stdio.  It shares the
+    configured Codex executable with the harness registry and intentionally
+    exposes fixed, secret-free failure messages only.
+    """
+    if not CODEX_EXE.is_file():
+        return {"state": "unavailable", "source": "Codex app-server account/rateLimits/read", "error": "Codex CLI is not installed"}
+    requests = (
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "harbor-telemetry", "version": "1"}, "capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}},
+    )
+    payload = "\n".join(json.dumps(item) for item in requests) + "\n"
+    try:
+        completed = run_safe_subprocess(
+            [str(CODEX_EXE), "app-server", "--listen", "stdio://"],
+            input=payload.encode("utf-8"),
+            timeout=6,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"state": "unavailable", "source": "Codex app-server account/rateLimits/read", "error": "Codex app-server could not be started"}
+    for line in (completed.stdout or "").splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(message, dict) and message.get("id") == 2 and isinstance(message.get("result"), dict):
+            return _normalise_codex_rate_limits(message["result"])
+    return {"state": "unavailable", "source": "Codex app-server account/rateLimits/read", "error": "Codex app-server returned no quota response"}
+
+
+def _harness_job_activity(jobs_dir: Path | None = None) -> dict[str, dict[str, Any]]:
+    jobs_dir = jobs_dir or JOBS_DIR
+    counts = {name: {"running": 0, "queued": 0, "running_job_ids": [], "source": "Harbor job queue"} for name in ("codex", "minimax", "agy")}
+    if not jobs_dir.is_dir():
         return counts
-    for path in JOBS_DIR.glob("*/status.json"):
+    for path in jobs_dir.glob("*/status.json"):
         try:
             state = read_json_object(path)
         except (OSError, ValueError, json.JSONDecodeError):
+            for row in counts.values():
+                row["error"] = "Some job states could not be read"
             continue
         name = state.get("harness")
         status = state.get("status")
+        if not queue_root_matches(state, jobs_dir):
+            for row in counts.values():
+                row["error"] = "Job queue identity mismatch"
+            continue
+        if name in counts:
+            timestamp = state.get("updated_at") or state.get("created_at")
+            if isinstance(timestamp, str):
+                try:
+                    timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    if timestamp.tzinfo is not None:
+                        normalized = timestamp.astimezone(timezone.utc).isoformat()
+                        counts[name]["latest_activity_at"] = max(normalized, counts[name].get("latest_activity_at", ""))
+                except ValueError:
+                    pass
         if name in counts and status in {"queued", "running"}:
             counts[name][status] += 1
+            if status == "running":
+                counts[name]["running_job_ids"].append(path.parent.name)
+    for row in counts.values():
+        row["running_job_ids"].sort()
     return counts
+
+_HARNESS_TELEMETRY_PROVIDER: HarnessTelemetryProvider | None = None
 
 
 def harness_telemetry_snapshot(*, force_refresh: bool = False) -> dict:
-    """Return a bounded, read-only snapshot shared by core integrations."""
+    """Return the versioned unified read-only harness telemetry snapshot."""
     global _HARNESS_TELEMETRY_PROVIDER
     if _HARNESS_TELEMETRY_PROVIDER is None:
-        def invalidate_agy_cache() -> None:
+        def _invalidate_agy_cache() -> None:
+            """Reset the short-lived AGY capability probe cache.
+
+            Telemetry and canonical AGY status must derive from the same
+            *current* canonical probe/context.  ``agy_status()`` /
+            ``harness_status("agy")`` and the telemetry provider both read
+            ``_AGY_PROBE_CACHE``; the cache key only covers
+            ``(executable, executable identity, cwd, env fingerprint)``,
+            so a real AGY capability flip driven by auth, credentials, or
+            network state can leave a stale failing result in the cache
+            that the canonical path has since moved past.  Forcing a
+            fresh probe from the telemetry snapshot eliminates that
+            asymmetry without altering what canonical observes.
+            """
             global _AGY_PROBE_CACHE
             _AGY_PROBE_CACHE = None
         _HARNESS_TELEMETRY_PROVIDER = HarnessTelemetryProvider(
             status_provider=harness_status,
-            codex_quota_provider=lambda: {"state": "unavailable", "source": "Codex CLI status", "error": "no authoritative local quota source"},
+            codex_quota_provider=_codex_rate_limits_snapshot,
             job_activity_provider=_harness_job_activity,
             process_adapter=default_process_activity_adapter(run_safe_subprocess),
-            agy_cache_invalidator=invalidate_agy_cache,
+            agy_cache_invalidator=_invalidate_agy_cache,
         )
     return _HARNESS_TELEMETRY_PROVIDER.snapshot(force_refresh=force_refresh)
 
@@ -1771,29 +2185,22 @@ def resolve_task_cwd(project: str | None, cwd: str | None) -> tuple[Path, str | 
 
 def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, project: str | None,
                cwd: str | None, model: str | None, sandbox: str, reasoning_effort: str | None,
-               route: str = "current") -> dict:
+               route: str = "current", codex_role: str = "worker") -> dict:
     if harness not in {"codex", "minimax", "agy"}:
         return {"ok": False, "error": f"unsupported harness: {harness}"}
     if not isinstance(prompt, str) or not prompt.strip():
         return {"ok": False, "error": "prompt must be a non-empty string"}
     if sandbox not in SANDBOXES:
         return {"ok": False, "error": f"unsupported sandbox: {sandbox}"}
-    if harness == "codex":
-        if route not in CODEX_ROUTES:
-            return {"ok": False, "error": f"Codex route must be one of {sorted(CODEX_ROUTES)}."}
-        try:
-            validate_codex_route(route)
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
-    elif route != "current":
-        return {"ok": False, "error": f"{harness} tasks only support route=current."}
+    if route not in {"current", "official", "codeflow", "official_then_codeflow", "custom", "official_then_custom"}:
+        return {"ok": False, "error": f"unsupported route: {route}"}
     try:
         workdir, project_alias = resolve_task_cwd(project, cwd)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     if harness == "minimax":
         if route != "current":
-            return {"ok": False, "error": "MiniMax tasks only support route=current."}
+            return {"ok": False, "error": "MiniMax tasks only support route=current; Codex route switching is not applied."}
         if reasoning_effort is not None:
             return {"ok": False, "error": "MiniMax CLI does not expose a verified reasoning_effort flag."}
         if sandbox != "workspace-write":
@@ -1801,9 +2208,12 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
         minimax_status = harness_status("minimax")
         if not minimax_status["available"]:
             return {"ok": False, "error": minimax_status["blocker"]}
+        minimax_sandbox_requested = sandbox
+        minimax_sandbox_effective = "unenforced"
+        minimax_sandbox_enforced = False
     if harness == "agy":
         if route != "current":
-            return {"ok": False, "error": "Antigravity tasks only support route=current."}
+            return {"ok": False, "error": "Antigravity tasks only support route=current; Codex route switching is not applied."}
         if sandbox != "workspace-write":
             return {"ok": False, "error": "Antigravity CLI does not expose a verified read-only sandbox mapping; use sandbox=workspace-write."}
         if reasoning_effort is not None and reasoning_effort not in AGY_EFFORTS:
@@ -1811,9 +2221,44 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
         agy_status = harness_status("agy")
         if not agy_status["available"]:
             return {"ok": False, "error": agy_status["blocker"]}
-        dangerous_permissions_enabled = agy_dangerous_permissions_enabled()
-    if not CODEX_EXE.is_file() and harness == "codex":
-        return {"ok": False, "error": f"Codex executable not found: {CODEX_EXE}"}
+        if not isinstance(model, str) or not model.startswith("gemini-"):
+            return {
+                "ok": False,
+                "error": (
+                    f"Antigravity harness is Gemini-only: model must start with 'gemini-'; "
+                    f"rejected non-Gemini model {model!r}. Non-Gemini models (Claude, GPT-OSS, etc.) "
+                    f"cannot be executed via AGY."
+                ),
+            }
+    if harness == "codex":
+        if not CODEX_EXE.is_file():
+            return {"ok": False, "error": f"Codex executable not found: {CODEX_EXE}"}
+        stale, stale_reason = is_stale_harbor_managed_codex_config()
+        if stale:
+            return {
+                "ok": False,
+                "error": f"stale_harbor_managed_codex_config: {stale_reason}",
+                "blocker": "stale_harbor_managed_codex_config",
+            }
+        if route in ("codeflow", "official_then_codeflow") and not os.environ.get("CODEFLOW_API_KEY"):
+            return {
+                "ok": False,
+                "error": "missing_codeflow_api_key: CODEFLOW_API_KEY environment variable is not set for Code Flow route/fallback.",
+                "blocker": "missing_codeflow_api_key",
+                "route": route,
+                "route_status": codex_route_status(),
+            }
+        if route in ("custom", "official_then_custom"):
+            custom_route = _custom_codex_route_definition(include_secret=True)
+            if not custom_route.get("ok"):
+                blocker = custom_route.get("blocker", "custom_route_invalid")
+                return {
+                    "ok": False,
+                    "error": f"{blocker}: custom Codex route is not configured",
+                    "blocker": blocker,
+                    "route": route,
+                    "route_status": codex_route_status(),
+                }
     job_id = uuid.uuid4().hex
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=False)
@@ -1828,39 +2273,40 @@ def start_task(*, harness: Literal["codex", "minimax", "agy"], prompt: str, proj
         "sandbox": sandbox,
         "reasoning_effort": reasoning_effort,
         "route_requested": route,
-        "route_used": (
-            codex_route_attempts(route)[0] if harness == "codex" else "current"
-        ),
-        "fallback_used": False,
-        "fallback_reason": None,
-        "attempts": [],
-        "queue_root_fingerprint": QUEUE_ROOT.fingerprint,
+        "route_used": ("codeflow" if route == "codeflow" else
+                        "custom" if route == "custom" else
+                        "official" if route in ("official", "official_then_codeflow", "official_then_custom") else "current"),
         "native_process": None,
         "minimax_executable": minimax_status["executable"] if harness == "minimax" else None,
-        "agy_executable": str(AGY_EXE) if harness == "agy" else None,
-        "agy_dangerously_skip_permissions": (
-            dangerous_permissions_enabled if harness == "agy" else False
-        ),
+        "agy_executable": agy_status["executable"] if harness == "agy" else None,
         "created_at": utc_now(),
         "updated_at": utc_now(),
+        "queue_root_fingerprint": queue_root_fingerprint(JOBS_DIR),
+        "codex_role": ("primary" if codex_role == "primary" else "worker") if harness == "codex" else None,
     }
+    if harness == "minimax":
+        state["sandbox_requested"] = minimax_sandbox_requested
+        state["sandbox_effective"] = minimax_sandbox_effective
+        state["sandbox_enforced"] = minimax_sandbox_enforced
     write_json(job_dir / "status.json", state)
     response = {"ok": True, "job_id": job_id, "status": "queued", "harness": harness, "cwd": str(workdir), "project": project_alias}
     if harness == "minimax":
         response["parameter_handling"] = {
+            "prompt": "UTF-8 stdin via --input -",
             "model": "mapped to --model" if model else "not requested",
-            "sandbox": "not mapped; MiniMax uses its configured/default permission policy",
+            "sandbox": "unenforced",
+            "sandbox_requested": minimax_sandbox_requested,
+            "sandbox_effective": minimax_sandbox_effective,
+            "sandbox_enforced": minimax_sandbox_enforced,
             "reasoning_effort": "not supported",
         }
+        response["sandbox_requested"] = minimax_sandbox_requested
+        response["sandbox_effective"] = minimax_sandbox_effective
+        response["sandbox_enforced"] = minimax_sandbox_enforced
     if harness == "agy":
         response["parameter_handling"] = {
             "model": "mapped to --model" if model else "not requested",
-            "sandbox": "workspace-write is required; dangerous permission bypass is opt-in",
-            "dangerously_skip_permissions": (
-                f"enabled via {AGY_DANGEROUS_PERMISSIONS_ENV}"
-                if dangerous_permissions_enabled
-                else f"disabled by default; set {AGY_DANGEROUS_PERMISSIONS_ENV}=1 to enable"
-            ),
+            "sandbox": "not mapped; agy uses --dangerously-skip-permissions by default",
             "reasoning_effort": "mapped to --effort" if reasoning_effort else "not requested",
             "cwd": "not passed via flag; the worker sets Popen(cwd=...)",
             "result_path": "not passed via flag; the worker writes result.txt from captured stdout",
@@ -2035,6 +2481,14 @@ def poll_task(
             cached_snapshot = meta.get("snapshot")
             last_polled_ts = meta.get("last_polled_ts")
 
+            if isinstance(cached_snapshot, dict) and not queue_root_matches(cached_snapshot, base_jobs_dir):
+                return {
+                    "ok": False,
+                    "error": "job queue root mismatch; refusing cached foreign queue state",
+                    "queue_root_mismatch": True,
+                    **queue_diagnostics(base_jobs_dir),
+                }
+
             # If a terminal state was already observed, return cached result directly without reading disk
             if isinstance(cached_snapshot, dict) and cached_snapshot.get("status") in TERMINAL_STATUSES:
                 return {"ok": True, **cached_snapshot, "poll_throttled": False}
@@ -2074,8 +2528,13 @@ def poll_task(
                 state = read_json_object(state_path)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 return {"ok": False, "error": f"Could not read job state: {exc}"}
-            if not queue_root_matches(state, QUEUE_ROOT):
-                return {"ok": False, "error": "job belongs to a different Harbor queue root"}
+            if not queue_root_matches(state, base_jobs_dir):
+                return {
+                    "ok": False,
+                    "error": "job queue root mismatch; refusing to poll foreign queue state",
+                    "queue_root_mismatch": True,
+                    **queue_diagnostics(base_jobs_dir),
+                }
 
             status = state.get("status")
             if status in TERMINAL_STATUSES:
@@ -2185,10 +2644,10 @@ def poll_task(
         return response
 
 
-def cancel_task(job_id: str) -> dict:
+def cancel_task(job_id: str, jobs_dir: Path | None = None) -> dict:
     if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
         return {"ok": False, "error": "invalid job_id"}
-    job_dir = JOBS_DIR / job_id
+    job_dir = (jobs_dir or JOBS_DIR) / job_id
     state_path = job_dir / "status.json"
     if not state_path.is_file():
         return {"ok": False, "error": f"unknown job_id: {job_id}"}
@@ -2196,6 +2655,13 @@ def cancel_task(job_id: str) -> dict:
         return {"ok": False, "error": "task already claimed by worker and cannot be safely cancelled", "status": "running"}
     try:
         state = read_json_object(state_path)
+        if not queue_root_matches(state, jobs_dir or JOBS_DIR):
+            return {
+                "ok": False,
+                "error": "job queue root mismatch; refusing to cancel foreign queue state",
+                "queue_root_mismatch": True,
+                **queue_diagnostics(jobs_dir or JOBS_DIR),
+            }
         if state.get("status") != "queued":
             return {"ok": False, "error": f"task is not queued: {state.get('status')}", "status": state.get("status")}
         state.update(status="cancelled", cancelled_at=utc_now(), updated_at=utc_now())
@@ -2205,44 +2671,120 @@ def cancel_task(job_id: str) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
-def build_codex_command(
-    state: dict,
-    result_path: Path,
+def is_effective_openai_provider(route: str | None = None, config_path: Path | None = None) -> bool:
+    """Return True if the effective Codex route resolves to OpenAI."""
+    effective_route = route or "current"
+    if effective_route in ("official", "official_then_codeflow", "official_then_custom"):
+        return True
+    if effective_route in ("codeflow", "custom"):
+        return False
+    if effective_route == "current":
+        provider = _get_codex_config_provider(config_path)
+        return provider in ("official", "openai")
+    return False
+
+
+def resolve_codex_model_and_effort(
     *,
-    route: str | None = None,
-) -> list[str]:
-    selected_route = route or state.get("route_used") or state.get("route_requested", "current")
-    if selected_route == "official_then_custom":
-        selected_route = codex_route_attempts(selected_route)[0]
+    role: str = "worker",
+    route: str = "current",
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    config_path: Path | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve the effective model and reasoning_effort for a Codex execution.
+
+    Policy:
+    1) Primary/main Codex default (codex_run, codex_start):
+       model = gpt-6-sol; reasoning_effort = medium
+    2) Delegated Codex worker default (task_start):
+       model = gpt-6-luna; reasoning_effort = max
+    3) Explicit caller-provided model/reasoning_effort always wins.
+    4) Defaults apply ONLY when effective provider is OpenAI:
+       - route=official
+       - official attempt of official_then_* routes
+       - route=current when current configured provider resolves to openai
+    5) Explicit model only: preserve explicit model; do not guess effort.
+    6) Explicit reasoning_effort only: preserve it; choose role default model
+       if route/provider is OpenAI and model omitted.
+    7) Non-OpenAI routes (custom, codeflow, or current with non-openai provider):
+       no GPT-6 injection. Custom route preserves its default_model.
+    """
+    explicit_model = model if (isinstance(model, str) and model.strip()) else None
+    explicit_effort = reasoning_effort if (isinstance(reasoning_effort, str) and reasoning_effort.strip()) else None
+
+    openai_target = is_effective_openai_provider(route, config_path=config_path)
+
+    if openai_target:
+        if role == "primary":
+            role_model = CODEX_PRIMARY_DEFAULT_MODEL
+            role_effort = CODEX_PRIMARY_DEFAULT_REASONING_EFFORT
+        else:
+            role_model = CODEX_WORKER_DEFAULT_MODEL
+            role_effort = CODEX_WORKER_DEFAULT_REASONING_EFFORT
+
+        if explicit_model is not None and explicit_effort is not None:
+            return explicit_model, explicit_effort
+        elif explicit_model is not None and explicit_effort is None:
+            return explicit_model, None
+        elif explicit_model is None and explicit_effort is not None:
+            return role_model, explicit_effort
+        else:
+            return role_model, role_effort
+    else:
+        if explicit_model is not None:
+            eff_model = explicit_model
+        elif route == "custom":
+            eff_model = _custom_codex_route_definition(include_secret=False).get("default_model") or None
+        else:
+            eff_model = None
+
+        return eff_model, explicit_effort
+
+
+def build_codex_command(state: dict, result_path: Path, route: str | None = None) -> list[str]:
     command = [
         str(CODEX_EXE), "exec", "--color", "never", "--sandbox", state["sandbox"],
         "-C", state["cwd"], "-o", str(result_path),
     ]
-    if selected_route == "official":
+    effective_route = route or state.get("route") or state.get("route_requested") or "current"
+    if effective_route in ("official", "official_then_codeflow", "official_then_custom"):
         command.extend(["-c", 'model_provider="openai"'])
-    elif selected_route == "custom":
-        custom = codex_custom_route_config()
-
-        def toml_string(value: str) -> str:
+    elif effective_route == "codeflow":
+        command.extend([
+            "-c", 'model_provider="harbor_codeflow"',
+            "-c", 'model_providers.harbor_codeflow.name="Harbor Code Flow"',
+            "-c", 'model_providers.harbor_codeflow.base_url="https://codeflow.asia/v1"',
+            "-c", 'model_providers.harbor_codeflow.wire_api="responses"',
+            "-c", 'model_providers.harbor_codeflow.env_key="CODEFLOW_API_KEY"',
+        ])
+    elif effective_route == "custom":
+        custom = _custom_codex_route_definition(include_secret=False)
+        if not custom.get("ok"):
+            raise ValueError(str(custom.get("blocker", "custom_route_invalid")))
+        provider_id = custom["provider_id"]
+        def _toml_string(value: str) -> str:
             # JSON strings are valid TOML basic strings and safely escape any
             # user-provided quotes, slashes, or control characters.
-            return json.dumps(value, ensure_ascii=False)
-
-        provider_id = custom["provider_id"]
+            return json.dumps(str(value), ensure_ascii=False)
         command.extend([
-            "-c", f"model_provider={toml_string(provider_id)}",
-            "-c", f"model_providers.{provider_id}.name={toml_string(custom['provider_name'])}",
-            "-c", f"model_providers.{provider_id}.base_url={toml_string(custom['base_url'])}",
-            "-c", f"model_providers.{provider_id}.wire_api={toml_string(custom['wire_api'])}",
-            "-c", f"model_providers.{provider_id}.env_key={toml_string(custom['env_key'])}",
+            "-c", f"model_provider={_toml_string(provider_id)}",
+            "-c", f"model_providers.{provider_id}.name={_toml_string(custom['provider_name'])}",
+            "-c", f"model_providers.{provider_id}.base_url={_toml_string(custom['base_url'])}",
+            "-c", f"model_providers.{provider_id}.wire_api={_toml_string(custom['wire_api'])}",
+            "-c", f"model_providers.{provider_id}.env_key={_toml_string(custom['env_key'])}",
         ])
-    effective_model = state.get("model")
-    if not effective_model and selected_route == "custom":
-        effective_model = codex_custom_route_config().get("default_model")
+    codex_role = state.get("codex_role") or "worker"
+    effective_model, effective_effort = resolve_codex_model_and_effort(
+        role=codex_role,
+        route=effective_route,
+        model=state.get("model"),
+        reasoning_effort=state.get("reasoning_effort"),
+    )
     if effective_model:
         command.extend(["--model", effective_model])
-    if state.get("reasoning_effort"):
-        command.extend(["-c", f'model_reasoning_effort="{state["reasoning_effort"]}"'])
+    if effective_effort:
+        command.extend(["-c", f'model_reasoning_effort="{effective_effort}"'])
     command.append(state["prompt"])
     return command
 
@@ -2254,10 +2796,10 @@ def build_minimax_command(state: dict, result_path: Path) -> list[str]:
         "--cwd", state["cwd"],
         "--output-format", "json",
         "--output-last-message", str(result_path),
+        "--input", "-",
     ]
     if state.get("model"):
         command.extend(["--model", state["model"]])
-    command.extend(["--input", "-"])
     return command
 
 
@@ -2269,22 +2811,24 @@ def build_agy_command(state: dict, result_path: Path) -> list[str]:
     * ``result_path`` is **not** passed to agy; the worker writes it
       itself from the captured stdout.
 
-    The base flags are the supported non-interactive argv. The dangerous
-    permission bypass is included only when the job explicitly records that
-    ``HARBOR_AGY_DANGEROUSLY_SKIP_PERMISSIONS`` was enabled.
+    Permission and formatting flags must precede the prompt flag, and the prompt
+    is passed using the non-colliding ``--print=<prompt>`` form to prevent
+    token swallowing:
+    ``agy --dangerously-skip-permissions --output-format json
+    --print-timeout 1h [...] --print="<prompt>"``
     """
     executable = state.get("agy_executable") or str(AGY_EXE)
-    command: list[str] = [executable]
-    if state.get("agy_dangerously_skip_permissions", agy_dangerous_permissions_enabled()):
-        command.append("--dangerously-skip-permissions")
-    command.extend(["--output-format", "json", "--print-timeout", AGY_DEFAULT_PRINT_TIMEOUT])
+    command: list[str] = [
+        executable,
+        "--dangerously-skip-permissions",
+        "--output-format", "json",
+        "--print-timeout", AGY_DEFAULT_PRINT_TIMEOUT,
+    ]
     if state.get("model"):
         command.extend(["--model", state["model"]])
     if state.get("reasoning_effort"):
         command.extend(["--effort", state["reasoning_effort"]])
-    # The prompt must be a value of the ``-p`` flag; a bare positional
-    # would be rejected by agy.
-    command.append("--print=" + state["prompt"])
+    command.append(f"--print={state['prompt']}")
     # result_path is intentionally unused here. The worker writes it.
     _ = result_path
     return command
@@ -2304,3 +2848,53 @@ def claim_job(job_dir: Path) -> dict | None:
     state.update(status="running", started_at=utc_now(), updated_at=utc_now())
     write_json(job_dir / "status.json", state)
     return state
+
+
+@contextmanager
+def route_lock(lock_path: Path = ROUTE_LOCK_FILE, timeout_seconds: float = 5.0) -> Iterator[None]:
+    """Cross-process lock for any future guarded global Codex config mutation."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_seconds
+    fd: int | None = None
+    while fd is None:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for Codex route lock")
+            time.sleep(0.05)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"pid={os.getpid()} created_at={utc_now()}\n")
+        yield
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+class ConfigSnapshot:
+    """Snapshot/restore primitive used only with an explicit safe config mutation path."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.existed = path.exists()
+        self.content = path.read_bytes() if self.existed else b""
+        self.before_sha256 = hashlib.sha256(self.content).hexdigest()
+
+    def restore(self) -> None:
+        if self.existed:
+            fd, temp = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".restore", dir=self.path.parent)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(self.content)
+                os.replace(temp, self.path)
+            except Exception:
+                Path(temp).unlink(missing_ok=True)
+                raise
+        else:
+            self.path.unlink(missing_ok=True)
+
+    def unchanged(self) -> bool:
+        if self.path.exists() != self.existed:
+            return False
+        current = self.path.read_bytes() if self.existed else b""
+        return hashlib.sha256(current).hexdigest() == self.before_sha256

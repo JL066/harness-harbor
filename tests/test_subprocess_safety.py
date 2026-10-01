@@ -16,6 +16,8 @@ These tests guarantee that:
 from __future__ import annotations
 
 import asyncio
+import ast
+import io
 import os
 import subprocess
 import sys
@@ -66,6 +68,20 @@ def _pid_alive(pid: int) -> bool:
 
 
 class SafeSubprocessTimeoutReapTests(unittest.TestCase):
+    def test_run_safe_subprocess_bounds_both_streams_while_draining(self) -> None:
+        cap = 8192
+        result = control_plane.run_safe_subprocess(
+            [sys.executable, "-c", (
+                "import os\nchunk=b'x'*65536\n"
+                "for _ in range(128):\n os.write(1, chunk); os.write(2, chunk)\n"
+            )],
+            timeout=10.0,
+            max_output_bytes=cap,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(result.stdout.encode("utf-8")), cap)
+        self.assertEqual(len(result.stderr.encode("utf-8")), cap)
+
     def test_run_safe_subprocess_reaps_hanging_child(self) -> None:
         """A child that sleeps longer than the timeout must be reaped and
         the helper must return within a small bounded window.
@@ -129,7 +145,6 @@ class SafeSubprocessTimeoutReapTests(unittest.TestCase):
         elapsed = time.time() - t0
         self.assertLess(elapsed, 6.0)
 
-    @unittest.skipIf(sys.platform == "win32", "managed Windows runners deny termination of child processes created by the test sandbox")
     def test_run_safe_subprocess_kills_child_tree(self) -> None:
         """A wrapper that spawns a long-lived child must not leave the
         child orphaned after the helper returns. This is the exact
@@ -181,13 +196,13 @@ class SafeSubprocessTimeoutReapTests(unittest.TestCase):
         # Trigger the escalation through the public helper.
         control_plane._escalate_terminate(proc, wrapper_argv)
 
-        # After the escalation both PIDs must be gone. Poll the portable
-        # process probe; tasklist is unavailable in some isolated runners.
+        # After the escalation both PIDs must be gone. Poll the Win32 API
+        # directly; locked-down hosts can deny tasklist even for owned PIDs.
         for pid in (proc.pid, child_pid):
             deadline = time.time() + 3.0
             while time.time() < deadline and _pid_alive(pid):
                 time.sleep(0.05)
-            self.assertFalse(_pid_alive(pid), f"PID {pid} survived termination")
+            self.assertFalse(_pid_alive(pid), f"PID {pid} survived _escalate_terminate")
 
 
 class StdinIsolationTests(unittest.TestCase):
@@ -206,9 +221,9 @@ class StdinIsolationTests(unittest.TestCase):
                 # minimal API surface for the helper
                 self.pid = 99999  # not used; helper checks poll() etc.
                 self.returncode = 0
-
-            def communicate(self, timeout=None):
-                return (b"", b"")
+                self.stdin = None
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
 
             def poll(self):
                 return 0
@@ -232,6 +247,53 @@ class StdinIsolationTests(unittest.TestCase):
             flags = captured["kwargs"].get("creationflags", 0)
             self.assertTrue(flags & subprocess.CREATE_NO_WINDOW)
             self.assertTrue(flags & subprocess.CREATE_NEW_PROCESS_GROUP)
+
+    def test_run_safe_subprocess_delivers_exact_bytes_input(self) -> None:
+        payload = "第一行\nsecond line\n".encode("utf-8")
+        result = control_plane.run_safe_subprocess(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+            input=payload,
+            timeout=5.0,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, payload.decode("utf-8"))
+
+    def test_run_safe_subprocess_uses_pipe_only_for_explicit_input(self) -> None:
+        captured: dict = {}
+
+        class _FakePopen:
+            returncode = 0
+
+            def __init__(self, argv, **kwargs):
+                captured["kwargs"] = kwargs
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO(payload)
+                self.stderr = io.BytesIO()
+
+            def wait(self, timeout=None):
+                captured["timeout"] = timeout
+                return 0
+
+            def poll(self):
+                return 0
+
+        payload = "alpha\nβeta\n".encode("utf-8")
+        with mock.patch.object(control_plane.subprocess, "Popen", _FakePopen):
+            result = control_plane.run_safe_subprocess([sys.executable, "--version"], input=payload, timeout=1.0)
+
+        self.assertEqual(captured["kwargs"]["stdin"], subprocess.PIPE)
+        self.assertEqual(captured["timeout"], 1.0)
+        self.assertEqual(result.stdout, payload.decode("utf-8"))
+
+    def test_run_safe_subprocess_input_path_preserves_timeout_cleanup(self) -> None:
+        t0 = time.time()
+        result = control_plane.run_safe_subprocess(
+            [sys.executable, "-c", "import sys, time; sys.stdin.buffer.read(); time.sleep(60)"],
+            input=b"probe\n",
+            timeout=0.3,
+        )
+        self.assertLess(time.time() - t0, 6.0)
+        self.assertIsNotNone(result.returncode)
 
     def test_run_git_uses_safe_subprocess(self) -> None:
         """The internal _run_git helper must delegate to run_safe_subprocess."""
@@ -377,6 +439,51 @@ class EventLoopResponsivenessTests(unittest.TestCase):
                 inspect.iscoroutinefunction(fn),
                 f"{name} must be async def (got sync); sync tools run on the FastMCP event loop and can wedge the stdio transport",
             )
+
+    def test_batch7_subprocess_callsites_stay_inside_explicit_lifecycle_helpers(self) -> None:
+        allowed = {
+            "control_plane.py": {"_escalate_terminate", "run_safe_subprocess"},
+            "codex_job_worker.py": {
+                "run_codex_with_lifecycle", "run_minimax_with_lifecycle",
+                "run_agy_with_lifecycle",
+            },
+            "harness_telemetry.py": set(),
+            "harness_process_adapter.py": set(),
+        }
+        violations = []
+        for filename, allowed_functions in allowed.items():
+            tree = ast.parse((PROJECT_ROOT / filename).read_text(encoding="utf-8"))
+
+            class Visitor(ast.NodeVisitor):
+                def __init__(self):
+                    self.function = "<module>"
+
+                def visit_FunctionDef(self, node):
+                    previous, self.function = self.function, node.name
+                    self.generic_visit(node)
+                    self.function = previous
+
+                visit_AsyncFunctionDef = visit_FunctionDef
+
+                def visit_Call(self, node):
+                    func = node.func
+                    if (isinstance(func, ast.Attribute)
+                            and isinstance(func.value, ast.Name)
+                            and func.value.id == "subprocess"
+                            and func.attr in {"run", "Popen"}
+                            and self.function not in allowed_functions):
+                        violations.append(f"{filename}:{node.lineno}:{self.function}:subprocess.{func.attr}")
+                    self.generic_visit(node)
+
+            Visitor().visit(tree)
+        self.assertEqual(violations, [])
+
+    def test_harness_telemetry_remains_offloaded_from_async_mcp(self) -> None:
+        source = (PROJECT_ROOT / "server_legacy.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        fn = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "harness_telemetry")
+        segment = ast.get_source_segment(source, fn) or ""
+        self.assertIn("await asyncio.to_thread", segment)
 
 
 class HardTerminationReportingTests(unittest.TestCase):

@@ -1,12 +1,12 @@
-# Harness Harbor Supervisor Skill Sidecar
+# ChatGPT Harbor Supervisor Skill Sidecar
 
-This document explains the role, architecture, and optional installation of the **Harness Harbor Supervisor Skill** sidecar (`skills/harbor-supervisor/SKILL.md`).
+This document explains the role, architecture, and optional installation of the **ChatGPT Harbor Supervisor Skill** sidecar (`skills/harbor-supervisor/SKILL.md`).
 
 ---
 
 ## 1. What is the Supervisor Skill?
 
-The Supervisor Skill is an AI operational behavior policy that teaches the model how to act as an effective engineering supervisor when connected to Harness Harbor.
+The Supervisor Skill is an AI operational behavior policy that teaches the model how to act as an effective engineering supervisor when connected to ChatGPT Harbor.
 
 Harbor provides two distinct categories of capabilities:
 1. **Direct Read-Only MCP Tools**: Fast, immediate tools for inspecting git repositories, reading files, and performing host network and system diagnostics.
@@ -49,7 +49,7 @@ The Supervisor Skill is an **optional sidecar capability**:
 - **Skill Installed**: The AI client loads `SKILL.md` as context or instructions, guiding it to follow Harbor supervisor best practices during interactions.
 - **Skill Skipped / Unsupported**: If the client surface does not support installing custom skills, or if the user chooses not to install it, Harbor MCP and all associated harnesses continue to function normally.
 
-A missing or uninstalled Skill is **never** an installation failure for Harness Harbor.
+A missing or uninstalled Skill is **never** an installation failure for ChatGPT Harbor.
 
 ---
 

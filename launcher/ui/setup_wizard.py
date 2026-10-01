@@ -6,7 +6,9 @@ delegate persistence to :class:`SettingsController`.
 """
 from __future__ import annotations
 
+import os
 import tkinter as tk
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -33,10 +35,15 @@ from launcher.user_settings import (
     save_user_settings,
 )
 
-ROUTE_CHOICES = ("current", "official", "custom", "official_then_custom")
+ROUTE_CHOICES = ("current", "direct", "official", "codeflow", "custom", "official_then_custom")
+
+def packaged_mode():
+    return os.environ.get("HARBOR_RUNTIME_MODE") == "packaged"
 ROUTE_LABELS = {
     "current": "Current Codex configuration",
+    "direct": "Direct (current configuration)",
     "official": "Official OpenAI",
+    "codeflow": "CodeFlow",
     "custom": "Custom OpenAI-compatible provider",
     "official_then_custom": "Official, then custom on quota exhaustion",
 }
@@ -90,7 +97,7 @@ def first_run_status(
             candidate = Path(settings_path).expanduser() if settings_path is not None else get_user_settings_path()
             absent = not candidate.exists()
             detector = legacy_detector if legacy_detector is not None else legacy_installation_detected
-            legacy = detector() if absent else False
+            legacy = detector() if absent and not packaged_mode() else False
         except Exception:
             # Any path/detector failure fails closed into the normal setup
             # validation below; never skip setup on uncertain evidence.
@@ -104,6 +111,19 @@ def first_run_status(
         current = settings if settings is not None else load_user_settings(settings_path)
     except SettingsError as exc:
         return FirstRunStatus(True, "Existing settings are corrupted; repair is required.", True)
+    if packaged_mode():
+        from harbor_runtime.config import validate_settings
+        try:
+            store = credential_store or CredentialStore()
+            validate_settings(current.to_dict(), require_connection=True, credentials={
+                "tunnel": store.exists(CREDENTIAL_TARGET_TUNNEL_RUNTIME_KEY),
+                "custom": store.exists(CREDENTIAL_TARGET_CODEX_CUSTOM_API_KEY),
+            })
+            return FirstRunStatus(False)
+        except (ValueError, SettingsError) as exc:
+            return FirstRunStatus(True, str(exc))
+        except Exception:
+            return FirstRunStatus(True, "Secure credential store is unavailable.")
     conn = current.connection
     if not conn.tunnel_id.strip() or not conn.base_url.strip() or not conn.profile_name.strip():
         return FirstRunStatus(True, "Tunnel connection details are incomplete.")
@@ -147,6 +167,13 @@ def _url(value: str, label: str) -> str | None:
 
 def validate_draft(draft: dict) -> list[str]:
     """Validate all non-secret input before any mutation occurs."""
+    if packaged_mode():
+        from harbor_runtime.config import validate_settings
+        try:
+            validate_settings(draft, require_connection=True)
+            return []
+        except (ValueError, SettingsError) as exc:
+            return [str(exc)]
     errors: list[str] = []
     conn = draft.get("connection", {})
     for key, label in (("tunnel_id", "Tunnel ID"), ("profile_name", "Profile name")):
@@ -201,17 +228,24 @@ class SettingsController:
         old = load_user_settings(self.settings_path)
         selected_route = canonical_route(str(draft["codex"].get("routing_mode", old.codex.routing_mode)).strip().lower())
         custom_input = draft["codex"].get("custom", {})
-        staged = UserSettings(
-            version=old.version,
-            connection=ConnectionSettings(**{**vars(old.connection), **{k: str(v) for k, v in draft["connection"].items() if k in {"tunnel_id", "base_url", "profile_name", "credential_ref"}}}),
-            codex=CodexSettings(
-                routing_mode=selected_route,
-                custom=CodexCustomSettings(**{**vars(old.codex.custom), **{k: custom_input.get(k, getattr(old.codex.custom, k)) for k in ("enabled", "profile_name", "base_url", "default_model", "credential_ref")}, **({"enabled": True} if selected_route == "custom" else {})}),
-            ),
-        )
+        merged = old.to_dict()
+        for section in ("connection", "codex"):
+            values = deepcopy(draft.get(section, {}))
+            if section == "codex" and "custom" in values:
+                merged[section]["custom"].update(values.pop("custom"))
+            merged[section].update(values)
+        if "windows" in draft:
+            merged["windows"] = deepcopy(draft["windows"])
+        merged["codex"]["routing_mode"] = "current" if selected_route == "direct" else selected_route
+        if selected_route in ("custom", "official_then_custom"):
+            merged["codex"]["custom"]["enabled"] = True
+        if packaged_mode():
+            from harbor_runtime.config import validate_settings
+            merged = validate_settings(merged, require_connection=True)
+        staged = UserSettings.from_dict(merged)
         tunnel_ref = staged.connection.credential_ref or CREDENTIAL_TARGET_TUNNEL_RUNTIME_KEY
         custom_ref = staged.codex.custom.credential_ref or CREDENTIAL_TARGET_CODEX_CUSTOM_API_KEY
-        custom_required = staged.codex.routing_mode == "custom" or staged.codex.custom.enabled
+        custom_required = staged.codex.routing_mode in ("custom", "official_then_custom") or staged.codex.custom.enabled
         # Validate both credential transitions before rendering or writing a
         # profile, settings file, or secure-store value.
         old_secrets: dict[str, str | None] = {
@@ -226,14 +260,15 @@ class SettingsController:
         }
         # Generate the managed profile only through Batch 2's abstraction.  It
         # is a per-user profile and this does not start/restart tunnel-client.
-        profile_manager = TunnelProfileManager(staged, profile_path=self.profile_path or (Path(self.settings_path).parent / f"{staged.connection.profile_name}.yaml" if self.settings_path is not None else None))
-        profile_target = profile_manager.profile_path.expanduser()
-        profile_backup = profile_target.read_bytes() if profile_target.exists() else None
+        profile_manager = None if packaged_mode() else TunnelProfileManager(staged, profile_path=self.profile_path or (Path(self.settings_path).parent / f"{staged.connection.profile_name}.yaml" if self.settings_path is not None else None))
+        profile_target = profile_manager.profile_path.expanduser() if profile_manager is not None else None
+        profile_backup = profile_target.read_bytes() if profile_target is not None and profile_target.exists() else None
         profile_written = False
         changed: list[str] = []
         try:
-            profile_manager.write_profile()
-            profile_written = True
+            if profile_manager is not None:
+                profile_manager.write_profile()
+                profile_written = True
             for ref, value, clear in ((tunnel_ref, tunnel_runtime_key, clear_tunnel_key), (custom_ref, custom_api_key, clear_custom_key)):
                 if value is not None:
                     self.store.store(ref, value)
@@ -324,19 +359,30 @@ class SetupWizard(ctk.CTkToplevel):
             conn = self.draft["connection"]
             self._field("Tunnel ID", conn.get("tunnel_id", ""), "tunnel_id")
             self._field("Control-plane / base URL", conn.get("base_url", ""), "base_url")
-            self._field("Managed profile name", conn.get("profile_name", "harness-harbor"), "profile_name")
+            self._field("Managed profile name", conn.get("profile_name", "chatgpt-harbor"), "profile_name")
             state = "configured" if self._secret_state.get("tunnel_runtime_key") else "not configured"
             self._field(f"Tunnel Runtime Key ({state}; leave blank to keep)", "", "tunnel_secret", True)
             ctk.CTkCheckBox(self.body, text="Explicitly delete the stored Tunnel Runtime Key", variable=self._clear_values["tunnel"]).pack(anchor="w", pady=4)
         elif step == 1:
             ctk.CTkLabel(self.body, text="Harness status", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w")
-            for rec in list_harnesses(): ctk.CTkLabel(self.body, text=f"{rec['display_name']}: {rec['status']} — {rec['detail']}", anchor="w").pack(fill="x", pady=3)
-            models = agy_models(); ctk.CTkLabel(self.body, text="AGY models: " + (", ".join(models) if models else "No models detected"), anchor="w", wraplength=450).pack(fill="x", pady=8)
+            if packaged_mode():
+                from harbor_runtime.config import discover_executables
+                found = discover_executables()
+                saved = self.draft.get("windows", {}).get("executables", {})
+                for name, label in (("codex", "Codex CLI"), ("agy", "AGY CLI"), ("minimax", "MiniMax mcode CLI"), ("tunnel", "tunnel-client")):
+                    self._field(label + " executable (absolute path; blank uses detection)", saved.get(name, ""), "exe_" + name)
+                    ctk.CTkLabel(self.body, text="Detected: " + (found.get(name) or "Not installed"), anchor="w", wraplength=450).pack(fill="x")
+                ctk.CTkLabel(self.body, text="Install and sign in to these external CLIs separately. Accounts are not included with Harbor.", wraplength=450, justify="left").pack(fill="x", pady=8)
+            else:
+                for rec in list_harnesses():
+                    ctk.CTkLabel(self.body, text=f"{rec['display_name']}: {rec['status']} — {rec['detail']}", anchor="w").pack(fill="x", pady=3)
+                models = agy_models()
+                ctk.CTkLabel(self.body, text="AGY models: " + (", ".join(models) if models else "No models detected"), anchor="w", wraplength=450).pack(fill="x", pady=8)
         elif step == 2:
             ctk.CTkLabel(self.body, text="Codex routing", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w")
             current_route = self.draft["codex"].get("routing_mode", "current")
             route = tk.StringVar(value=ROUTE_LABELS.get(current_route, ROUTE_LABELS["current"])); self._route_var = route
-            ctk.CTkOptionMenu(self.body, variable=route, values=[ROUTE_LABELS[x] for x in ROUTE_CHOICES], dynamic_resizing=False).pack(fill="x", pady=8)
+            ctk.CTkOptionMenu(self.body, variable=route, values=[ROUTE_LABELS[x] for x in (("current", "official", "custom", "official_then_custom") if packaged_mode() else ROUTE_CHOICES)], dynamic_resizing=False).pack(fill="x", pady=8)
             custom = self.draft["codex"].setdefault("custom", {})
             self._field("Custom profile name", custom.get("profile_name", ""), "custom_profile")
             self._field("Custom base URL", custom.get("base_url", ""), "custom_url")
@@ -353,10 +399,14 @@ class SetupWizard(ctk.CTkToplevel):
         if self._step.get() == 0:
             for key in ("tunnel_id", "base_url", "profile_name"): self.draft["connection"][key] = getattr(self, f"_var_{key}").get()
             value = self._var_tunnel_secret.get(); self._secret_values["tunnel"] = value or None
+        elif self._step.get() == 1 and packaged_mode():
+            commands = self.draft.setdefault("windows", {}).setdefault("executables", {})
+            for name in ("codex", "agy", "minimax", "tunnel"):
+                commands[name] = getattr(self, "_var_exe_" + name).get().strip()
         elif self._step.get() == 2:
             selected = canonical_route(self._route_var.get())
             self.draft["codex"]["routing_mode"] = selected
-            custom = self.draft["codex"]["custom"]; custom.update(profile_name=self._var_custom_profile.get(), base_url=self._var_custom_url.get(), default_model=self._var_custom_model.get(), enabled=selected == "custom")
+            custom = self.draft["codex"]["custom"]; custom.update(profile_name=self._var_custom_profile.get(), base_url=self._var_custom_url.get(), default_model=self._var_custom_model.get(), enabled=selected in ("custom", "official_then_custom"))
             value = self._var_custom_secret.get(); self._secret_values["custom"] = value or None
 
     def _next(self):

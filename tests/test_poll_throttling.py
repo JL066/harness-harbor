@@ -47,9 +47,9 @@ class PollThrottlingTests(unittest.TestCase):
             "status": status,
             "prompt": "test prompt",
             "cwd": "D:\\test",
-            "created_at": "2000-01-01T12:00:00.000000+00:00",
-            "started_at": "2000-01-01T12:00:01.000000+00:00",
-            "updated_at": "2000-01-01T12:00:01.000000+00:00",
+            "created_at": "2026-08-30T12:00:00.000000+00:00",
+            "started_at": "2026-08-30T12:00:01.000000+00:00",
+            "updated_at": "2026-08-30T12:00:01.000000+00:00",
         }
         (job_dir / "status.json").write_text(json.dumps(state), encoding="utf-8")
         return job_dir

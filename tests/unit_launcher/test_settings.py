@@ -2,7 +2,7 @@
 
 These tests pin down the public contract of :mod:`launcher.settings`:
 
-* Defaults reproduce the checkout-relative public layout.
+* Defaults use portable paths in the source checkout.
 * Every key in :data:`launcher.settings.ENV_KEYS` actually overrides the
   matching default.
 * Path keys are coerced to :class:`pathlib.Path`, float keys to ``float``.
@@ -16,6 +16,7 @@ These tests pin down the public contract of :mod:`launcher.settings`:
 from __future__ import annotations
 
 import os
+import importlib
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ def _isolate_settings(monkeypatch):
         if k.startswith("HARBOR_"):
             monkeypatch.delenv(k, raising=False)
     settings.reload()
+    importlib.reload(config)
     yield
     # Restore (monkeypatch handles teardown of the delenv calls above;
     # anything we set during the test is reverted automatically).
@@ -50,6 +52,7 @@ def _isolate_settings(monkeypatch):
     for k, v in saved.items():
         monkeypatch.setenv(k, v)
     settings.reload()
+    importlib.reload(config)
 
 
 # ---------------------------------------------------------------------------
@@ -57,16 +60,15 @@ def _isolate_settings(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_defaults_are_public_and_checkout_relative():
-    """Built-in defaults must not disclose a deployment or user identity."""
-    expected_root = Path(settings.__file__).resolve().parent.parent
-    assert settings.get("harbor_home") == expected_root
-    assert settings.get("junction_path").name == ".harbor-junction"
-    assert settings.get("tunnel_exe") == Path("tunnel-client.exe")
+def test_defaults_use_source_checkout():
+    """Built-in defaults use portable paths within the source checkout."""
+    assert settings.get("harbor_home") == Path(settings.__file__).resolve().parents[1]
+    assert settings.get("junction_path") == Path(settings.__file__).resolve().parents[1] / "codex-mcp"
+    assert settings.get("tunnel_exe") == Path(settings.__file__).resolve().parents[1] / "bin" / "tunnel-client.exe"
     assert settings.get("mcp_script_name") == "server_legacy.py"
     assert settings.get("forbidden_mcp_script") == "server.py"
     assert settings.get("daemon_script_name") == "codex_job_daemon.py"
-    assert settings.get("autostart_app_name") == "HarnessHarborLauncher"
+    assert settings.get("autostart_app_name") == "ChatGPTHarborLauncher"
 
 
 def test_default_float_timings():
@@ -141,7 +143,7 @@ def test_empty_env_value_treated_as_unset(monkeypatch):
     """An empty string is indistinguishable from 'no override'."""
     monkeypatch.setenv("HARBOR_HOME", "")
     settings.reload()
-    assert settings.get("harbor_home") == Path(settings.__file__).resolve().parent.parent
+    assert settings.get("harbor_home") == Path(settings.__file__).resolve().parents[1]
     assert settings.source_for("harbor_home") == "default"
 
 
@@ -237,6 +239,7 @@ def test_config_derived_paths_follow_production_path(monkeypatch):
     """
     monkeypatch.setenv("HARBOR_HOME", r"F:\alt\harbor")
     import importlib
+    settings.reload()
     reloaded = importlib.reload(config)
     assert reloaded.PRODUCTION_PATH == Path(r"F:\alt\harbor")
     assert reloaded.TUNNEL_LOG == Path(r"F:\alt\harbor\tunnel-supervisor.log")
@@ -253,6 +256,7 @@ def test_brand_assets_remain_launcher_local(monkeypatch):
     """
     import importlib
     monkeypatch.setenv("HARBOR_HOME", r"Z:\somewhere\else")
+    settings.reload()
     reloaded = importlib.reload(config)
     # Brand paths are still under the launcher's own install dir, not under
     # the production runtime.

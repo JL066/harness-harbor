@@ -115,44 +115,12 @@ def _telemetry_rows(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
         detail = row["detail"]
         if isinstance(activity, Mapping) and activity.get("state") not in {None, "idle"}:
             detail = f"{detail} — {str(activity.get('state')).replace('_', ' ').title()}"
-        quota_summary = _quota_summary(quota)
-        if quota_summary:
-            detail = f"{detail} — {quota_summary}"
         if isinstance(quota, Mapping) and quota.get("stale"):
             detail += " — telemetry stale"
         row["detail"] = detail
         row["raw"] = raw
         rows.append(row)
     return rows
-
-
-def _quota_summary(quota: object) -> str:
-    """Format only valid, authoritative normalized quota windows for a card.
-
-    Core owns quota acquisition and normalization.  The launcher deliberately
-    renders nothing for unavailable, malformed, or empty quota records rather
-    than deriving a value from activity, errors, or provider-specific fields.
-    """
-    if not isinstance(quota, Mapping) or quota.get("state") != "available":
-        return ""
-    windows = quota.get("windows")
-    if not isinstance(windows, Sequence) or isinstance(windows, (str, bytes)):
-        return ""
-    summaries: list[str] = []
-    for window in windows:
-        if not isinstance(window, Mapping):
-            continue
-        label = window.get("label")
-        used_percent = window.get("used_percent")
-        if not isinstance(label, str) or not label.strip() or not isinstance(used_percent, (int, float)):
-            continue
-        if isinstance(used_percent, float) and not used_percent.is_integer():
-            continue
-        value = int(used_percent)
-        if not 0 <= value <= 100:
-            continue
-        summaries.append(f"Quota {label.strip()}: {value}% used")
-    return "; ".join(summaries)
 
 
 def list_harnesses(

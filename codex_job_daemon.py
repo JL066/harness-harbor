@@ -1,4 +1,4 @@
-"""Harness Harbor — optional multi-harness queue daemon with worker pools.
+"""Harness Harbor — Multi-harness job daemon scheduler with worker pools.
 
 Per-harness concurrency defaults to 3 (codex=3, minimax=3, agy=3),
 allowing up to 9 concurrent workers across all three harnesses.
@@ -26,7 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-from control_plane import JOBS_DIR
+from control_plane import JOBS_DIR, queue_diagnostics, spawn_runtime_child, utc_now, write_json
+from runtime_queue import queue_root_matches
+from runtime_liveness import ProcessLiveness, probe_job_tree_liveness, probe_pid_liveness
 
 
 SUPPORTED_HARNESSES: tuple[str, ...] = ("codex", "minimax", "agy")
@@ -64,38 +66,12 @@ class ActiveWorker:
 
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process ID is currently active in the operating system."""
-    if pid <= 0:
-        return False
-    if IS_WINDOWS:
-        try:
-            import ctypes
+    return probe_pid_liveness(pid) is ProcessLiveness.ALIVE
 
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            SYNCHRONIZE = 0x00100000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid
-            )
-            if not handle:
-                return False
-            exit_code = ctypes.c_ulong()
-            ctypes.windll.kernel32.GetExitCodeProcess(
-                handle, ctypes.byref(exit_code)
-            )
-            ctypes.windll.kernel32.CloseHandle(handle)
-            STILL_ACTIVE = 259
-            return bool(exit_code.value == STILL_ACTIVE)
-        except Exception:
-            try:
-                os.kill(pid, 0)
-                return True
-            except (OSError, ProcessLookupError, PermissionError) as exc:
-                return isinstance(exc, PermissionError)
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, OSError):
-            return False
+
+def _probe_pid_liveness(pid: int) -> ProcessLiveness:
+    """Compatibility seam for tests and conservative recovery decisions."""
+    return probe_pid_liveness(pid)
 
 
 WORKER_HANDOFF_GRACE_SECONDS: float = 5.0
@@ -547,6 +523,7 @@ def queued_jobs(jobs_dir: Path = JOBS_DIR) -> list[Path]:
         if (
             isinstance(state, dict)
             and state.get("status") == "queued"
+            and queue_root_matches(state, jobs_dir)
             and not (job_dir / "worker.lock").exists()
             and not is_dispatch_locked(job_dir)
         ):
@@ -555,6 +532,17 @@ def queued_jobs(jobs_dir: Path = JOBS_DIR) -> list[Path]:
 
     queued.sort(key=lambda item: (item[0], item[1].name))
     return [item[1] for item in queued]
+
+
+def _job_tree_liveness(job_dir: Path, owners: set[int] = ()) -> ProcessLiveness:
+    """Determine whether a descendant tree is alive, dead, or unobservable."""
+    return probe_job_tree_liveness(job_dir, owners)
+
+
+def _job_tree_alive(job_dir: Path, owners: set[int] = ()) -> bool:
+    """Return true for live or unobservable trees so callers fail closed."""
+    return _job_tree_liveness(job_dir, owners) is not ProcessLiveness.DEAD
+
 
 
 def get_disk_active_job_ids(jobs_dir: Path = JOBS_DIR) -> dict[str, set[str]]:
@@ -575,13 +563,34 @@ def get_disk_active_job_ids(jobs_dir: Path = JOBS_DIR) -> dict[str, set[str]]:
         lock_path = job_dir / "worker.lock"
 
         is_active = False
-        if lock_path.exists() or is_dispatch_locked(job_dir):
+        if lock_path.exists():
+            worker_pid = get_worker_lock_pid(job_dir)
+            if (
+                worker_pid is not None
+                and _probe_pid_liveness(worker_pid) is ProcessLiveness.DEAD
+                and _job_tree_liveness(job_dir, {worker_pid}) is ProcessLiveness.DEAD
+            ):
+                is_active = False
+            else:
+                is_active = True
+        elif is_dispatch_locked(job_dir):
             is_active = True
         elif state_path.is_file():
             try:
                 state = json.loads(state_path.read_text(encoding="utf-8"))
                 if isinstance(state, dict) and state.get("status") == "running":
-                    is_active = True
+                    native = state.get("native_process") or {}
+                    if not isinstance(native, dict):
+                        native = {}
+                    pids = {p for p in (state.get("worker_pid"), native.get("launcher_pid")) if type(p) is int and p > 1}
+                    if (
+                        pids
+                        and all(_probe_pid_liveness(p) is ProcessLiveness.DEAD for p in pids)
+                        and _job_tree_liveness(job_dir, pids) is ProcessLiveness.DEAD
+                    ):
+                        is_active = False
+                    else:
+                        is_active = True
             except (OSError, ValueError):
                 pass
 
@@ -598,8 +607,103 @@ def get_disk_busy_harnesses(jobs_dir: Path = JOBS_DIR) -> set[str]:
     return {h for h, jobs in disk_active.items() if jobs}
 
 
+def recover_abandoned_jobs(jobs_dir: Path, harness: str) -> list[str]:
+    """Recover persisted running/queued jobs whose worker processes are demonstrably dead.
+
+    Must preserve fail-closed behavior when ownership cannot be safely determined.
+    Preserves forensic state in status.before-recovery.json before mutating status.json.
+    Reconstructs completed terminal status if canonical result allows, otherwise fails.
+    Removes worker.lock, dispatch.lock, workspace lease, and unreserves job.
+    """
+    recovered = []
+    for state_path in jobs_dir.glob("*/status.json"):
+        job_dir = state_path.parent
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict) or state.get("harness", "codex") != harness:
+                continue
+            if not queue_root_matches(state, jobs_dir):
+                continue
+            if state.get("status") not in {"queued", "running"} and not (job_dir / "worker.lock").exists():
+                continue
+
+            worker_pid = get_worker_lock_pid(job_dir)
+            native = state.get("native_process") or {}
+            if not isinstance(native, dict):
+                native = {}
+            owners = {
+                pid for pid in (worker_pid, state.get("worker_pid"), native.get("launcher_pid"))
+                if type(pid) is int and pid > 1
+            }
+
+            # Fail-closed: if ownership cannot be determined at all (no valid PID found anywhere),
+            # do not assume dead; preserve for inspection.
+            if not owners:
+                continue
+
+            # Every observation must affirm death; alive or unknown preserves the job.
+            owner_states = {_probe_pid_liveness(pid) for pid in owners}
+            if owner_states != {ProcessLiveness.DEAD}:
+                continue
+
+            # Within worker handoff grace window, worker might be in the middle of spinning up
+            if time.time() - state_path.stat().st_mtime < WORKER_HANDOFF_GRACE_SECONDS:
+                continue
+
+            # Check if any descendant process in the job tree is alive
+            if _job_tree_liveness(job_dir, owners) is not ProcessLiveness.DEAD:
+                continue
+
+            # Forensic backup before mutation
+            backup = job_dir / "status.before-recovery.json"
+            if not backup.exists():
+                write_json(backup, state)
+
+            # Check if an existing canonical result allows safe terminal reconstruction
+            result_path = job_dir / "result.txt"
+            can_reconstruct_success = False
+            reconstructed_message = ""
+            if result_path.is_file():
+                try:
+                    reconstructed_message = result_path.read_text(encoding="utf-8", errors="replace").strip()
+                    if reconstructed_message and state.get("process_exit_code") == 0:
+                        can_reconstruct_success = True
+                except OSError:
+                    pass
+
+            if can_reconstruct_success:
+                state.update(
+                    status="completed",
+                    final_message=reconstructed_message,
+                    recovered_at=utc_now(),
+                    updated_at=utc_now(),
+                )
+            else:
+                state.update(
+                    status="failed",
+                    failure_type="worker_abandoned_after_runtime_exit",
+                    error="Worker exited or was abandoned after runtime exit without recording terminal state; task was not retried.",
+                    recovered_at=utc_now(),
+                    updated_at=utc_now(),
+                )
+
+            write_json(state_path, state)
+            recovered.append(job_dir.name)
+
+            # Clean up lock files and workspace lease
+            (job_dir / "worker.lock").unlink(missing_ok=True)
+            (job_dir / "dispatch.lock").unlink(missing_ok=True)
+            release_workspace_lease(jobs_dir, get_canonical_workspace(get_job_cwd(job_dir)), job_dir)
+            unreserve_job(job_dir)
+
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue  # Unreadable state is not proof that a worker died (fail-closed)
+    return recovered
+
+
+
 class HarborScheduler:
-    """Non-blocking multi-lane worker pool dispatcher for Harness Harbor jobs."""
+    """Non-blocking multi-lane worker pool scheduler for Harness Harbor jobs."""
 
     def __init__(
         self,
@@ -623,6 +727,14 @@ class HarborScheduler:
         self.active_workers: dict[str, dict[str, ActiveWorker]] = {
             h: {} for h in self.supported_harnesses
         }
+        for harness in self.supported_harnesses:
+            try:
+                with harness_dispatch_lock(
+                    self.jobs_dir, harness, timeout_seconds=self.dispatch_lock_timeout
+                ):
+                    recover_abandoned_jobs(self.jobs_dir, harness)
+            except HarnessDispatchLockTimeout:
+                pass
 
     def reap_workers(self) -> list[tuple[str, Path, int]]:
         """Reap finished worker subprocesses and release their in-memory lane claims and workspace leases.
@@ -634,6 +746,10 @@ class HarborScheduler:
             for job_id, worker in list(workers.items()):
                 exit_code = worker.proc.poll()
                 if exit_code is not None:
+                    if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
+                        from harbor_platform.process import terminate_tree
+                        if not terminate_tree(worker.proc):
+                            continue  # Retain lease until every owned descendant exits.
                     print(
                         f"Finished job {worker.job_dir.name} ({harness}) with exit code {exit_code}",
                         flush=True,
@@ -685,7 +801,8 @@ class HarborScheduler:
 
     def spawn_worker(self, job_dir: Path, harness: str) -> subprocess.Popen:
         """Spawn a worker child subprocess asynchronously."""
-        argv = [self.python_exe, self.worker_script, str(job_dir)]
+        argv = ([sys.executable, "worker", str(job_dir)] if getattr(sys, "frozen", False)
+                else [self.python_exe, self.worker_script, str(job_dir)])
         popen_kwargs: dict[str, Any] = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
@@ -693,6 +810,9 @@ class HarborScheduler:
         }
         if IS_WINDOWS:
             popen_kwargs["creationflags"] = _WIN_CREATION_FLAGS
+        if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
+            popen_kwargs["env"] = dict(os.environ)
+            return spawn_runtime_child(argv, **popen_kwargs)
         return subprocess.Popen(argv, **popen_kwargs)
 
     def tick(self) -> list[tuple[str, Path, int]]:
@@ -716,6 +836,7 @@ class HarborScheduler:
                 with harness_dispatch_lock(
                     self.jobs_dir, harness, timeout_seconds=self.dispatch_lock_timeout
                 ):
+                    recover_abandoned_jobs(self.jobs_dir, harness)
                     occupied_count = self.get_occupied_count(harness)
                     available_slots = max(0, limit - occupied_count)
                     if available_slots > 0:
@@ -775,8 +896,14 @@ class HarborScheduler:
 
 
 def main() -> None:
-    JOBS_DIR.mkdir(exist_ok=True)
-    print(f"Harness Harbor daemon started: {JOBS_DIR}", flush=True)
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    queue = queue_diagnostics(JOBS_DIR)
+    print(
+        "Harness Harbor daemon started: "
+        f"jobs_dir={queue['jobs_dir']} source={queue['source']} "
+        f"canonical_path={queue['canonical_path']} fingerprint={queue['fingerprint']}",
+        flush=True,
+    )
     scheduler = HarborScheduler(jobs_dir=JOBS_DIR)
     try:
         while True:

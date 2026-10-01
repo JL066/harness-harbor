@@ -32,7 +32,7 @@ def test_profile_render_is_deterministic_and_uses_legacy_entrypoint(tmp_path):
         "tunnel_id": "tun-123",
     }
     assert profile["health"]["listen_addr"] == "127.0.0.1:0"
-    assert profile["health"]["url_file"].endswith(".local\\state\\tunnel-client\\health\\harness-harbor.url") or profile["health"]["url_file"].endswith(".local/state/tunnel-client/health/harness-harbor.url")
+    assert profile["health"]["url_file"].endswith(".local\\state\\tunnel-client\\health\\chatgpt-harbor.url") or profile["health"]["url_file"].endswith(".local/state/tunnel-client/health/chatgpt-harbor.url")
     assert profile["log"]["format"] == "json"
     assert profile["log"]["level"] == "info"
     assert len(profile["mcp"]["commands"]) == 1

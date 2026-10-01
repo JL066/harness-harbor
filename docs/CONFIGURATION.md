@@ -1,7 +1,7 @@
-# Harness Harbor Launcher — Configuration Guide
+# ChatGPT Harbor Launcher — Configuration Guide
 
-This document explains how to install and operate the Harness Harbor Launcher
-with deployment-specific paths supplied by the operator.
+This document explains how to install and operate the ChatGPT Harbor
+Launcher from a Windows source checkout or packaged installation.
 The launcher's **Batch 1** configuration foundation resolves every
 deployment-specific path, name, and timing constant through a single
 resolution layer (`launcher/settings.py`) so operators can point it at
@@ -20,7 +20,7 @@ Every configurable value is resolved using the following tier order
 | Tier | Source | Notes |
 |------|--------|-------|
 | 1 | **Environment variable** (`HARBOR_*`) | Set before launching. Read once at startup. |
-| 2 | Built-in default | Checkout-relative public defaults. |
+| 2 | Built-in default | Uses paths relative to the source checkout. |
 
 A future batch may add tier 3 (an external YAML/JSON config file). The
 candidate path is already exposed via `settings.config_path()` and is
@@ -38,25 +38,25 @@ covers the full set accepted by the launcher. Paths are coerced to
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `HARBOR_HOME` | Launcher checkout | Root of the Harbor install. Contains `server_legacy.py`, `codex_job_daemon.py`, the PowerShell supervisors, and the configured Python runtime. |
+| `HARBOR_HOME` | Source checkout root | Root containing `server_legacy.py`, `codex_job_daemon.py`, and the PowerShell supervisors. Set this explicitly for an existing installation. |
 | `HARBOR_PRODUCTION_PATH` | _(alias of `HARBOR_HOME`)_ | Legacy alias; preferred name is `HARBOR_HOME`. |
-| `HARBOR_JUNCTION_PATH` | `<HARBOR_HOME>/.harbor-junction` | Optional compatibility path used by process discovery. |
+| `HARBOR_JUNCTION_PATH` | `<source root>\codex-mcp` | Legacy junction used by some supervisors. |
 
 ### Tunnel-client
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `HARBOR_TUNNEL_EXE` | `tunnel-client.exe` | Path to the `tunnel-client.exe` binary. |
+| `HARBOR_TUNNEL_EXE` | `<source root>\bin\tunnel-client.exe` | Path to the `tunnel-client.exe` binary. |
 | `HARBOR_TUNNEL_PROFILE_DIR` | `%APPDATA%\tunnel-client` | Per-profile state directory. |
-| `HARBOR_TUNNEL_PROFILE_NAME` | `harness-harbor` | Active tunnel-client profile name. |
-| `HARBOR_TUNNEL_HEALTH_URL_FILE` | `%USERPROFILE%\.local\state\tunnel-client\health\harness-harbor.url` | Health-endpoint URL file written by tunnel-client. |
+| `HARBOR_TUNNEL_PROFILE_NAME` | `chatgpt-harbor` | Active tunnel-client profile name. |
+| `HARBOR_TUNNEL_HEALTH_URL_FILE` | `%USERPROFILE%\.local\state\tunnel-client\health\chatgpt-harbor.url` | Health-endpoint URL file written by tunnel-client. |
 
 ### Legacy Python venv (drives the MCP server and job daemon)
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `HARBOR_VENV_PYTHON` | `<HARBOR_HOME>\.venv-legacy\Scripts\python.exe` | Console Python interpreter. |
-| `HARBOR_VENV_PYTHONW` | `<HARBOR_HOME>\.venv-legacy\Scripts\pythonw.exe` | Windowless Python interpreter. |
+| `HARBOR_VENV_PYTHON` | `<source root>\.venv-legacy\Scripts\python.exe` | Console Python interpreter. |
+| `HARBOR_VENV_PYTHONW` | `<source root>\.venv-legacy\Scripts\pythonw.exe` | Windowless Python interpreter. |
 
 ### Runtime job queue
 
@@ -64,8 +64,10 @@ covers the full set accepted by the launcher. Paths are coerced to
 |----------|---------|---------|
 | `HARBOR_JOBS_DIR` | `<runtime code root>\.jobs` | Absolute path to the shared runtime queue. MCP/control-plane producers, poll/cancel readers, and the daemon must receive the same value. Relative paths are rejected so changing the process working directory cannot redirect the queue. |
 
-Set `HARBOR_JOBS_DIR` explicitly when the MCP server and daemon are installed
-in different directories. Leaving it unset uses the runtime code root.
+For an isolated development runtime, set `HARBOR_JOBS_DIR` to the
+worktree's `.jobs` before starting both the MCP server and daemon.
+Leaving it unset preserves the historical per-code-root fallback for
+compatibility.
 
 ### Script & scheduled-task names
 
@@ -73,9 +75,9 @@ in different directories. Leaving it unset uses the runtime code root.
 |----------|---------|---------|
 | `HARBOR_MCP_SCRIPT` | `server_legacy.py` | The **real** Harbor MCP entry script. The launcher explicitly refuses to match the simplified `server.py` placeholder. |
 | `HARBOR_DAEMON_SCRIPT` | `codex_job_daemon.py` | Codex Job Daemon entry script. |
-| `HARBOR_SCHEDULED_TASK_TUNNEL` | `Harness Harbor Tunnel` | Windows Scheduled Task name for the tunnel supervisor. |
-| `HARBOR_SCHEDULED_TASK_DAEMON` | `Harness Harbor Job Daemon` | Windows Scheduled Task name for the daemon supervisor. |
-| `HARBOR_AUTOSTART_APP_NAME` | `HarnessHarborLauncher` | HKCU Run registry value name for Windows autostart. |
+| `HARBOR_SCHEDULED_TASK_TUNNEL` | `OpenAI Codex Tunnel` | Windows Scheduled Task name for the tunnel supervisor. |
+| `HARBOR_SCHEDULED_TASK_DAEMON` | `OpenAI Codex Job Daemon` | Windows Scheduled Task name for the daemon supervisor. |
+| `HARBOR_AUTOSTART_APP_NAME` | `ChatGPTHarborLauncher` | HKCU Run registry value name for Windows autostart. |
 
 ### Timing
 
@@ -94,7 +96,7 @@ in different directories. Leaving it unset uses the runtime code root.
 
 ```powershell
 $env:HARBOR_HOME = "E:\harbor\prod"
-& "C:\Users\Example\HarnessHarbor\run-launcher.ps1"
+& ".\run-launcher.ps1"
 ```
 
 The launcher derives `TUNNEL_LOG`, `DAEMON_LOG`, `START_TUNNEL_SCRIPT`,

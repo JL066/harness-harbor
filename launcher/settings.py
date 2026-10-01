@@ -11,9 +11,9 @@ Resolution precedence (highest to lowest)
 1. **Process environment variables** — operators can override individual
    fields without editing source. See :data:`ENV_KEYS` for the full list of
    accepted names. The ``HARBOR_`` prefix is reserved for the launcher.
-2. **Built-in defaults** — a checkout-relative public layout
-   layout used by the public checkout. Deployment-specific values can be
-   supplied through environment variables or the setup wizard, while
+2. **Built-in defaults** — paths relative to the source checkout
+   layout used by the original author environment. These defaults keep the
+   launcher working out-of-the-box for the current production install while
    every consumer of this module is free to override.
 
 A future batch may add a third tier (e.g. ``~/.harbor-launcher/config.yaml``);
@@ -81,21 +81,22 @@ ENV_KEYS: dict[str, str] = {
 # Built-in defaults
 # ---------------------------------------------------------------------------
 
-#: Built-in defaults for a public source distribution. Deployment-specific
-#: values remain configurable through the HARBOR_* environment contract.
+#: Portable source checkout defaults. Existing installations can supply
+#: their legacy paths through the HARBOR_* environment overrides.
+_SOURCE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULTS: dict[str, Any] = {
     # Production runtime install root (the directory that contains
     # server_legacy.py, codex_job_daemon.py, start-*.ps1, etc.).
-    "harbor_home": Path(__file__).resolve().parent.parent,
+    "harbor_home": _SOURCE_ROOT,
     # Legacy junction that some supervisors historically wrote into.
-    "junction_path": Path(__file__).resolve().parent.parent / ".harbor-junction",
+    "junction_path": _SOURCE_ROOT / "codex-mcp",
     # Tunnel client executable (download location for the upstream binary).
-    "tunnel_exe": Path("tunnel-client.exe"),
+    "tunnel_exe": _SOURCE_ROOT / "bin" / "tunnel-client.exe",
     # Where tunnel-client stores its per-profile state.
     "tunnel_profile_dir": (
         Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "tunnel-client"
     ),
-    "tunnel_profile_name": "harness-harbor",
+    "tunnel_profile_name": "chatgpt-harbor",
     # Per-profile dynamic health endpoint URL file written by tunnel-client.
     "tunnel_health_url_file": (
         Path(os.environ.get("USERPROFILE", Path.home()))
@@ -103,15 +104,11 @@ DEFAULTS: dict[str, Any] = {
         / "state"
         / "tunnel-client"
         / "health"
-        / "harness-harbor.url"
+        / "chatgpt-harbor.url"
     ),
     # Legacy venv interpreter that drives server_legacy.py and the daemon.
-    "venv_python": Path(
-        Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "python.exe"
-    ),
-    "venv_pythonw": Path(
-        Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "pythonw.exe"
-    ),
+    "venv_python": _SOURCE_ROOT / ".venv-legacy" / "Scripts" / "python.exe",
+    "venv_pythonw": _SOURCE_ROOT / ".venv-legacy" / "Scripts" / "pythonw.exe",
     # Script file names within ``harbor_home``.
     "mcp_script_name": "server_legacy.py",
     # The forbidden legacy simplified server name; the launcher must never
@@ -119,10 +116,10 @@ DEFAULTS: dict[str, Any] = {
     "forbidden_mcp_script": "server.py",
     "daemon_script_name": "codex_job_daemon.py",
     # Windows Scheduled Task names (used to start/stop the supervisors).
-    "scheduled_task_tunnel": "Harness Harbor Tunnel",
-    "scheduled_task_daemon": "Harness Harbor Job Daemon",
+    "scheduled_task_tunnel": "OpenAI Codex Tunnel",
+    "scheduled_task_daemon": "OpenAI Codex Job Daemon",
     # HKCU autostart registration.
-    "autostart_app_name": "HarnessHarborLauncher",
+    "autostart_app_name": "ChatGPTHarborLauncher",
     "autostart_reg_key": r"Software\Microsoft\Windows\CurrentVersion\Run",
     # Health polling and lifecycle timing (seconds).
     "poll_interval_seconds": 3.0,

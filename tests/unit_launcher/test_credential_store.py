@@ -29,8 +29,8 @@ from launcher.credential_store import (
 
 def test_credential_target_constants():
     """Target names must be stable, explicit, and namespaced."""
-    assert CREDENTIAL_TARGET_TUNNEL_RUNTIME_KEY == "Harness-Harbor:tunnel:runtime_key"
-    assert CREDENTIAL_TARGET_CODEX_CUSTOM_API_KEY == "Harness-Harbor:codex:custom_api_key"
+    assert CREDENTIAL_TARGET_TUNNEL_RUNTIME_KEY == "ChatGPT-Harbor:tunnel:runtime_key"
+    assert CREDENTIAL_TARGET_CODEX_CUSTOM_API_KEY == "ChatGPT-Harbor:codex:custom_api_key"
 
 
 # ---------------------------------------------------------------------------

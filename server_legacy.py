@@ -1,8 +1,8 @@
 import asyncio
 import os
+import shutil
 import re
 import subprocess
-import shutil
 import tempfile
 import json
 import time
@@ -14,13 +14,8 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 
 from control_plane import (
+    JOBS_DIR,
     cancel_task,
-    build_codex_command,
-    classify_codex_route_failure,
-    codex_process_environment,
-    codex_route_attempts,
-    codex_route_redaction_values,
-    CODEX_ROUTE_FAILURES,
     directory_list_result,
     file_append_result,
     file_read_result,
@@ -37,17 +32,16 @@ from control_plane import (
     git_rev_parse_result,
     git_status_result,
     git_worktree_list_result,
+    harness_telemetry_snapshot,
     harness_status as control_harness_status,
     harnesses,
     list_projects,
     poll_task,
+    queue_diagnostics,
     resolve_project,
     run_safe_subprocess,
-    sanitize_codex_diagnostic,
     start_task,
-    validate_codex_route,
-    QUEUE_ROOT,
-    harness_telemetry_snapshot,
+    resolve_codex_model_and_effort,
 )
 from host_diagnostics import (
     dns_resolve as diag_dns_resolve,
@@ -61,9 +55,8 @@ from host_diagnostics import (
 )
 
 
-CODEX_EXE = Path(os.environ.get("HARBOR_CODEX_EXE") or shutil.which("codex") or ("codex.exe" if os.name == "nt" else "codex"))
+CODEX_EXE = Path(os.environ.get("HARBOR_CODEX_EXE") or shutil.which("codex") or "codex.exe")
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
-JOBS_DIR = QUEUE_ROOT.path
 SANDBOXES = {"read-only", "workspace-write"}
 
 MAX_LIST_ENTRIES_HARD_LIMIT = 5000
@@ -190,7 +183,6 @@ async def codex_run(
     model: str | None = None,
     sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
     reasoning_effort: str | None = None,
-    route: Literal["current", "official", "custom", "official_then_custom"] = "current",
 ) -> dict:
     """Run a Codex task synchronously and wait for the final result.
 
@@ -198,7 +190,7 @@ async def codex_run(
 
     Do NOT use this as a substitute for codex_start.
 
-    For normal coding, repository analysis, debugging, edits, research, or any task that may take more than a few seconds, prefer codex_start followed by codex_poll. Long synchronous calls may exceed a remote tunnel transport response deadline and fail with a timeout or 502 error.
+    For normal coding, repository analysis, debugging, edits, research, or any task that may take more than a few seconds, prefer codex_start followed by codex_poll. Long synchronous calls may exceed the OpenAI Tunnel response deadline and fail with a timeout or 502 error.
     """
     workdir = Path(cwd).expanduser().resolve()
 
@@ -211,28 +203,43 @@ async def codex_run(
     fd, output_path = tempfile.mkstemp(prefix="codex-mcp-", suffix=".txt")
     os.close(fd)
 
-    route_state = {
-        "cwd": str(workdir), "sandbox": sandbox, "model": model,
-        "reasoning_effort": reasoning_effort, "prompt": prompt,
-    }
+    cmd = [
+        str(CODEX_EXE),
+        "exec",
+        "--color",
+        "never",
+        "--sandbox",
+        sandbox,
+        "-C",
+        str(workdir),
+        "-o",
+        output_path,
+    ]
+
+    eff_model, eff_effort = resolve_codex_model_and_effort(
+        role="primary",
+        route="current",
+        model=model,
+        reasoning_effort=reasoning_effort,
+        config_path=CODEX_CONFIG,
+    )
+    if eff_model:
+        cmd.extend(["--model", eff_model])
+    if eff_effort:
+        cmd.extend(["-c", f'model_reasoning_effort="{eff_effort}"'])
+
+    cmd.append(prompt)
 
     try:
-        validate_codex_route(route)
-        result = None
-        for index, attempt_route in enumerate(codex_route_attempts(route)):
-            cmd = build_codex_command(route_state, Path(output_path), route=attempt_route)
-            child_env = codex_process_environment(attempt_route)
-            result = await asyncio.to_thread(
-                lambda: run_safe_subprocess(cmd, cwd=None, env=child_env, timeout=600.0)
+        def _run() -> "subprocess.CompletedProcess":
+            return run_safe_subprocess(
+                cmd,
+                cwd=None,
+                env=None,
+                timeout=600.0,
             )
-            classification = classify_codex_route_failure(result)
-            if not (
-                route == "official_then_custom"
-                and index == 0
-                and classification in CODEX_ROUTE_FAILURES
-            ):
-                break
-        assert result is not None
+
+        result = await asyncio.to_thread(_run)
 
         final_message = ""
         try:
@@ -246,19 +253,10 @@ async def codex_run(
         return {
             "ok": result.returncode == 0,
             "exit_code": result.returncode,
-            "final_message": sanitize_codex_diagnostic(
-                final_message,
-                redact_values=codex_route_redaction_values(attempt_route),
-            ),
-            "stderr": sanitize_codex_diagnostic(
-                result.stderr,
-                redact_values=codex_route_redaction_values(attempt_route),
-            ),
+            "final_message": final_message,
+            "stderr": (result.stderr or "")[-4000:].strip(),
             "cwd": str(workdir),
         }
-
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc), "cwd": str(workdir)}
 
     finally:
         try:
@@ -274,7 +272,6 @@ async def codex_start(
     model: str | None = None,
     sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
     reasoning_effort: str | None = None,
-    route: Literal["current", "official", "custom", "official_then_custom"] = "current",
 ) -> dict:
     """Start a Codex task asynchronously.
 
@@ -291,7 +288,8 @@ async def codex_start(
         model=model,
         sandbox=sandbox,
         reasoning_effort=reasoning_effort,
-        route=route,
+        route="current",
+        codex_role="primary",
     )
 
 
@@ -660,8 +658,20 @@ async def harness_status(harness: str) -> dict:
 
 
 @mcp.tool()
+def queue_status() -> dict:
+    """Report the canonical runtime queue identity used by this MCP process."""
+    return {"ok": True, **queue_diagnostics()}
+
+
+@mcp.tool()
 async def harness_telemetry(force_refresh: bool = False) -> dict:
-    """Return bounded read-only harness status, queue, process, and quota telemetry."""
+    """Return the unified, read-only harness activity and quota snapshot.
+
+    Existing ``harness_list`` and ``harness_status`` contracts remain
+    unchanged.  Quota values appear only when an authoritative account-bound
+    source provides them; no credential or raw process command line is
+    returned.
+    """
     return await asyncio.to_thread(harness_telemetry_snapshot, force_refresh=force_refresh)
 
 
@@ -692,13 +702,13 @@ async def task_start(
     model: str | None = None,
     sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
     reasoning_effort: str | None = None,
-    route: Literal["current", "official", "custom", "official_then_custom"] = "current",
+    route: Literal["current", "official", "codeflow", "official_then_codeflow", "custom", "official_then_custom"] = "current",
 ) -> dict:
     """Queue a unified async task using exactly one project alias or explicit cwd.
 
-    Harness/model choice remains caller-controlled. MiniMax uses its verified
-    headless `mcode exec` interface. Codex supports the four public route
-    values; MiniMax and AGY accept only `current`.
+    Harness/model/route choice remains caller-controlled. MiniMax uses its
+    verified headless `mcode exec` interface; automatic Codex route switching
+    continues to report its existing blocker without mutating live config.
 
     Offloaded to a worker thread because it may run a MiniMax capability probe.
     """
@@ -736,7 +746,7 @@ def task_poll(job_id: str, immediate: bool = False) -> dict:
 @mcp.tool()
 def task_cancel(job_id: str) -> dict:
     """Cancel only an unclaimed queued task; running tasks are intentionally not killed."""
-    return cancel_task(job_id)
+    return cancel_task(job_id, jobs_dir=JOBS_DIR)
 
 
 @mcp.tool()
@@ -818,71 +828,164 @@ async def git_commit(repo: str, message: str) -> dict:
 
 @mcp.tool()
 async def git_ls_remote(repo: str, remote: str, ref: str) -> dict:
-    """Read one existing branch ref from a configured HTTPS remote."""
+    """Read one existing branch ref from a configured HTTPS remote.
+
+    ``remote`` is a configured remote name, never a URL.  The server resolves
+    and validates its push URL in the repository immediately before lookup.
+    """
     return await asyncio.to_thread(git_ls_remote_result, repo, remote, ref)
 
 
 @mcp.tool()
-async def git_push_dry_run(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str) -> dict:
-    """Dry-run exactly one non-force existing-branch update with an exact-head precondition."""
+async def git_push_dry_run(
+    repo: str,
+    remote: str,
+    src_ref: str,
+    dst_ref: str,
+    expected_remote_head: str,
+) -> dict:
+    """Dry-run exactly one non-force existing-branch update with an exact-head precondition.
+
+    No URLs, credentials, flags, tags, deletion, or multi-ref specifications
+    are accepted.  A fresh remote lookup must match ``expected_remote_head``.
+    """
     return await asyncio.to_thread(
         git_push_dry_run_result, repo, remote, src_ref, dst_ref, expected_remote_head,
     )
 
 
 @mcp.tool()
-async def git_push_ref(repo: str, remote: str, src_ref: str, dst_ref: str, expected_remote_head: str) -> dict:
-    """Push one non-force branch update after dry-run, drift checks, and verification."""
+async def git_push_ref(
+    repo: str,
+    remote: str,
+    src_ref: str,
+    dst_ref: str,
+    expected_remote_head: str,
+) -> dict:
+    """Push one non-force fast-forward branch update after fresh dry-run and drift checks.
+
+    This repeats validation, runs ``git push --dry-run``, rechecks the exact
+    destination head, performs one push, and verifies the resulting head.
+    """
     return await asyncio.to_thread(
         git_push_ref_result, repo, remote, src_ref, dst_ref, expected_remote_head,
     )
 
 
+# ---------------------------------------------------------------------------
+# Host Diagnostics Tools (Strictly Read-Only)
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 async def port_listeners(port: int, protocol: Literal["tcp", "udp"] = "tcp") -> dict:
-    """Read current listeners and owning PIDs for one TCP or UDP port."""
+    """Query current listening sockets and owning PIDs for a specific TCP or UDP port.
+
+    This tool is strictly read-only and distinguishes bindings such as 127.0.0.1, 0.0.0.0,
+    LAN IPv4, ::1, and ::. Port range is strictly 1-65535.
+    Offloaded to a worker thread.
+    """
     return await asyncio.to_thread(diag_port_listeners, port, protocol)
 
 
 @mcp.tool()
 async def process_inspect(pid: int) -> dict:
-    """Read safe metadata for one process by PID; no process mutation is performed."""
+    """Inspect safe metadata of a specific process by PID in a strictly read-only manner.
+
+    Returns process name, executable path, command line, start time, and parent PID.
+    Does not allow process termination, suspension, or handle modification.
+    Offloaded to a worker thread.
+    """
     return await asyncio.to_thread(diag_process_inspect, pid)
 
 
 @mcp.tool()
-async def http_probe(url: str, method: Literal["HEAD", "GET"] = "HEAD", timeout_seconds: int = 5) -> dict:
-    """Perform a bounded, SSRF-restricted read-only HTTP probe."""
+async def http_probe(
+    url: str,
+    method: Literal["HEAD", "GET"] = "HEAD",
+    timeout_seconds: int = 5,
+) -> dict:
+    """Perform a read-only HTTP/HTTPS probe with strict DNS pinning and SSRF protection.
+
+    Restricted to explicit local/LAN allowlist (127/8, 10/8, 172.16/12, 192.168/16,
+    169.254/16, 100.64/10, ::1/128, fc00::/7, fe80::/10). Explicitly blocks 198.18/15
+    TUN fake-IPs and public addresses.
+    HEAD is the default read-only probe method. If GET is explicitly requested, it carries
+    read-intent but cannot guarantee that poorly designed remote endpoints have no server-side
+    side effects. State-mutating methods (POST/PUT/PATCH/DELETE) and request bodies are strictly
+    forbidden. Target IP is pinned to prevent DNS TOCTOU / rebinding attacks. Response headers
+    undergo credential redaction.
+    Timeout is bounded between 1 and 15 seconds.
+    Offloaded to a worker thread.
+    """
     return await asyncio.to_thread(diag_http_probe, url, method=method, timeout_seconds=timeout_seconds)
 
 
 @mcp.tool()
-async def tls_inspect(host: str, port: int = 443, timeout_seconds: int = 5) -> dict:
-    """Inspect TLS certificate metadata for an approved local/LAN target."""
+async def tls_inspect(
+    host: str,
+    port: int = 443,
+    timeout_seconds: int = 5,
+) -> dict:
+    """Inspect HTTPS/TLS certificate metadata, SANs, and trust chain independently.
+
+    Evaluates whether SAN contains requested hostname or IP, and checks trust against
+    system root CA store independently from hostname matching. Target IP is pinned and
+    restricted to explicit local/LAN allowlist. Strictly inspects peer certificate;
+    zero private key access. Timeout is bounded between 1 and 15 seconds.
+    Offloaded to a worker thread.
+    """
     return await asyncio.to_thread(diag_tls_inspect, host, port=port, timeout_seconds=timeout_seconds)
 
 
 @mcp.tool()
-async def firewall_query(port: int | None = None, protocol: Literal["tcp", "udp"] | None = None, executable: str | None = None) -> dict:
-    """Read-only query of matching Windows Defender Firewall rules."""
+async def firewall_query(
+    port: int | None = None,
+    protocol: Literal["tcp", "udp"] | None = None,
+    executable: str | None = None,
+) -> dict:
+    """Read-only query for Windows Defender Firewall rules matching port or executable.
+
+    When multiple criteria (port, protocol, executable) are specified, rules must satisfy
+    ALL provided conditions (AND / intersection semantics). Supports port ranges and 'Any'.
+    Executable matching is literal without wildcard pattern expansion. Strictly read-only;
+    does not add, modify, enable, or delete firewall rules.
+    Offloaded to a worker thread.
+    """
     return await asyncio.to_thread(diag_firewall_query, port=port, protocol=protocol, executable=executable)
 
 
 @mcp.tool()
 async def network_interfaces() -> dict:
-    """Read local network interface metadata."""
+    """Inspect local network adapters, IP configurations, gateways, and DNS servers.
+
+    Useful for detecting LAN IP address changes and adapter status. Strictly read-only.
+    Offloaded to a worker thread.
+    """
     return await asyncio.to_thread(diag_network_interfaces)
 
 
 @mcp.tool()
-async def tcp_connect_probe(host: str, port: int, timeout_seconds: int = 3) -> dict:
-    """Test TCP connectivity without sending application data."""
+async def tcp_connect_probe(
+    host: str,
+    port: int,
+    timeout_seconds: int = 3,
+) -> dict:
+    """Test raw TCP connection to a host and port without sending application data.
+
+    Target host is validated against the explicit local/LAN allowlist (SSRF restriction active).
+    Timeout is bounded between 1 and 10 seconds. Strictly read-only.
+    Offloaded to a worker thread.
+    """
     return await asyncio.to_thread(diag_tcp_connect_probe, host, port, timeout_seconds=timeout_seconds)
 
 
 @mcp.tool()
 async def dns_resolve(hostname: str) -> dict:
-    """Resolve a hostname to A/AAAA records with bounded timeout."""
+    """Resolve a hostname to IPv4 (A) and IPv6 (AAAA) addresses with bounded timeout.
+
+    Strictly read-only; does not alter system DNS configuration.
+    Offloaded to a worker thread.
+    """
     return await asyncio.to_thread(diag_dns_resolve, hostname)
 
 

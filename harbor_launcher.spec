@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Portable PyInstaller specification for the public Harbor Launcher build."""
+"""Launcher component specification. Use build_exe.py for the complete Windows bundle."""
 
 from pathlib import Path
 import sys
@@ -26,6 +26,9 @@ RUNTIME_HIDDEN_IMPORTS = [
     "launcher.tunnel_profile",
     "launcher.ui.setup_wizard",
     "control_plane",
+    "launcher.runtime_client",
+    "launcher.runtime_backend",
+    "runtime_bootstrap",
 ]
 GUI_HIDDEN_IMPORTS = ["tkinter.font", "tkinter.filedialog", "tkinter.messagebox", "tkinter.ttk"]
 DATA_FILES = [(str(CUSTOMTKINTER_DIR), "customtkinter"), (str(ASSETS_DIR), "launcher/assets")]

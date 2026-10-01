@@ -1,4 +1,4 @@
-"""Tests for Harness Harbor multi-harness worker pool daemon (codex_job_daemon.py)."""
+"""Tests for Harness Harbor multi-harness worker pool daemon scheduler (codex_job_daemon.py)."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def _create_job(
     job_id: str,
     harness: str | None = "codex",
     status: str = "queued",
-    created_at: str = "2000-01-01T10:00:00Z",
+    created_at: str = "2026-08-30T10:00:00Z",
     has_lock: bool = False,
     cwd: str | Path | None = None,
 ) -> Path:
@@ -156,22 +156,22 @@ class TestCodexJobDaemon(unittest.TestCase):
 
     def test_queued_jobs_ordering_and_filtering(self) -> None:
         """Queued jobs are sorted FIFO and ignore running/locked jobs."""
-        j2 = _create_job(self.jobs_dir, "job2", created_at="2000-01-01T10:05:00Z")
-        j1 = _create_job(self.jobs_dir, "job1", created_at="2000-01-01T10:01:00Z")
-        j3 = _create_job(self.jobs_dir, "job3", created_at="2000-01-01T10:10:00Z")
-        _create_job(self.jobs_dir, "job_locked", created_at="2000-01-01T10:00:00Z", has_lock=True)
-        _create_job(self.jobs_dir, "job_running", status="running", created_at="2000-01-01T10:00:00Z")
-        _create_job(self.jobs_dir, "job_done", status="completed", created_at="2000-01-01T10:00:00Z")
+        j2 = _create_job(self.jobs_dir, "job2", created_at="2026-08-30T10:05:00Z")
+        j1 = _create_job(self.jobs_dir, "job1", created_at="2026-08-30T10:01:00Z")
+        j3 = _create_job(self.jobs_dir, "job3", created_at="2026-08-30T10:10:00Z")
+        _create_job(self.jobs_dir, "job_locked", created_at="2026-08-30T10:00:00Z", has_lock=True)
+        _create_job(self.jobs_dir, "job_running", status="running", created_at="2026-08-30T10:00:00Z")
+        _create_job(self.jobs_dir, "job_done", status="completed", created_at="2026-08-30T10:00:00Z")
 
         queued = queued_jobs(self.jobs_dir)
         self.assertEqual(queued, [j1, j2, j3])
 
     def test_codex_3_concurrency_and_4th_queued(self) -> None:
         """Codex supports 3 concurrent workers; the 4th job remains queued until a slot opens."""
-        j1 = _create_job(self.jobs_dir, "codex_1", harness="codex", created_at="2000-01-01T10:01:00Z")
-        j2 = _create_job(self.jobs_dir, "codex_2", harness="codex", created_at="2000-01-01T10:02:00Z")
-        j3 = _create_job(self.jobs_dir, "codex_3", harness="codex", created_at="2000-01-01T10:03:00Z")
-        j4 = _create_job(self.jobs_dir, "codex_4", harness="codex", created_at="2000-01-01T10:04:00Z")
+        j1 = _create_job(self.jobs_dir, "codex_1", harness="codex", created_at="2026-08-30T10:01:00Z")
+        j2 = _create_job(self.jobs_dir, "codex_2", harness="codex", created_at="2026-08-30T10:02:00Z")
+        j3 = _create_job(self.jobs_dir, "codex_3", harness="codex", created_at="2026-08-30T10:03:00Z")
+        j4 = _create_job(self.jobs_dir, "codex_4", harness="codex", created_at="2026-08-30T10:04:00Z")
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -218,7 +218,7 @@ class TestCodexJobDaemon(unittest.TestCase):
                 sub_jobs_dir = self.root / f".jobs_{harness}"
                 sub_jobs_dir.mkdir(exist_ok=True)
                 jobs = [
-                    _create_job(sub_jobs_dir, f"{harness}_{i}", harness=harness, created_at=f"2000-01-01T10:0{i}:00Z")
+                    _create_job(sub_jobs_dir, f"{harness}_{i}", harness=harness, created_at=f"2026-08-30T10:0{i}:00Z")
                     for i in range(1, 5)
                 ]
 
@@ -244,9 +244,9 @@ class TestCodexJobDaemon(unittest.TestCase):
 
     def test_9_workers_active_simultaneously(self) -> None:
         """Codex 3 + MiniMax 3 + agy 3 = 9 concurrent active workers."""
-        codex_jobs = [_create_job(self.jobs_dir, f"c_{i}", harness="codex", created_at=f"2000-01-01T10:0{i}:00Z") for i in range(3)]
-        minimax_jobs = [_create_job(self.jobs_dir, f"m_{i}", harness="minimax", created_at=f"2000-01-01T10:0{i}:00Z") for i in range(3)]
-        agy_jobs = [_create_job(self.jobs_dir, f"a_{i}", harness="agy", created_at=f"2000-01-01T10:0{i}:00Z") for i in range(3)]
+        codex_jobs = [_create_job(self.jobs_dir, f"c_{i}", harness="codex", created_at=f"2026-08-30T10:0{i}:00Z") for i in range(3)]
+        minimax_jobs = [_create_job(self.jobs_dir, f"m_{i}", harness="minimax", created_at=f"2026-08-30T10:0{i}:00Z") for i in range(3)]
+        agy_jobs = [_create_job(self.jobs_dir, f"a_{i}", harness="agy", created_at=f"2026-08-30T10:0{i}:00Z") for i in range(3)]
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -273,9 +273,9 @@ class TestCodexJobDaemon(unittest.TestCase):
 
     def test_custom_concurrency_limits(self) -> None:
         """HarborScheduler respects custom concurrency limits (e.g. codex=2, minimax=1, agy=4)."""
-        codex_jobs = [_create_job(self.jobs_dir, f"c_{i}", harness="codex", created_at=f"2000-01-01T10:0{i}:00Z") for i in range(3)]
-        minimax_jobs = [_create_job(self.jobs_dir, f"m_{i}", harness="minimax", created_at=f"2000-01-01T10:0{i}:00Z") for i in range(2)]
-        agy_jobs = [_create_job(self.jobs_dir, f"a_{i}", harness="agy", created_at=f"2000-01-01T10:0{i}:00Z") for i in range(5)]
+        codex_jobs = [_create_job(self.jobs_dir, f"c_{i}", harness="codex", created_at=f"2026-08-30T10:0{i}:00Z") for i in range(3)]
+        minimax_jobs = [_create_job(self.jobs_dir, f"m_{i}", harness="minimax", created_at=f"2026-08-30T10:0{i}:00Z") for i in range(2)]
+        agy_jobs = [_create_job(self.jobs_dir, f"a_{i}", harness="agy", created_at=f"2026-08-30T10:0{i}:00Z") for i in range(5)]
 
         custom_limits = {"codex": 2, "minimax": 1, "agy": 4}
         scheduler = HarborScheduler(
@@ -309,7 +309,7 @@ class TestCodexJobDaemon(unittest.TestCase):
         """
         import threading
 
-        jobs = [_create_job(self.jobs_dir, f"c_{i}", harness="codex", created_at=f"2000-01-01T10:0{i}:00Z") for i in range(6)]
+        jobs = [_create_job(self.jobs_dir, f"c_{i}", harness="codex", created_at=f"2026-08-30T10:0{i}:00Z") for i in range(6)]
 
         scheduler_a = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -372,8 +372,8 @@ class TestCodexJobDaemon(unittest.TestCase):
         j1 = _create_job(self.jobs_dir, "c_1", harness="codex", status="running", has_lock=True)
         j2 = _create_job(self.jobs_dir, "c_2", harness="codex", status="running", has_lock=True)
         # 2 queued jobs
-        j3 = _create_job(self.jobs_dir, "c_3", harness="codex", created_at="2000-01-01T10:03:00Z")
-        j4 = _create_job(self.jobs_dir, "c_4", harness="codex", created_at="2000-01-01T10:04:00Z")
+        j3 = _create_job(self.jobs_dir, "c_3", harness="codex", created_at="2026-08-30T10:03:00Z")
+        j4 = _create_job(self.jobs_dir, "c_4", harness="codex", created_at="2026-08-30T10:04:00Z")
 
         scheduler_a = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -615,8 +615,8 @@ class TestCodexJobDaemon(unittest.TestCase):
         """Daemon restart accurately recovers occupied slot count from disk."""
         _create_job(self.jobs_dir, "c_1", harness="codex", status="running", has_lock=True)
         _create_job(self.jobs_dir, "c_2", harness="codex", status="running", has_lock=True)
-        j_codex_q = _create_job(self.jobs_dir, "c_q", harness="codex", created_at="2000-01-01T10:03:00Z")
-        j_minimax_q = _create_job(self.jobs_dir, "m_q", harness="minimax", created_at="2000-01-01T10:01:00Z")
+        j_codex_q = _create_job(self.jobs_dir, "c_q", harness="codex", created_at="2026-08-30T10:03:00Z")
+        j_minimax_q = _create_job(self.jobs_dir, "m_q", harness="minimax", created_at="2026-08-30T10:01:00Z")
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -642,9 +642,9 @@ class TestCodexJobDaemon(unittest.TestCase):
         T1: Codex A completes -> Codex B/C/D running (3), MiniMax & agy unaffected (9 running, 2 queued).
         T2: All complete cleanly.
         """
-        codex_jobs = [_create_job(self.jobs_dir, f"codex_{c}", harness="codex", created_at=f"2000-01-01T10:0{i}:00Z") for i, c in enumerate(["A", "B", "C", "D"])]
-        minimax_jobs = [_create_job(self.jobs_dir, f"minimax_{c}", harness="minimax", created_at=f"2000-01-01T10:0{i}:00Z") for i, c in enumerate(["E", "F", "G", "H"])]
-        agy_jobs = [_create_job(self.jobs_dir, f"agy_{c}", harness="agy", created_at=f"2000-01-01T10:0{i}:00Z") for i, c in enumerate(["I", "J", "K", "L"])]
+        codex_jobs = [_create_job(self.jobs_dir, f"codex_{c}", harness="codex", created_at=f"2026-08-30T10:0{i}:00Z") for i, c in enumerate(["A", "B", "C", "D"])]
+        minimax_jobs = [_create_job(self.jobs_dir, f"minimax_{c}", harness="minimax", created_at=f"2026-08-30T10:0{i}:00Z") for i, c in enumerate(["E", "F", "G", "H"])]
+        agy_jobs = [_create_job(self.jobs_dir, f"agy_{c}", harness="agy", created_at=f"2026-08-30T10:0{i}:00Z") for i, c in enumerate(["I", "J", "K", "L"])]
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -721,7 +721,7 @@ class TestCodexJobDaemon(unittest.TestCase):
     def test_workspace_identity_git_and_subdirs(self) -> None:
         """Workspace identity resolves Git worktree top-level path and normalizes casing/slashes."""
         # 1. Main Git repo
-        repo_dir = self.root / "WorkspaceAlpha"
+        repo_dir = self.root / "Polaris"
         (repo_dir / ".git").mkdir(parents=True)
         sub1 = repo_dir / "src" / "app"
         sub2 = repo_dir / "tests"
@@ -735,7 +735,7 @@ class TestCodexJobDaemon(unittest.TestCase):
         self.assertEqual(ws_sub2, ws_top)
 
         # 2. Linked Git worktree (.git is a file pointing to gitdir)
-        worktree_dir = self.root / "WorkspaceAlpha_night"
+        worktree_dir = self.root / "Polaris_night"
         worktree_dir.mkdir(parents=True)
         (worktree_dir / ".git").write_text("gitdir: /fake/path/.git/worktrees/night\n", encoding="utf-8")
         ws_worktree = get_canonical_workspace(worktree_dir)
@@ -753,15 +753,15 @@ class TestCodexJobDaemon(unittest.TestCase):
 
     def test_same_workspace_cross_harness_mutual_exclusion(self) -> None:
         """Codex and MiniMax targeting the same Git workspace cannot execute simultaneously."""
-        repo_dir = self.root / "WorkspaceAlpha_Repo"
+        repo_dir = self.root / "Polaris_Repo"
         (repo_dir / ".git").mkdir(parents=True)
         sub_src = repo_dir / "src"
         sub_tests = repo_dir / "tests"
         sub_src.mkdir(parents=True)
         sub_tests.mkdir(parents=True)
 
-        j_codex = _create_job(self.jobs_dir, "job_codex", harness="codex", cwd=sub_src, created_at="2000-01-01T10:01:00Z")
-        j_minimax = _create_job(self.jobs_dir, "job_minimax", harness="minimax", cwd=sub_tests, created_at="2000-01-01T10:02:00Z")
+        j_codex = _create_job(self.jobs_dir, "job_codex", harness="codex", cwd=sub_src, created_at="2026-08-30T10:01:00Z")
+        j_minimax = _create_job(self.jobs_dir, "job_minimax", harness="minimax", cwd=sub_tests, created_at="2026-08-30T10:02:00Z")
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -769,7 +769,7 @@ class TestCodexJobDaemon(unittest.TestCase):
             worker_script=self.fake_worker,
         )
 
-        # Tick 1: Codex claims the alpha workspace lease; MiniMax remains queued
+        # Tick 1: Codex job claims Polaris workspace lease and spawns; MiniMax must remain queued
         spawned = scheduler.tick()
         self.assertEqual(len(spawned), 1)
         self.assertEqual(spawned[0][0], "codex")
@@ -802,11 +802,11 @@ class TestCodexJobDaemon(unittest.TestCase):
 
     def test_same_workspace_minimax_and_agy_exclusion(self) -> None:
         """MiniMax and AGY targeting the same workspace are mutually exclusive."""
-        repo_dir = self.root / "WorkspaceBeta_Repo"
+        repo_dir = self.root / "LabTrace_Repo"
         repo_dir.mkdir(parents=True)
 
-        j_minimax = _create_job(self.jobs_dir, "j_minimax", harness="minimax", cwd=repo_dir, created_at="2000-01-01T10:01:00Z")
-        j_agy = _create_job(self.jobs_dir, "j_agy", harness="agy", cwd=repo_dir, created_at="2000-01-01T10:02:00Z")
+        j_minimax = _create_job(self.jobs_dir, "j_minimax", harness="minimax", cwd=repo_dir, created_at="2026-08-30T10:01:00Z")
+        j_agy = _create_job(self.jobs_dir, "j_agy", harness="agy", cwd=repo_dir, created_at="2026-08-30T10:02:00Z")
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -839,8 +839,8 @@ class TestCodexJobDaemon(unittest.TestCase):
         repo_dir = self.root / "Harbor_Repo"
         repo_dir.mkdir(parents=True)
 
-        j1 = _create_job(self.jobs_dir, "c_1", harness="codex", cwd=repo_dir, created_at="2000-01-01T10:01:00Z")
-        j2 = _create_job(self.jobs_dir, "c_2", harness="codex", cwd=repo_dir, created_at="2000-01-01T10:02:00Z")
+        j1 = _create_job(self.jobs_dir, "c_1", harness="codex", cwd=repo_dir, created_at="2026-08-30T10:01:00Z")
+        j2 = _create_job(self.jobs_dir, "c_2", harness="codex", cwd=repo_dir, created_at="2026-08-30T10:02:00Z")
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -869,21 +869,21 @@ class TestCodexJobDaemon(unittest.TestCase):
 
     def test_no_head_of_line_blocking_on_busy_workspace(self) -> None:
         """A queued job blocked by a busy workspace does NOT block subsequent jobs for free workspaces."""
-        ws_alpha = self.root / "WorkspaceAlpha_Repo"
-        ws_alpha.mkdir(parents=True)
-        ws_beta = self.root / "WorkspaceBeta_Repo"
-        ws_beta.mkdir(parents=True)
+        ws_polaris = self.root / "Polaris_Repo"
+        ws_polaris.mkdir(parents=True)
+        ws_labtrace = self.root / "LabTrace_Repo"
+        ws_labtrace.mkdir(parents=True)
 
-        # Job 1: MiniMax on the alpha workspace (running)
-        j1 = _create_job(self.jobs_dir, "m_alpha", harness="minimax", cwd=ws_alpha, status="running", has_lock=True)
-        # Acquire the initial alpha workspace lease
-        acquire_workspace_lease(self.jobs_dir, get_canonical_workspace(ws_alpha), j1, "minimax")
+        # Job 1: MiniMax on Polaris (running)
+        j1 = _create_job(self.jobs_dir, "m_polaris", harness="minimax", cwd=ws_polaris, status="running", has_lock=True)
+        # Acquire initial workspace lease for Polaris
+        acquire_workspace_lease(self.jobs_dir, get_canonical_workspace(ws_polaris), j1, "minimax")
 
         # Queue:
-        # Job 2: Codex on alpha (blocked because MiniMax holds the lease)
-        j2 = _create_job(self.jobs_dir, "c_alpha", harness="codex", cwd=ws_alpha, created_at="2000-01-01T10:01:00Z")
-        # Job 3: Codex on beta (free workspace)
-        j3 = _create_job(self.jobs_dir, "c_beta", harness="codex", cwd=ws_beta, created_at="2000-01-01T10:02:00Z")
+        # Job 2: Codex on Polaris (blocked because Polaris is currently leased by MiniMax)
+        j2 = _create_job(self.jobs_dir, "c_polaris", harness="codex", cwd=ws_polaris, created_at="2026-08-30T10:01:00Z")
+        # Job 3: Codex on LabTrace (free workspace)
+        j3 = _create_job(self.jobs_dir, "c_labtrace", harness="codex", cwd=ws_labtrace, created_at="2026-08-30T10:02:00Z")
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -892,7 +892,7 @@ class TestCodexJobDaemon(unittest.TestCase):
             concurrency_limits={"codex": 3, "minimax": 3},
         )
 
-        # Tick: Codex tries Job 2 (alpha is leased), skips it, and dispatches Job 3
+        # Tick: Codex tries Job 2 (fails lease acquisition on Polaris), skips it, and dispatches Job 3!
         spawned = scheduler.tick()
         self.assertEqual(len(spawned), 1)
         self.assertEqual(spawned[0][1], j3)
@@ -902,13 +902,13 @@ class TestCodexJobDaemon(unittest.TestCase):
         time.sleep(0.08)
         self.assertIn(j2, queued_jobs(self.jobs_dir))
 
-        # Finish MiniMax Job 1 on alpha and release its lease
+        # Finish MiniMax Job 1 on Polaris and release its lease
         (j1 / "exit_trigger").write_text("done", encoding="utf-8")
-        release_workspace_lease(self.jobs_dir, get_canonical_workspace(ws_alpha), j1)
+        release_workspace_lease(self.jobs_dir, get_canonical_workspace(ws_polaris), j1)
         (j1 / "status.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
         (j1 / "worker.lock").unlink(missing_ok=True)
 
-        # Next tick: Job 2 on alpha can now be dispatched
+        # Next tick: Job 2 on Polaris can now be dispatched!
         spawned2 = scheduler.tick()
         self.assertEqual(len(spawned2), 1)
         self.assertEqual(spawned2[0][1], j2)
@@ -924,9 +924,9 @@ class TestCodexJobDaemon(unittest.TestCase):
         for ws in workspaces:
             (ws / ".git").mkdir(parents=True)
 
-        codex_jobs = [_create_job(self.jobs_dir, f"c_{i}", harness="codex", cwd=workspaces[i], created_at=f"2000-01-01T10:0{i}:00Z") for i in range(3)]
-        minimax_jobs = [_create_job(self.jobs_dir, f"m_{i}", harness="minimax", cwd=workspaces[3 + i], created_at=f"2000-01-01T10:0{i}:00Z") for i in range(3)]
-        agy_jobs = [_create_job(self.jobs_dir, f"a_{i}", harness="agy", cwd=workspaces[6 + i], created_at=f"2000-01-01T10:0{i}:00Z") for i in range(3)]
+        codex_jobs = [_create_job(self.jobs_dir, f"c_{i}", harness="codex", cwd=workspaces[i], created_at=f"2026-08-30T10:0{i}:00Z") for i in range(3)]
+        minimax_jobs = [_create_job(self.jobs_dir, f"m_{i}", harness="minimax", cwd=workspaces[3 + i], created_at=f"2026-08-30T10:0{i}:00Z") for i in range(3)]
+        agy_jobs = [_create_job(self.jobs_dir, f"a_{i}", harness="agy", cwd=workspaces[6 + i], created_at=f"2026-08-30T10:0{i}:00Z") for i in range(3)]
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -951,8 +951,8 @@ class TestCodexJobDaemon(unittest.TestCase):
         ws = self.root / "Contended_Repo"
         ws.mkdir(parents=True)
 
-        j1 = _create_job(self.jobs_dir, "j_codex_race", harness="codex", cwd=ws, created_at="2000-01-01T10:01:00Z")
-        j2 = _create_job(self.jobs_dir, "j_minimax_race", harness="minimax", cwd=ws, created_at="2000-01-01T10:02:00Z")
+        j1 = _create_job(self.jobs_dir, "j_codex_race", harness="codex", cwd=ws, created_at="2026-08-30T10:01:00Z")
+        j2 = _create_job(self.jobs_dir, "j_minimax_race", harness="minimax", cwd=ws, created_at="2026-08-30T10:02:00Z")
 
         scheduler_a = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -1031,10 +1031,10 @@ class TestCodexJobDaemon(unittest.TestCase):
         ws = self.root / "Crash_Repo"
         ws.mkdir(parents=True)
 
-        j_crash = _create_job(self.jobs_dir, "j_crash", harness="codex", cwd=ws, created_at="2000-01-01T10:01:00Z")
+        j_crash = _create_job(self.jobs_dir, "j_crash", harness="codex", cwd=ws, created_at="2026-08-30T10:01:00Z")
         (j_crash / "crash_immediately").write_text("crash", encoding="utf-8")
 
-        j_next = _create_job(self.jobs_dir, "j_next", harness="codex", cwd=ws, created_at="2000-01-01T10:02:00Z")
+        j_next = _create_job(self.jobs_dir, "j_next", harness="codex", cwd=ws, created_at="2026-08-30T10:02:00Z")
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -1116,7 +1116,7 @@ class TestCodexJobDaemon(unittest.TestCase):
         )
 
         # Second job queued on the same workspace
-        j2 = _create_job(self.jobs_dir, "j2_queued", harness="minimax", cwd=ws, created_at="2000-01-01T10:02:00Z")
+        j2 = _create_job(self.jobs_dir, "j2_queued", harness="minimax", cwd=ws, created_at="2026-08-30T10:02:00Z")
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,
@@ -1141,7 +1141,7 @@ class TestCodexJobDaemon(unittest.TestCase):
 
         # Job 1: Dead worker PID (9999998) in worker.lock
         j1 = _create_job(self.jobs_dir, "j1_dead", harness="codex", cwd=ws, status="running")
-        (j1 / "worker.lock").write_text("9999998 2000-01-01T10:00:00Z\n", encoding="utf-8")
+        (j1 / "worker.lock").write_text("9999998 2026-08-30T10:00:00Z\n", encoding="utf-8")
 
         # Lease has dead daemon PID (9999999)
         lease_path = get_workspace_lease_path(self.jobs_dir, canonical_ws)
@@ -1152,7 +1152,7 @@ class TestCodexJobDaemon(unittest.TestCase):
         )
 
         # Job 2: Queued on same workspace
-        j2 = _create_job(self.jobs_dir, "j2_queued", harness="codex", cwd=ws, created_at="2000-01-01T10:02:00Z")
+        j2 = _create_job(self.jobs_dir, "j2_queued", harness="codex", cwd=ws, created_at="2026-08-30T10:02:00Z")
 
         scheduler = HarborScheduler(
             jobs_dir=self.jobs_dir,

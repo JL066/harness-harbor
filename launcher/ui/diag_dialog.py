@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import threading
+
 import customtkinter as ctk
 
 from launcher.diagnostics import collect_diagnostics, format_diagnostics_markdown
@@ -10,8 +13,9 @@ from launcher.diagnostics import collect_diagnostics, format_diagnostics_markdow
 class DiagnosticsDialog(ctk.CTkToplevel):
     """Modern rounded diagnostics inspection dialog."""
 
-    def __init__(self, master=None):
+    def __init__(self, master=None, *, backend=None):
         super().__init__(master)
+        self.backend = backend
 
         self.title("Harbor System Diagnostics")
         self.geometry("700x520")
@@ -22,6 +26,7 @@ class DiagnosticsDialog(ctk.CTkToplevel):
             y = master.winfo_y() + (master.winfo_height() // 2) - 260
             self.geometry(f"+{max(50, x)}+{max(50, y)}")
 
+        self._refresh_token = 0
         self._init_ui()
         self.refresh_diagnostics()
 
@@ -91,14 +96,47 @@ class DiagnosticsDialog(ctk.CTkToplevel):
         )
         notice_lbl.grid(row=2, column=0, sticky="w", padx=24, pady=(4, 14))
 
-    def refresh_diagnostics(self):
-        diag_data = collect_diagnostics()
-        md_text = format_diagnostics_markdown(diag_data)
+    def _is_packaged(self) -> bool:
+        return getattr(self.backend, "mode", "legacy") == "packaged"
 
+    def _apply_diagnostics(self, token: int, result=None, error=None):
+        if token != self._refresh_token:
+            return
+        if error is not None:
+            text = f"[Error loading runtime diagnostics: {error}]"
+        elif isinstance(result, str):
+            text = result
+        else:
+            try:
+                text = json.dumps(result, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError):
+                text = "[Runtime diagnostics returned an invalid result.]"
         self.text_box.configure(state="normal")
         self.text_box.delete("1.0", "end")
-        self.text_box.insert("1.0", md_text)
+        self.text_box.insert("1.0", text)
         self.text_box.configure(state="disabled")
+
+    def refresh_diagnostics(self):
+        if self.backend is None:
+            diag_data = collect_diagnostics()
+            text = format_diagnostics_markdown(diag_data)
+            self.text_box.configure(state="normal")
+            self.text_box.delete("1.0", "end")
+            self.text_box.insert("1.0", text)
+            self.text_box.configure(state="disabled")
+            return
+
+        self._refresh_token += 1
+        token = self._refresh_token
+
+        def worker():
+            try:
+                result = self.backend.diagnostics.run()
+                self.after(0, self._apply_diagnostics, token, result, None)
+            except Exception as exc:
+                self.after(0, self._apply_diagnostics, token, None, str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _copy_diagnostics(self):
         self.clipboard_clear()

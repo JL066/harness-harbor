@@ -16,7 +16,7 @@ from launcher.user_settings import UserSettings, save_user_settings
 
 def draft(route="current"):
     return {
-        "connection": {"tunnel_id": "tun-1", "base_url": "https://control.example", "profile_name": "harness-harbor"},
+        "connection": {"tunnel_id": "tun-1", "base_url": "https://control.example", "profile_name": "chatgpt-harbor"},
         "codex": {"routing_mode": route, "custom": {"enabled": route == "custom", "profile_name": "Acme", "base_url": "https://api.acme.test/v1", "default_model": ""}},
     }
 

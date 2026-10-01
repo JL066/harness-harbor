@@ -22,6 +22,7 @@ from launcher.config import (
     COLOR_BTN_SECONDARY_LIGHT,
     COLOR_CARD_DARK,
     COLOR_CARD_LIGHT,
+    COLOR_STATUS_FAILED,
     COLOR_STATUS_HEALTHY,
     COLOR_STATUS_RESTARTING,
     COLOR_STATUS_RUNNING,
@@ -39,10 +40,8 @@ from launcher.config import (
     BRAND_SYSTEM_ICO_PATH,
 )
 from PIL import Image
-from launcher.health_checker import HarborHealthSnapshot, get_harbor_health
-from launcher.harnesses import agy_models, list_harnesses
-from control_plane import harness_telemetry_snapshot
-from launcher.lifecycle import restart_harbor, start_harbor, stop_harbor
+from launcher.health_checker import HarborHealthSnapshot
+from launcher.runtime_backend import create_backend
 from launcher.ui.components import StatusCard
 from launcher.ui.diag_dialog import DiagnosticsDialog
 from launcher.ui.log_dialog import LogDialog
@@ -54,7 +53,7 @@ from launcher.credential_store import CredentialStore
 class HarborLauncherApp(ctk.CTk):
     """Apple-inspired utility panel for Harness Harbor."""
 
-    def __init__(self):
+    def __init__(self, backend=None):
         super().__init__()
 
         # Appearance configuration
@@ -63,8 +62,8 @@ class HarborLauncherApp(ctk.CTk):
 
         self.title("Harness Harbor")
         self.geometry("470x680")
-        self.minsize(440, 620)
-        self.resizable(False, False)
+        self.minsize(420, 520)
+        self.resizable(True, True)
 
         # Center on screen
         sw = self.winfo_screenwidth()
@@ -89,6 +88,7 @@ class HarborLauncherApp(ctk.CTk):
         self.agy_model_menu = None
         self.settings_dialog = None
         self._settings_controller = None
+        self.backend = backend or create_backend()
 
         self._build_ui()
 
@@ -111,10 +111,11 @@ class HarborLauncherApp(ctk.CTk):
         self.after(50, self._maybe_open_setup)
 
     def _build_ui(self):
+        self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
         # Main scrollable or static container with smooth padding
-        main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        main_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
         main_frame.grid(row=0, column=0, sticky="nsew", padx=24, pady=20)
         main_frame.grid_columnconfigure(0, weight=1)
 
@@ -174,7 +175,7 @@ class HarborLauncherApp(ctk.CTk):
 
         sub_lbl = ctk.CTkLabel(
             header_frame,
-            text="Windows Control Panel",
+            text=f"{self._runtime_mode_label()} Control Panel",
             font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
             text_color=(COLOR_TEXT_MUTED_LIGHT, COLOR_TEXT_MUTED_DARK),
             anchor="w",
@@ -190,12 +191,13 @@ class HarborLauncherApp(ctk.CTk):
         env_badge.grid(row=0, column=2, rowspan=2, sticky="e")
         env_lbl = ctk.CTkLabel(
             env_badge,
-            text="Production",
+            text=self._runtime_mode_label(),
             font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
             text_color=(COLOR_TEXT_MUTED_LIGHT, COLOR_TEXT_MUTED_DARK),
             padx=10,
             pady=3,
         )
+        self.environment_label = env_lbl
         env_lbl.pack()
 
         # -------------------------------------------------------------------
@@ -382,16 +384,53 @@ class HarborLauncherApp(ctk.CTk):
 
         path_lbl = ctk.CTkLabel(
             footer_frame,
-            text=f"Production Path: {PRODUCTION_PATH}",
+            text=self._runtime_path_label(),
             font=ctk.CTkFont(family="Segoe UI Variable Text", size=10),
             text_color=(COLOR_TEXT_MUTED_LIGHT, COLOR_TEXT_MUTED_DARK),
             anchor="w",
         )
         path_lbl.grid(row=1, column=0, sticky="w")
 
+        version_lbl = ctk.CTkLabel(
+            footer_frame,
+            text=self._build_version_label(),
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=10),
+            text_color=(COLOR_TEXT_MUTED_LIGHT, COLOR_TEXT_MUTED_DARK),
+            anchor="e",
+        )
+        version_lbl.grid(row=1, column=1, sticky="e")
+
     # -----------------------------------------------------------------------
-    # Background Health Polling
+    # Runtime selection and background health polling
     # -----------------------------------------------------------------------
+
+    def _is_packaged(self) -> bool:
+        return getattr(self.backend, "mode", "legacy") == "packaged"
+
+    def _build_version_label(self) -> str:
+        from launcher.build_info import get_build_info
+        from harbor_runtime import RUNTIME_VERSION
+        info = get_build_info()
+        display_version = info.get("display_version") or RUNTIME_VERSION
+        return info.get("footer_string") or f"v{display_version}"
+
+    def _runtime_mode_label(self) -> str:
+        return "Packaged Runtime" if self._is_packaged() else "Legacy Source"
+
+    def _runtime_path_label(self) -> str:
+        return "Runtime: Bundled sidecar" if self._is_packaged() else f"Production Path: {PRODUCTION_PATH}"
+
+    def _show_backend_error(self, message: str):
+        try:
+            self.summary_title.configure(text="Runtime error", text_color=COLOR_STATUS_FAILED)
+            self.summary_sub.configure(text=str(message) or "Runtime operation failed.")
+        except Exception:
+            pass
+
+    def _post_ui(self, callback, *args, **kwargs):
+        if not self._poll_active:
+            return
+        self.after(0, lambda: callback(*args, **kwargs) if self._poll_active else None)
 
     def _schedule_health_poll(self, immediate: bool = False):
         if not self._poll_active:
@@ -401,22 +440,28 @@ class HarborLauncherApp(ctk.CTk):
         self.after(delay_ms, self._run_health_poll_async)
 
     def _run_health_poll_async(self):
+        if not self._poll_active:
+            return
         if self.is_busy:
             self._schedule_health_poll(immediate=False)
             return
 
         def worker():
             try:
-                snapshot = get_harbor_health()
-                self.after(0, self._apply_health_snapshot, snapshot)
-                telemetry = harness_telemetry_snapshot()
-                harness_statuses = list_harnesses(telemetry_snapshot=telemetry)
-                models = agy_models(telemetry_snapshot=telemetry)
-                self.after(0, self._apply_harness_statuses, harness_statuses, models)
-            except Exception as e:
-                pass
+                snapshot = self.backend.health()
+                self._post_ui(self._apply_health_snapshot, snapshot)
+                telemetry = self.backend.telemetry()
+                if isinstance(telemetry, dict):
+                    harness_statuses = telemetry.get("rows", [])
+                    models = telemetry.get("agy_models", telemetry.get("models", []))
+                else:
+                    harness_statuses, models = telemetry
+                self._post_ui(self._apply_harness_statuses, harness_statuses, models)
+            except Exception as exc:
+                self._post_ui(self._show_backend_error, str(exc))
             finally:
-                self.after(0, lambda: self._schedule_health_poll(immediate=False))
+                if self._poll_active:
+                    self.after(0, lambda: self._schedule_health_poll(immediate=False))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -481,38 +526,37 @@ class HarborLauncherApp(ctk.CTk):
         self.is_busy = False
         self._schedule_health_poll(immediate=True)
 
-    def _handle_start(self):
+    def _finish_action(self, ok: bool, message: str):
+        if not ok:
+            self.summary_title.configure(text="Runtime action failed", text_color=COLOR_STATUS_FAILED)
+        self.summary_sub.configure(text=message or ("Action completed." if ok else "Runtime action failed."))
+        self.after(500, self._clear_busy)
+
+    def _run_lifecycle_action(self, action: str, title: str, subtext: str):
         if self.is_busy:
             return
-        self._set_busy("Starting Harbor...", "Spawning supervisors and probing health...")
+        self._set_busy(title, subtext)
+        operation = getattr(self.backend, action)
 
         def worker():
-            ok, msg = start_harbor(progress_cb=lambda s: self.after(0, lambda: self.summary_sub.configure(text=s)))
-            self.after(500, self._clear_busy)
+            try:
+                result = operation(progress_cb=lambda value: self._post_ui(self.summary_sub.configure, text=value))
+                ok, message = result if isinstance(result, tuple) and len(result) == 2 else (False, "Invalid runtime action result.")
+            except Exception as exc:
+                ok, message = False, str(exc) or "Runtime action failed."
+            if self._poll_active:
+                self.after(0, self._finish_action, bool(ok), str(message))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_start(self):
+        self._run_lifecycle_action("start", "Starting Harbor...", "Starting runtime and probing health...")
 
     def _handle_restart(self):
-        if self.is_busy:
-            return
-        self._set_busy("Restarting Harbor...", "Stopping existing runtime...")
-
-        def worker():
-            ok, msg = restart_harbor(progress_cb=lambda s: self.after(0, lambda: self.summary_sub.configure(text=s)))
-            self.after(500, self._clear_busy)
-
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_lifecycle_action("restart", "Restarting Harbor...", "Restarting the owned runtime...")
 
     def _handle_stop(self):
-        if self.is_busy:
-            return
-        self._set_busy("Stopping Harbor...", "Stopping supervisors and child process tree...")
-
-        def worker():
-            ok, msg = stop_harbor(progress_cb=lambda s: self.after(0, lambda: self.summary_sub.configure(text=s)))
-            self.after(500, self._clear_busy)
-
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_lifecycle_action("stop", "Stopping Harbor...", "Stopping the owned runtime...")
 
     # -----------------------------------------------------------------------
     # Secondary Dialogs
@@ -520,14 +564,14 @@ class HarborLauncherApp(ctk.CTk):
 
     def _open_logs(self):
         if self.log_dialog is None or not self.log_dialog.winfo_exists():
-            self.log_dialog = LogDialog(self)
+            self.log_dialog = LogDialog(self, backend=self.backend)
         else:
             self.log_dialog.lift()
             self.log_dialog.focus()
 
     def _open_diagnostics(self):
         if self.diag_dialog is None or not self.diag_dialog.winfo_exists():
-            self.diag_dialog = DiagnosticsDialog(self)
+            self.diag_dialog = DiagnosticsDialog(self, backend=self.backend)
         else:
             self.diag_dialog.lift()
             self.diag_dialog.focus()
@@ -543,7 +587,12 @@ class HarborLauncherApp(ctk.CTk):
 
     def _maybe_open_setup(self):
         try:
-            status = first_run_status(credential_store=self._get_settings_controller().store if self._get_settings_controller() else None)
+            controller = self._get_settings_controller()
+            kwargs = {"credential_store": controller.store if controller else None}
+            if self._is_packaged():
+                # Packaged setup must never inspect the legacy production tree.
+                kwargs["legacy_detector"] = lambda: False
+            status = first_run_status(**kwargs)
         except Exception:
             status = None
         if status is not None and status.required:
@@ -597,8 +646,86 @@ class HarborLauncherApp(ctk.CTk):
     def _tray_stop(self):
         self.after(0, self._handle_stop)
 
-    def _tray_exit(self):
-        """Exit launcher application only (Harbor runtime continues running)."""
+    def _finish_packaged_exit(self, result, error=None):
+        if error is not None or result is False:
+            self._exit_in_progress = False
+            try:
+                self.deiconify()
+                self.lift()
+                self.summary_title.configure(text="Shutdown failed", text_color=COLOR_STATUS_FAILED)
+                self.summary_sub.configure(text=str(error or "Owned runtime did not shut down."))
+            except Exception:
+                pass
+            return
         self._poll_active = False
         self.tray.stop()
         self.after(0, self.destroy)
+
+    def _tray_exit(self):
+        """Handle exit request from system tray icon."""
+        self.after(0, self._request_exit)
+
+    def _request_exit(self, *, confirm_dialog_factory=None):
+        """Initiate exit flow guarded by authoritative active-job inspection."""
+        if self.__dict__.get("_exit_in_progress", False) or self.__dict__.get("_exit_prompt_open", False):
+            return
+
+        from launcher.exit_guard import get_authoritative_active_jobs, ExitConfirmationDialog
+
+        jobs_dir = None
+        if hasattr(self, "backend") and hasattr(self.backend, "client"):
+            from harbor_platform.paths import PlatformPaths
+            try:
+                jobs_dir = Path(PlatformPaths().jobs_dir())
+            except Exception:
+                pass
+        if jobs_dir is None:
+            from control_plane import JOBS_DIR
+            jobs_dir = JOBS_DIR
+
+        activity = get_authoritative_active_jobs(jobs_dir)
+        if activity.get("running_count", 0) > 0 or activity.get("uncertain_count", 0) > 0:
+            self._exit_prompt_open = True
+
+            def on_confirm():
+                self._exit_prompt_open = False
+                self._proceed_with_exit()
+
+            def on_cancel():
+                self._exit_prompt_open = False
+
+            dialog_cls = confirm_dialog_factory or ExitConfirmationDialog
+            dialog_cls(
+                master=self,
+                running_count=activity["running_count"],
+                running_harnesses=activity["running_harnesses"],
+                queued_count=activity["queued_count"],
+                uncertain_count=activity["uncertain_count"],
+                on_confirm=on_confirm,
+                on_cancel=on_cancel,
+            )
+            return
+
+        self._proceed_with_exit()
+
+    def _proceed_with_exit(self):
+        """Execute shutdown sequence once exit is confirmed or known safe."""
+
+        if not self._is_packaged():
+            self._poll_active = False
+            self.tray.stop()
+            self.after(0, self.destroy)
+            return
+        if getattr(self, "_exit_in_progress", False):
+            return
+        self._exit_in_progress = True
+        self._poll_active = False
+
+        def worker():
+            try:
+                result = self.backend.close()
+                self.after(0, self._finish_packaged_exit, result, None)
+            except Exception as exc:
+                self.after(0, self._finish_packaged_exit, False, str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
