@@ -45,5 +45,3 @@ if __name__ == "__main__":
         # Imported libraries may put secrets in exception reprs.
         print("Harbor runtime failed. Check configuration and component status.", file=sys.stderr)
         raise SystemExit(1) from None
-
-\n

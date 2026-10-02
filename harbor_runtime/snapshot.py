@@ -33,5 +33,3 @@ def harness_snapshot(jobs_dir, telemetry_rows=(), *, connected=True, now=None):
         row["detail"] = summary + " — " + (f"Running {len(ids)}: " + ", ".join(ids) if ids else state.title())
         rows.append(row)
     return rows
-
-\n

@@ -26,5 +26,3 @@ def probe_loopback(url, timeout=0.5):
         return False, exc.code, (time.monotonic() - started) * 1000
     except (OSError, ValueError):
         return False, 0, (time.monotonic() - started) * 1000
-
-\n

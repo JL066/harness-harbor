@@ -40,5 +40,3 @@ def read_line(stream, timeout=15, limit=262144):
     if len(line) > limit or not line.endswith(b"\n"):
         raise ValueError("Invalid MCP handshake response")
     return line
-
-\n

@@ -89,5 +89,3 @@ def serve(paths, settings, found, source=None, output=None):
             sys.stdout = original_stdout
             if runtime._lock_file:
                 runtime._lock_file.close()
-
-\n

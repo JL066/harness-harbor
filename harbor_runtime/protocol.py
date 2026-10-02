@@ -70,5 +70,3 @@ def encode(response):
         data = json.dumps({"v": 1, "id": response.get("id"), "ok": False,
                            "error": {"code": "output_limit", "message": "Response exceeds protocol limit."}}).encode()
     return data + b"\n"
-
-\n
