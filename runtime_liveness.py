@@ -26,8 +26,8 @@ def probe_pid_liveness(pid: int) -> ProcessLiveness:
 
     if sys.platform == "win32":
         try:
-            kernel = ctypes.windll.kernel32
-            kernel.SetLastError(0)
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            ctypes.set_last_error(0)
             handle = kernel.OpenProcess(0x1000 | 0x00100000, False, pid)
             if not handle:
                 error = ctypes.get_last_error() or kernel.GetLastError()

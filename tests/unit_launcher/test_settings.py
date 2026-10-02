@@ -37,7 +37,7 @@ def _isolate_settings(monkeypatch):
     next test and mask regressions. The reload call at the end guarantees
     the settings cache is recomputed against the cleared env on each test.
     """
-    saved = {k: v for k, v in os.environ.items() if k.startswith("HARBOR_") or k == "APPDATA"}
+    saved = {k: v for k, v in os.environ.items() if k == "APPDATA"}
     for k in list(os.environ):
         if k.startswith("HARBOR_"):
             monkeypatch.delenv(k, raising=False)

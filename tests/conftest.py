@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 import pytest
@@ -6,6 +7,17 @@ import pytest
 root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
+
+
+@pytest.fixture(autouse=True)
+def isolate_test_environment(monkeypatch):
+    """Prevent inherited HARBOR_* state from redirecting tests into the running Harbor."""
+    for key in list(os.environ.keys()):
+        if key.startswith("HARBOR_"):
+            monkeypatch.delenv(key, raising=False)
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.set_last_error(0)
 
 
 def pytest_addoption(parser):

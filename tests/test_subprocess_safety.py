@@ -442,7 +442,11 @@ class EventLoopResponsivenessTests(unittest.TestCase):
 
     def test_batch7_subprocess_callsites_stay_inside_explicit_lifecycle_helpers(self) -> None:
         allowed = {
-            "control_plane.py": {"_escalate_terminate", "run_safe_subprocess"},
+            "control_plane.py": {
+                "_escalate_terminate",
+                "spawn_runtime_child",
+                "run_safe_subprocess",
+            },
             "codex_job_worker.py": {
                 "run_codex_with_lifecycle", "run_minimax_with_lifecycle",
                 "run_agy_with_lifecycle",
@@ -506,6 +510,103 @@ class HardTerminationReportingTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("terminated", result["error"].lower())
+
+
+class SpawnRuntimeChildLifecycleTests(unittest.TestCase):
+    def test_legacy_delegation_calls_popen_directly(self) -> None:
+        """In default/legacy runtime mode, spawn_runtime_child delegates to Popen."""
+        mock_proc = mock.Mock()
+        with mock.patch.dict(os.environ, {"HARBOR_RUNTIME_MODE": ""}, clear=False), \
+             mock.patch.object(control_plane.subprocess, "Popen", return_value=mock_proc) as mock_popen:
+            result = control_plane.spawn_runtime_child(
+                ["echo", "hi"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd="/test",
+                env={"KEY": "VAL"},
+            )
+            self.assertIs(result, mock_proc)
+            mock_popen.assert_called_once_with(
+                ["echo", "hi"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd="/test",
+                env={"KEY": "VAL"},
+            )
+
+    def test_packaged_delegation_and_environment_sanitization(self) -> None:
+        """In packaged mode, spawn_runtime_child redacts sensitive credentials and calls spawn_owned."""
+        mock_child = mock.Mock()
+        mock_spawn_owned = mock.Mock(return_value=mock_child)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HARBOR_RUNTIME_MODE": "packaged",
+                "TUNNEL_RUNTIME_KEY": "secret-tunnel-key",
+                control_plane.CUSTOM_CODEX_ENV_KEY: "secret-custom-key",
+                "SAFE_VAR": "safe-value",
+            },
+            clear=False,
+        ), mock.patch("harbor_platform.process.spawn_owned", mock_spawn_owned):
+            # 1. Without explicit env: redacts both TUNNEL_RUNTIME_KEY and CUSTOM_CODEX_ENV_KEY
+            res1 = control_plane.spawn_runtime_child(["cli-cmd"], stdin=subprocess.DEVNULL)
+            self.assertIs(res1, mock_child)
+            call_env1 = mock_spawn_owned.call_args.kwargs["env"]
+            self.assertNotIn("TUNNEL_RUNTIME_KEY", call_env1)
+            self.assertNotIn(control_plane.CUSTOM_CODEX_ENV_KEY, call_env1)
+            self.assertEqual(call_env1.get("SAFE_VAR"), "safe-value")
+
+            # 2. With explicit env: preserves caller's custom codex key, but still redacts tunnel key
+            mock_spawn_owned.reset_mock()
+            explicit_env = {
+                "TUNNEL_RUNTIME_KEY": "leaked-tunnel",
+                control_plane.CUSTOM_CODEX_ENV_KEY: "intended-custom-key",
+                "CUSTOM_FLAG": "1",
+            }
+            res2 = control_plane.spawn_runtime_child(["codex-cmd"], env=explicit_env)
+            self.assertIs(res2, mock_child)
+            call_env2 = mock_spawn_owned.call_args.kwargs["env"]
+            self.assertNotIn("TUNNEL_RUNTIME_KEY", call_env2)
+            self.assertEqual(call_env2.get(control_plane.CUSTOM_CODEX_ENV_KEY), "intended-custom-key")
+            self.assertEqual(call_env2.get("CUSTOM_FLAG"), "1")
+
+    def test_safe_subprocess_passes_stdio_isolation_to_spawn_runtime_child(self) -> None:
+        """run_safe_subprocess must pass stdin=DEVNULL (or PIPE if input provided) and PIPE for stdout/stderr."""
+        seen_kwargs = []
+        def fake_spawn(argv, **kwargs):
+            seen_kwargs.append(kwargs)
+            fake_proc = mock.Mock()
+            fake_proc.returncode = 0
+            fake_proc.stdout = io.BytesIO(b"out")
+            fake_proc.stderr = io.BytesIO(b"")
+            fake_proc.stdin = io.BytesIO() if kwargs.get("stdin") == subprocess.PIPE else None
+            fake_proc.poll.return_value = 0
+            fake_proc.wait.return_value = 0
+            return fake_proc
+
+        with mock.patch.object(control_plane, "spawn_runtime_child", side_effect=fake_spawn):
+            # Without input -> stdin=DEVNULL
+            control_plane.run_safe_subprocess(["git", "status"], timeout=1.0)
+            self.assertEqual(seen_kwargs[-1]["stdin"], subprocess.DEVNULL)
+            self.assertEqual(seen_kwargs[-1]["stdout"], subprocess.PIPE)
+            self.assertEqual(seen_kwargs[-1]["stderr"], subprocess.PIPE)
+
+            # With input -> stdin=PIPE
+            control_plane.run_safe_subprocess(["git", "apply"], input=b"diff", timeout=1.0)
+            self.assertEqual(seen_kwargs[-1]["stdin"], subprocess.PIPE)
+            self.assertEqual(seen_kwargs[-1]["stdout"], subprocess.PIPE)
+            self.assertEqual(seen_kwargs[-1]["stderr"], subprocess.PIPE)
+
+    def test_spawn_runtime_child_escalates_termination_on_packaged_failure(self) -> None:
+        """When in packaged mode, escalate_terminate invokes terminate_tree and fails closed if unstopped."""
+        mock_proc = mock.Mock()
+        with mock.patch.dict(os.environ, {"HARBOR_RUNTIME_MODE": "packaged"}, clear=False), \
+             mock.patch("harbor_platform.process.terminate_tree", return_value=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                control_plane._escalate_terminate(mock_proc, ["hanging-cmd"])
+            self.assertIn("Owned process tree could not be stopped", str(ctx.exception))
 
 
 if __name__ == "__main__":

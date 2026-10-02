@@ -1,0 +1,5 @@
+-r requirements-runtime.txt
+customtkinter==6.0.0
+pystray==0.19.5
+pillow==12.3.0
+pytest==9.1.1
