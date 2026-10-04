@@ -20,7 +20,7 @@ from build_exe import generate_version_info_file
 
 
 def test_package_version_matches_runtime_version():
-    assert launcher_version == RUNTIME_VERSION == "1.1.3"
+    assert launcher_version == RUNTIME_VERSION == "1.1.4"
 
 
 def test_derive_build_identity_keeps_public_version_simple_and_builds_distinct():

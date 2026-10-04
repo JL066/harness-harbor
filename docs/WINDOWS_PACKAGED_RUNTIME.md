@@ -1,6 +1,6 @@
 # Windows packaged runtime
 
-Harness Harbor v1.1.3 uses a Windows Launcher and a separate runtime sidecar.
+Harness Harbor v1.1.4 uses a Windows Launcher and a separate runtime sidecar.
 The Launcher starts the sidecar through `run_runtime.py` and communicates
 through the versioned JSON-lines bridge. The bundle contains both executables;
 the standalone Launcher executable is not a complete distribution.

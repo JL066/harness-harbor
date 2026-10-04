@@ -1,6 +1,6 @@
 # ChatGPT Harbor
 
-Current Windows release candidate: **v1.1.3**.
+Current Windows release candidate: **v1.1.4**.
 
 ChatGPT Harbor provides a secure, structured local control plane connecting ChatGPT to local development environments via the Model Context Protocol (MCP) and secure tunneling.
 

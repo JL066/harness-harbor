@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.4] - 2026-10-04
+
+### Fixed
+
+- Repaired Windows GitHub Actions by installing the test dependency set and running the complete pytest suite on Python 3.11 and 3.12.
+- Added subprocess lifecycle safety coverage and corrected the Win32 PID-liveness edge case exposed by complete CI collection.
+
 ## [1.1.3] - 2026-10-01
 
 ### Added

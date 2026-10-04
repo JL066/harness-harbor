@@ -654,7 +654,7 @@ python build_exe.py
 
 ## Core 与 Lighthouse Launcher
 
-此 Public RC 包含 Python Core 与 Lighthouse（独立 Windows 图形启动器）。Lighthouse 提供设置/向导界面、安全的 CredentialStore 集成、托管隧道配置与生命周期、启动/停止/重启控制、系统托盘、日志查看、诊断以及后台健康监测。其版本保持为 `1.1.3`；可通过 `run_launcher.py` 或 `run-launcher.ps1` 启动，并可通过 `build_exe.py` 或 `harbor_launcher.spec` 打包。Harbor/Lighthouse 图标及运行时打包资源位于 `launcher/assets/`。
+此 Public RC 包含 Python Core 与 Lighthouse（独立 Windows 图形启动器）。Lighthouse 提供设置/向导界面、安全的 CredentialStore 集成、托管隧道配置与生命周期、启动/停止/重启控制、系统托盘、日志查看、诊断以及后台健康监测。其版本保持为 `1.1.4`；可通过 `run_launcher.py` 或 `run-launcher.ps1` 启动，并可通过 `build_exe.py` 或 `harbor_launcher.spec` 打包。Harbor/Lighthouse 图标及运行时打包资源位于 `launcher/assets/`。
 
 向导仅持久化非敏感配置。隧道运行时密钥和自定义 provider 密钥存储于 Windows Credential Manager，仅传递给相关子进程环境变量；严禁明文回退。托管隧道设置采用操作者提供的通用 HTTPS 控制配置与本地路径，不捆绑私有端点或账户绑定。
 
