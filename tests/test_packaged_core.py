@@ -35,6 +35,7 @@ def test_frozen_worker_uses_sidecar_mode(monkeypatch, tmp_path):
     scheduler = daemon.HarborScheduler(jobs_dir=tmp_path)
     scheduler.spawn_worker(tmp_path / 'job-1', 'codex')
     assert spawn.call_args.args[0] == [sys.executable, 'worker', str(tmp_path / 'job-1')]
+    assert spawn.call_args.kwargs['owned'] is True
 
 
 def test_snapshot_reads_only_selected_queue(tmp_path):

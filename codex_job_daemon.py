@@ -205,6 +205,9 @@ def _clean_stale_workspace_lease_if_dead(lease_path: Path, jobs_dir: Path) -> bo
                         return True
                     except OSError:
                         return False
+                if isinstance(state, dict) and state.get("status") == "cancelling":
+                    # Only stop reconciliation may release this lease.
+                    return False
             except (OSError, ValueError):
                 pass
 
@@ -357,6 +360,8 @@ def _is_stale_dispatch_lock(lock_path: Path, job_dir: Path) -> bool:
     if state_path.is_file():
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(state, dict) and state.get("status") == "cancelling":
+                return False
             if isinstance(state, dict) and state.get("status") in {
                 "completed",
                 "failed",
@@ -562,6 +567,16 @@ def get_disk_active_job_ids(jobs_dir: Path = JOBS_DIR) -> dict[str, set[str]]:
         state_path = job_dir / "status.json"
         lock_path = job_dir / "worker.lock"
 
+        try:
+            state_for_stop = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state_for_stop = {}
+        if isinstance(state_for_stop, dict) and state_for_stop.get("status") == "cancelling":
+            harness = state_for_stop.get("harness", "codex")
+            if harness in active:
+                active[harness].add(job_dir.name)
+            continue
+
         is_active = False
         if lock_path.exists():
             worker_pid = get_worker_lock_pid(job_dir)
@@ -578,7 +593,9 @@ def get_disk_active_job_ids(jobs_dir: Path = JOBS_DIR) -> dict[str, set[str]]:
         elif state_path.is_file():
             try:
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-                if isinstance(state, dict) and state.get("status") == "running":
+                if isinstance(state, dict) and state.get("status") == "cancelling":
+                    is_active = True
+                elif isinstance(state, dict) and state.get("status") == "running":
                     native = state.get("native_process") or {}
                     if not isinstance(native, dict):
                         native = {}
@@ -623,6 +640,11 @@ def recover_abandoned_jobs(jobs_dir: Path, harness: str) -> list[str]:
             if not isinstance(state, dict) or state.get("harness", "codex") != harness:
                 continue
             if not queue_root_matches(state, jobs_dir):
+                continue
+            if state.get("status") == "cancelling":
+                from task_stop_control import reconcile
+                if reconcile(job_dir.name, jobs_dir):
+                    recovered.append(job_dir.name)
                 continue
             if state.get("status") not in {"queued", "running"} and not (job_dir / "worker.lock").exists():
                 continue
@@ -746,6 +768,18 @@ class HarborScheduler:
             for job_id, worker in list(workers.items()):
                 exit_code = worker.proc.poll()
                 if exit_code is not None:
+                    state_path = worker.job_dir / "status.json"
+                    try:
+                        current_state = json.loads(state_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        current_state = {}
+                    if current_state.get("status") == "cancelling":
+                        from task_stop_control import reconcile
+                        if not reconcile(job_id, self.jobs_dir):
+                            continue  # Owned descendants or uncertain observation retain lease and slot.
+                        finished.append((harness, worker.job_dir, exit_code))
+                        del workers[job_id]
+                        continue
                     if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
                         from harbor_platform.process import terminate_tree
                         if not terminate_tree(worker.proc):
@@ -812,8 +846,7 @@ class HarborScheduler:
             popen_kwargs["creationflags"] = _WIN_CREATION_FLAGS
         if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
             popen_kwargs["env"] = dict(os.environ)
-            return spawn_runtime_child(argv, **popen_kwargs)
-        return subprocess.Popen(argv, **popen_kwargs)
+        return spawn_runtime_child(argv, owned=True, **popen_kwargs)
 
     def tick(self) -> list[tuple[str, Path, int]]:
         """Run one scheduler cycle: reap, check available slots per harness, and dispatch queued jobs.
@@ -916,6 +949,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-

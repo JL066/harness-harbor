@@ -103,8 +103,88 @@ CODEX_TOTAL_TIMEOUT = MINIMAX_TOTAL_TIMEOUT  # same conservative harness-task bo
 
 
 def write_state(path: Path, state: dict) -> None:
-    state["updated_at"] = utc_now()
-    write_json(path, state)
+    from control_plane import _job_poll_lock
+    with _job_poll_lock(path.parent):
+        disk = load_state(path) if path.is_file() else {}
+        if disk.get("status") == "cancelled" and disk.get("stop"):
+            state["status"] = "cancelled"
+            state["stop"] = disk["stop"]
+            state["stop_ownership"] = disk.get("stop_ownership")
+            state["cancelled_at"] = disk.get("cancelled_at")
+        elif disk.get("status") == "cancelling":
+            state["stop"] = disk["stop"]
+            state["stop_ownership"] = disk.get("stop_ownership")
+            # The stop request won the durable ordering race. Preserve output
+            # and attempts, but do not publish a generic CLI failure/success.
+            if state.get("status") != "cancelling":
+                if state.get("status") in {"completed", "failed"}:
+                    state["stop"]["worker_result_observed_at"] = utc_now()
+                state["status"] = "cancelling"
+        state["updated_at"] = utc_now()
+        write_json(path, state)
+
+
+_ACTIVE_STATE_PATH: Path | None = None
+
+
+def _register_native(proc) -> None:
+    """Persist identity while the caller holds the job poll lock."""
+    if _ACTIVE_STATE_PATH is None:
+        return
+    from harbor_platform.process import process_identity
+    identity = getattr(proc, "_harbor_identity", None) or process_identity(proc.pid)
+    disk = load_state(_ACTIVE_STATE_PATH)
+    owner = disk.get("stop_ownership")
+    if not isinstance(owner, dict) or identity is None:
+        raise RuntimeError("Native process ownership could not be registered")
+    owner["native"] = identity
+    owner["native_exit_verified"] = False
+    disk["stop_ownership"] = owner
+    write_json(_ACTIVE_STATE_PATH, disk)
+
+
+def _spawn_native(command, **kwargs):
+    if _ACTIVE_STATE_PATH is None:
+        return spawn_runtime_child(command, **kwargs)
+    from control_plane import _job_poll_lock
+    with _job_poll_lock(_ACTIVE_STATE_PATH.parent):
+        proc = spawn_runtime_child(command, owned=True, **kwargs)
+        try:
+            _register_native(proc)
+        except BaseException:
+            from harbor_platform.process import terminate_tree
+            terminate_tree(proc)
+            raise
+        return proc
+
+
+def _stop_requested(proc) -> bool:
+    if _ACTIVE_STATE_PATH is None:
+        return False
+    from task_stop_control import request_native_stop
+    return request_native_stop(proc, _ACTIVE_STATE_PATH)
+
+
+def _owned_native_alive(proc) -> bool:
+    from harbor_platform.process import owned_tree_alive
+    return owned_tree_alive(proc)
+
+
+def _mark_native_exit(proc) -> None:
+    if _ACTIVE_STATE_PATH is None:
+        return
+    try:
+        if _owned_native_alive(proc):
+            return
+    except (OSError, ValueError):
+        return
+    from control_plane import _job_poll_lock
+    with _job_poll_lock(_ACTIVE_STATE_PATH.parent):
+        disk = load_state(_ACTIVE_STATE_PATH)
+        owner = disk.get("stop_ownership")
+        if isinstance(owner, dict) and isinstance(owner.get("native"), dict) and owner["native"].get("pid") == proc.pid:
+            owner["native_exit_verified"] = True
+            write_json(_ACTIVE_STATE_PATH, disk)
 
 
 def output_tail(value: object) -> str:
@@ -154,20 +234,31 @@ def run_codex_with_lifecycle(
             subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         )
 
-    proc = spawn_runtime_child(command, **popen_kwargs)
+    proc = _spawn_native(command, **popen_kwargs)
     stdout_reader = _BoundedStreamReader(proc.stdout)
     stderr_reader = _BoundedStreamReader(proc.stderr)
     stdout_reader.start()
     stderr_reader.start()
     timed_out = False
+    stop_requested = False
     try:
-        try:
-            proc.wait(timeout=total_timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _escalate_terminate(proc, list(command))
+        deadline = time.monotonic() + total_timeout
+        while proc.poll() is None or (stop_requested and _owned_native_alive(proc)):
+            if not stop_requested and _stop_requested(proc):
+                stop_requested = True
+            if stop_requested:
+                time.sleep(0.1)
+                continue
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _escalate_terminate(proc, list(command))
+                break
+            try:
+                proc.wait(timeout=min(0.2, max(0.01, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                pass
     finally:
-        if proc.poll() is None or os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
+        if not stop_requested and (proc.poll() is None or os.environ.get("HARBOR_RUNTIME_MODE") == "packaged"):
             _escalate_terminate(proc, list(command))
         stdout = stdout_reader.drain(timeout=0.5)
         stderr = stderr_reader.drain(timeout=0.5)
@@ -184,7 +275,8 @@ def run_codex_with_lifecycle(
         stdout=stdout,
         stderr=stderr,
     )
-    result.termination_reason = "hard_timeout" if timed_out else "self_exit"
+    result.termination_reason = "task_stop" if stop_requested else ("hard_timeout" if timed_out else "self_exit")
+    _mark_native_exit(proc)
     return result
 
 
@@ -444,7 +536,7 @@ def run_minimax_with_lifecycle(
         )
 
     try:
-        proc = spawn_runtime_child(command, **popen_kwargs)
+        proc = _spawn_native(command, **popen_kwargs)
     except (OSError, ValueError) as exc:
         return {
             "exit_code": -1,
@@ -489,14 +581,22 @@ def run_minimax_with_lifecycle(
     exit_code: int | None = None
     termination_reason = "hard_timeout"
     forced_exit = False
+    stop_requested = False
 
     try:
         while True:
             now = time.monotonic()
             exit_code = proc.poll()
-            if exit_code is not None:
-                termination_reason = "self_exit"
+            if exit_code is not None and (not stop_requested or not _owned_native_alive(proc)):
+                termination_reason = "task_stop" if stop_requested else "self_exit"
                 break
+
+            if not stop_requested and _stop_requested(proc):
+                stop_requested = True
+            if stop_requested:
+                termination_reason = "task_stop"
+                time.sleep(poll_interval)
+                continue
 
             if now >= deadline:
                 termination_reason = "hard_timeout"
@@ -547,7 +647,7 @@ def run_minimax_with_lifecycle(
         # Reap (idempotent) and drain remaining pipe bytes.
         try:
             was_running = proc.poll() is None
-            if was_running or os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
+            if not stop_requested and (was_running or os.environ.get("HARBOR_RUNTIME_MODE") == "packaged"):
                 _escalate_terminate(proc, list(command))
                 exit_code = proc.returncode
                 forced_exit = forced_exit or was_running
@@ -582,6 +682,7 @@ def run_minimax_with_lifecycle(
                 handle.close()
         except Exception:  # noqa: BLE001
             pass
+    _mark_native_exit(proc)
     return {
         "exit_code": exit_code,
         "stdout": stdout_text,
@@ -1135,7 +1236,7 @@ def run_agy_with_lifecycle(
         )
 
     try:
-        proc = spawn_runtime_child(command, **popen_kwargs)
+        proc = _spawn_native(command, **popen_kwargs)
     except (OSError, ValueError) as exc:
         return {
             "exit_code": -1,
@@ -1161,14 +1262,22 @@ def run_agy_with_lifecycle(
     exit_code: int | None = None
     termination_reason = "hard_timeout"
     forced_exit = False
+    stop_requested = False
 
     try:
         while True:
             now = time.monotonic()
             exit_code = proc.poll()
-            if exit_code is not None:
-                termination_reason = "self_exit"
+            if exit_code is not None and (not stop_requested or not _owned_native_alive(proc)):
+                termination_reason = "task_stop" if stop_requested else "self_exit"
                 break
+
+            if not stop_requested and _stop_requested(proc):
+                stop_requested = True
+            if stop_requested:
+                termination_reason = "task_stop"
+                time.sleep(poll_interval)
+                continue
 
             if now >= deadline:
                 termination_reason = "hard_timeout"
@@ -1218,7 +1327,7 @@ def run_agy_with_lifecycle(
     finally:
         try:
             was_running = proc.poll() is None
-            if was_running or os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
+            if not stop_requested and (was_running or os.environ.get("HARBOR_RUNTIME_MODE") == "packaged"):
                 _escalate_terminate(proc, list(command))
                 exit_code = proc.returncode
                 forced_exit = forced_exit or was_running
@@ -1242,6 +1351,7 @@ def run_agy_with_lifecycle(
                 handle.close()
         except Exception:  # noqa: BLE001
             pass
+    _mark_native_exit(proc)
     return {
         "exit_code": exit_code,
         "stdout": stdout_text,
@@ -1452,12 +1562,14 @@ def collect_minimax_result(
 
 
 def main(job_dir: Path) -> None:
+    global _ACTIVE_STATE_PATH
     state_path = job_dir / "status.json"
     state: dict = {}
     try:
         state = claim_job(job_dir)
         if state is None:
             return
+        _ACTIVE_STATE_PATH = state_path
 
         result_path = job_dir / "result.txt"
         harness = state.get("harness", "codex")
@@ -1480,6 +1592,8 @@ def main(job_dir: Path) -> None:
                 prompt_sha256=hashlib.sha256(prompt_bytes).hexdigest(),
             )
         write_state(state_path, state)
+        if load_state(state_path).get("status") == "cancelling":
+            return
 
         if harness == "minimax":
             lifecycle = run_minimax_with_lifecycle(command, result_path, prompt=state["prompt"])
@@ -1526,6 +1640,7 @@ def main(job_dir: Path) -> None:
             should_fallback = (
                 route_requested in ("official_then_codeflow", "official_then_custom")
                 and state.get("status") == "failed"
+                and load_state(state_path).get("status") != "cancelling"
                 and is_official_quota_exhausted(diagnostic)
                 and (bool(os.environ.get("CODEFLOW_API_KEY")) if route_requested == "official_then_codeflow" else bool(resolve_custom_codex_route(include_secret=True).get("ok")))
             )
@@ -1603,6 +1718,7 @@ def main(job_dir: Path) -> None:
         _ = existing_stderr
         _ = existing_stdout
     finally:
+        _ACTIVE_STATE_PATH = None
         try:
             release_job_lock(job_dir)
         except Exception:

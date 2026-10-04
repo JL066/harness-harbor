@@ -263,8 +263,12 @@ class RecoveredProcess:
         self.returncode = None
 
     def poll(self):
-        if process_identity(self.pid) != self.identity:
+        if not is_alive(self.pid):
             self.returncode = 0
+        else:
+            current = process_identity(self.pid)
+            if current is not None and current != self.identity:
+                self.returncode = 0
         return self.returncode
 
     def wait(self, timeout):

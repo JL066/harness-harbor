@@ -16,6 +16,7 @@ build/
 
 # Control-plane runtime state
 .control/
+.local/
 *.lock
 *.pid
 poll_meta.json

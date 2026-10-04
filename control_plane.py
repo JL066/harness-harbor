@@ -243,9 +243,9 @@ def _make_safe_popen_kwargs(
     return kwargs
 
 
-def spawn_runtime_child(argv, **kwargs):
+def spawn_runtime_child(argv, *, owned: bool = False, **kwargs):
     """Packaged children have verified ownership; legacy retains its contract."""
-    if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
+    if owned or os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
         from harbor_platform.process import spawn_owned
         explicit_env = kwargs.get("env")
         child_env = dict(os.environ if explicit_env is None else explicit_env)
@@ -275,7 +275,7 @@ def _escalate_terminate(proc: subprocess.Popen, argv: list[str]) -> None:
     """
     if proc is None:
         return
-    if os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
+    if getattr(proc, "_harbor_identity", None) or getattr(proc, "_harbor_pgid", None) or os.environ.get("HARBOR_RUNTIME_MODE") == "packaged":
         from harbor_platform.process import terminate_tree
         if not terminate_tree(proc):
             raise RuntimeError("Owned process tree could not be stopped")
@@ -2671,6 +2671,18 @@ def cancel_task(job_id: str, jobs_dir: Path | None = None) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def task_stop_preview(job_id: str, jobs_dir: Path | None = None) -> dict:
+    from task_stop_control import preview
+    return preview(job_id, jobs_dir or JOBS_DIR)
+
+
+def task_stop(job_id: str, mode: Literal["graceful", "force"] = "graceful",
+              ownership_fingerprint: str | None = None, reason: str | None = None,
+              jobs_dir: Path | None = None) -> dict:
+    from task_stop_control import stop
+    return stop(job_id, jobs_dir or JOBS_DIR, mode, ownership_fingerprint, reason)
+
+
 def is_effective_openai_provider(route: str | None = None, config_path: Path | None = None) -> bool:
     """Return True if the effective Codex route resolves to OpenAI."""
     effective_route = route or "current"
@@ -2842,12 +2854,23 @@ def claim_job(job_dir: Path) -> dict | None:
             handle.write(f"{os.getpid()} {utc_now()}\n")
     except FileExistsError:
         return None
-    state = read_json_object(job_dir / "status.json")
-    if state.get("status") != "queued":
-        return None
-    state.update(status="running", started_at=utc_now(), updated_at=utc_now())
-    write_json(job_dir / "status.json", state)
-    return state
+    with _job_poll_lock(job_dir):
+        state = read_json_object(job_dir / "status.json")
+        if state.get("status") != "queued":
+            return None
+        from harbor_platform.process import process_identity
+        identity = process_identity(os.getpid())
+        state["stop_ownership"] = {
+            "job_id": state.get("job_id", job_dir.name),
+            "harness": state.get("harness", "codex"),
+            "queue_root": str(job_dir.parent.resolve()),
+            "generation": uuid.uuid4().hex,
+            "worker": identity,
+            "native": None,
+        }
+        state.update(status="running", started_at=utc_now(), updated_at=utc_now())
+        write_json(job_dir / "status.json", state)
+        return state
 
 
 @contextmanager

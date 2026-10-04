@@ -41,6 +41,8 @@ from control_plane import (
     resolve_project,
     run_safe_subprocess,
     start_task,
+    task_stop_preview as control_task_stop_preview,
+    task_stop as control_task_stop,
     resolve_codex_model_and_effort,
 )
 from host_diagnostics import (
@@ -747,6 +749,19 @@ def task_poll(job_id: str, immediate: bool = False) -> dict:
 def task_cancel(job_id: str) -> dict:
     """Cancel only an unclaimed queued task; running tasks are intentionally not killed."""
     return cancel_task(job_id, jobs_dir=JOBS_DIR)
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def task_stop_preview(job_id: str) -> dict:
+    """Read-only job inspection. Accepts only job_id, returns the verified owned process tree and stop eligibility; never terminates anything."""
+    return control_task_stop_preview(job_id, jobs_dir=JOBS_DIR)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
+def task_stop(job_id: str, mode: Literal["graceful", "force"] = "graceful",
+              ownership_fingerprint: str | None = None, reason: str | None = None) -> dict:
+    """Mutate one job lifecycle. Graceful enters cancelling; force requires timeout and a matching fresh ownership fingerprint. Never accepts arbitrary PIDs, runs Git cleanup, or kills foreign/daemon processes."""
+    return control_task_stop(job_id, mode, ownership_fingerprint, reason, jobs_dir=JOBS_DIR)
 
 
 @mcp.tool()

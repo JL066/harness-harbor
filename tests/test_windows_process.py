@@ -3,12 +3,37 @@ import unittest
 from unittest.mock import Mock, patch
 import pytest
 
-from harbor_platform import windows_process
+from harbor_platform import process, windows_process
 
 pytestmark = pytest.mark.windows_ci
 
 
 class WindowsOwnershipTests(unittest.TestCase):
+    def test_recovered_process_observes_exit_with_readable_identity(self):
+        identity = {"pid": 123, "started_at": "10", "job_name": "fixture"}
+        recovered = process.RecoveredProcess(identity)
+        with patch.object(process, "is_alive", return_value=False), patch.object(
+            process, "process_identity", return_value=identity
+        ) as identify:
+            self.assertEqual(recovered.poll(), 0)
+        identify.assert_not_called()
+
+    def test_recovered_process_observation_failure_stays_alive(self):
+        identity = {"pid": 123, "started_at": "10", "job_name": "fixture"}
+        recovered = process.RecoveredProcess(identity)
+        with patch.object(process, "is_alive", return_value=True), patch.object(
+            process, "process_identity", return_value=None
+        ):
+            self.assertIsNone(recovered.poll())
+
+    def test_recovered_process_identity_mismatch_is_not_owned(self):
+        identity = {"pid": 123, "started_at": "10", "job_name": "fixture"}
+        recovered = process.RecoveredProcess(identity)
+        with patch.object(process, "is_alive", return_value=True), patch.object(
+            process, "process_identity", return_value={**identity, "started_at": "11"}
+        ):
+            self.assertEqual(recovered.poll(), 0)
+
     def test_existing_job_collision_never_terminates_foreign_job(self):
         kernel = Mock()
         kernel.CreateJobObjectW.return_value = 42
