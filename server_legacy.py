@@ -25,6 +25,7 @@ from control_plane import (
     git_branch_result,
     git_commit_result,
     git_diff_result,
+    git_init_result,
     git_log_result,
     git_ls_remote_result,
     git_push_dry_run_result,
@@ -830,6 +831,12 @@ async def git_add(repo: str, paths: list[str]) -> dict:
     Offloaded to a worker thread.
     """
     return await asyncio.to_thread(git_add_result, repo, paths)
+
+
+@mcp.tool()
+async def git_init(path: str, initial_branch: str = "main") -> dict:
+    """Initialize an existing authorized directory outside any Git repository."""
+    return await asyncio.to_thread(git_init_result, path, initial_branch)
 
 
 @mcp.tool()

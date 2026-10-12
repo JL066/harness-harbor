@@ -839,7 +839,7 @@ def file_append_result(path: str, content: str, create: bool = False, backup: bo
         return {"ok": False, "error": str(exc)}
 
 
-def _run_git(args: list[str], cwd: Path, timeout: int = 30) -> dict:
+def _run_git(args: list[str], cwd: Path, timeout: int = 30, *, isolate_repository: bool = False) -> dict:
     """Run a Git command via the safe subprocess helper.
 
     The command is executed with:
@@ -853,6 +853,13 @@ def _run_git(args: list[str], cwd: Path, timeout: int = 30) -> dict:
     """
     argv = _git_argv_with_no_pager(["git", *args])
     env = _git_noninteractive_env()
+    if isolate_repository:
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES",
+                    "GIT_TEMPLATE_DIR", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"):
+            env.pop(key, None)
+        for key in tuple(env):
+            if key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+                env.pop(key, None)
     try:
         completed = run_safe_subprocess(
             argv,
@@ -915,6 +922,36 @@ def git_status_result(repo: str) -> dict:
     if result.get("ok"):
         result["branch"] = result["stdout"].splitlines()[0] if result["stdout"] else ""
     return result
+
+
+def git_init_result(path: str, initial_branch: str = "main") -> dict:
+    """Initialize one existing, authorized directory outside any Git repository."""
+    operation = "git_init"
+    refused = {"ok": False, "operation": operation, "path": None, "repo_root": None,
+               "initial_branch": initial_branch, "state": "refused", "argv": []}
+    if (not isinstance(initial_branch, str) or
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9][A-Za-z0-9_-]*)*", initial_branch)):
+        return {**refused, "error": "initial_branch must be a safe branch name"}
+    try:
+        target = _resolve_existing_read_path(path)
+        refused["path"] = str(target)
+        if not target.is_dir():
+            raise ValueError(f"not a directory: {target}")
+        authorize_write(target)
+        # rev-parse also finds bare repositories, worktrees represented by a
+        # .git file, and repositories in any ancestor directory.
+        if any((ancestor / ".git").exists() for ancestor in (target, *target.parents)):
+            raise ValueError("target is already in a Git repository")
+        existing = _run_git(["rev-parse", "--git-dir"], target, isolate_repository=True)
+        if existing["ok"]:
+            raise ValueError("target is already in a Git repository")
+        argv = ["init", f"--initial-branch={initial_branch}", "--template="]
+        result = _run_git(argv, target, isolate_repository=True)
+        return {"operation": operation, "path": str(target), "repo_root": str(target),
+                "initial_branch": initial_branch,
+                "state": "initialized" if result["ok"] else "failed", **result}
+    except (OSError, ValueError) as exc:
+        return {**refused, "error": str(exc)}
 
 
 def git_diff_result(repo: str, staged: bool = False, paths: list[str] | None = None) -> dict:
