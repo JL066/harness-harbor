@@ -25,6 +25,7 @@ from control_plane import (
     git_branch_result,
     git_commit_result,
     git_diff_result,
+    git_fetch_result,
     git_init_result,
     git_log_result,
     git_ls_remote_result,
@@ -33,6 +34,8 @@ from control_plane import (
     git_rev_parse_result,
     git_status_result,
     git_worktree_list_result,
+    git_worktree_create_result,
+    git_worktree_remove_result,
     harness_telemetry_snapshot,
     harness_status as control_harness_status,
     harnesses,
@@ -837,6 +840,24 @@ async def git_add(repo: str, paths: list[str]) -> dict:
 async def git_init(path: str, initial_branch: str = "main") -> dict:
     """Initialize an existing authorized directory outside any Git repository."""
     return await asyncio.to_thread(git_init_result, path, initial_branch)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+async def git_fetch(repo: str, remote: str = "origin") -> dict:
+    """Fetch a configured HTTPS remote. May update objects, tracking refs, tags and FETCH_HEAD."""
+    return await asyncio.to_thread(git_fetch_result, repo, remote)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+async def git_worktree_create(repo: str, path: str, branch: str, commit: str) -> dict:
+    """Create one local branch and linked worktree from an exact full commit SHA."""
+    return await asyncio.to_thread(git_worktree_create_result, repo, path, branch, commit)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
+async def git_worktree_remove(repo: str, path: str) -> dict:
+    """Remove one clean, unlocked registered linked worktree; retain its branch."""
+    return await asyncio.to_thread(git_worktree_remove_result, repo, path)
 
 
 @mcp.tool()

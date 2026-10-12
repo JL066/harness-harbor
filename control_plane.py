@@ -1216,6 +1216,203 @@ def _resolve_git_delivery_source(root: Path, src_ref: str) -> tuple[str, dict]:
     return object_id.lower(), result
 
 
+def _resolve_authorized_git_repo(repo: str) -> Path:
+    root = resolve_repo(repo)
+    authorize_write(root)
+    return root
+
+
+def _git_remote_tracking_refs(root: Path, remote: str) -> dict[str, str]:
+    result = _git_delivery_command(
+        ["for-each-ref", "--format=%(refname) %(objectname)", f"refs/remotes/{remote}/"], root
+    )
+    if not result["ok"] or result["truncated"]:
+        raise _GitDeliveryError("remote-tracking refs could not be inspected", result)
+    refs = {}
+    for line in result["stdout"].splitlines():
+        name, sep, oid = line.partition(" ")
+        if not sep or not _GIT_COMMIT_SHA_RE.fullmatch(oid):
+            raise ValueError("remote-tracking ref summary was malformed")
+        refs[name] = oid.lower()
+    return refs
+
+
+def git_fetch_result(repo: str, remote: str = "origin") -> dict:
+    """Fetch one configured HTTPS remote without pruning or changing checkout."""
+    operation = "git_fetch"
+    base = {"ok": False, "operation": operation, "state": "refused", "argv": [],
+            "repo_root": None, "remote": remote, "before_remote_tracking": None,
+            "after_remote_tracking": None, "mutation": False}
+    try:
+        root = _resolve_authorized_git_repo(repo)
+        base["repo_root"] = str(root)
+        remote = _validate_git_delivery_remote_name(remote)
+        if ".." in remote or remote.endswith(".lock"):
+            raise ValueError("remote must be an existing simple configured remote name")
+        base["remote"] = remote
+        url_check = _git_delivery_command(["remote", "get-url", "--all", remote], root)
+        if not url_check["ok"]:
+            raise _GitDeliveryError("configured fetch remote could not be resolved", url_check)
+        urls = url_check["stdout"].splitlines()
+        if len(urls) != 1:
+            raise ValueError("configured fetch remote must have exactly one URL")
+        _validate_git_delivery_https_url(urls[0])
+        before = _git_remote_tracking_refs(root, remote)
+        base["before_remote_tracking"] = before
+        command = _git_delivery_command(["fetch", "--no-recurse-submodules", "--no-prune", "--", remote], root)
+        try:
+            after = _git_remote_tracking_refs(root, remote)
+        except (OSError, ValueError, _GitDeliveryError):
+            after = None
+        return {**base, **command, "state": "fetched" if command["ok"] else "failed",
+                "after_remote_tracking": after,
+                "mutation": "objects, FETCH_HEAD, tags and remote-tracking refs may change"}
+    except _GitDeliveryError as exc:
+        return {**base, "error": _redact_git_delivery_text(str(exc)),
+                "diagnostic": exc.result}
+    except (OSError, ValueError) as exc:
+        return {**base, "error": _redact_git_delivery_text(str(exc))}
+
+
+_GIT_WORKTREE_BRANCH_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9][A-Za-z0-9_-]*)*$"
+)
+
+
+def _validate_git_worktree_branch(branch: str) -> str:
+    if (not isinstance(branch, str) or len(branch) > 240 or
+            not _GIT_WORKTREE_BRANCH_RE.fullmatch(branch) or
+            branch.startswith("refs/") or any(part.endswith(".lock") for part in branch.split("/"))):
+        raise ValueError("branch must be a safe local branch name")
+    return branch
+
+
+def _git_worktree_entries(root: Path) -> list[dict[str, Any]]:
+    result = _git_delivery_command(["worktree", "list", "--porcelain"], root)
+    if not result["ok"] or result["truncated"]:
+        raise _GitDeliveryError("worktree registration could not be inspected", result)
+    entries: list[dict[str, Any]] = []
+    for block in result["stdout"].strip().split("\n\n"):
+        if not block:
+            continue
+        entry: dict[str, Any] = {}
+        for line in block.splitlines():
+            key, _, value = line.partition(" ")
+            entry[key] = value if value else True
+        if not isinstance(entry.get("worktree"), str):
+            raise ValueError("worktree registration was malformed")
+        entries.append(entry)
+    return entries
+
+
+def _same_worktree_path(a: str | Path, b: str | Path) -> bool:
+    return os.path.normcase(str(Path(a).resolve(strict=False))) == os.path.normcase(str(Path(b).resolve(strict=False)))
+
+
+def _validate_git_worktree_path(value: str) -> Path:
+    if not isinstance(value, str) or value.startswith(("//", "\\\\")):
+        raise ValueError("UNC and Windows device paths are not allowed")
+    windows = PureWindowsPath(value)
+    if ".." in windows.parts or (windows.drive and not windows.is_absolute()):
+        raise ValueError("worktree path must not contain traversal or a drive-relative path")
+    return _validate_user_path(value)
+
+
+def git_worktree_create_result(repo: str, path: str, branch: str, commit: str) -> dict:
+    operation = "git_worktree_create"
+    base = {"ok": False, "operation": operation, "state": "refused", "argv": [],
+            "repo_root": None, "worktree_path": None, "branch": branch, "commit": commit}
+    base["mutation"] = False
+    try:
+        root = _resolve_authorized_git_repo(repo)
+        base["repo_root"] = str(root)
+        branch = _validate_git_worktree_branch(branch)
+        if not isinstance(commit, str) or not _GIT_COMMIT_SHA_RE.fullmatch(commit):
+            raise ValueError("commit must be an exact full 40-hex commit SHA")
+        commit = commit.lower()
+        base["commit"] = commit
+        _validate_git_worktree_path(path)
+        target = _resolve_write_target(path)
+        base["worktree_path"] = str(target)
+        authorize_write(target.parent)
+        authorize_write(target)
+        if target.exists() or target.is_symlink():
+            raise ValueError("worktree target already exists")
+        oid = _git_delivery_command(["cat-file", "-t", commit], root)
+        if not oid["ok"] or oid["stdout"].strip() != "commit":
+            raise ValueError("commit object does not exist locally or is not a commit")
+        existing = _git_delivery_command(["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], root)
+        if existing.get("exit_code") == 0:
+            raise ValueError("local branch already exists")
+        if existing.get("exit_code") != 1:
+            raise _GitDeliveryError("local branch existence could not be checked", existing)
+        base["state"] = "reconciliation_required"
+        base["mutation"] = "unknown; inspect branch and worktree registration"
+        command = _git_delivery_command(["worktree", "add", "-b", branch, "--", str(target), commit], root)
+        entries = _git_worktree_entries(root)
+        registered = next((e for e in entries if _same_worktree_path(e["worktree"], target)), None)
+        branch_after = _git_delivery_command(["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], root)
+        verified = bool(command["ok"] and registered and registered.get("HEAD") == commit and
+                        registered.get("branch") == f"refs/heads/{branch}" and target.is_dir())
+        return {**base, **command, "ok": verified,
+                "state": "created" if verified else "reconciliation_required",
+                "registered": registered, "branch_exists": branch_after.get("exit_code") == 0,
+                "mutation": bool(registered or branch_after.get("exit_code") == 0 or target.exists())}
+    except _GitDeliveryError as exc:
+        return {**base, "error": _redact_git_delivery_text(str(exc)), "diagnostic": exc.result}
+    except (OSError, ValueError) as exc:
+        return {**base, "error": _redact_git_delivery_text(str(exc))}
+
+
+def git_worktree_remove_result(repo: str, path: str) -> dict:
+    operation = "git_worktree_remove"
+    base = {"ok": False, "operation": operation, "state": "refused", "argv": [],
+            "repo_root": None, "worktree_path": None, "before_registration": None,
+            "after_registration": None, "mutation": False}
+    try:
+        root = _resolve_authorized_git_repo(repo)
+        base["repo_root"] = str(root)
+        target = _validate_git_worktree_path(path)
+        base["worktree_path"] = str(target)
+        authorize_write(target)
+        entries = _git_worktree_entries(root)
+        if not entries:
+            raise ValueError("repository has no registered worktrees")
+        registered = next((e for e in entries if _same_worktree_path(e["worktree"], target)), None)
+        if registered is None:
+            raise ValueError("path is not a registered linked worktree")
+        base["before_registration"] = registered
+        if registered is entries[0]:
+            raise ValueError("primary worktree cannot be removed")
+        if "locked" in registered:
+            raise ValueError("locked worktree cannot be removed")
+        if not target.is_dir():
+            raise ValueError("registered worktree directory is missing")
+        status = _git_delivery_command(
+            ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"], target
+        )
+        if not status["ok"] or status["truncated"]:
+            raise _GitDeliveryError("worktree status could not be inspected", status)
+        if status["stdout"]:
+            raise ValueError("worktree is dirty")
+        base["state"] = "reconciliation_required"
+        base["mutation"] = "unknown; inspect worktree registration and path"
+        command = _git_delivery_command(["worktree", "remove", "--", str(target)], root)
+        after = _git_worktree_entries(root)
+        still_registered = next((e for e in after if _same_worktree_path(e["worktree"], target)), None)
+        verified = bool(command["ok"] and still_registered is None and not target.exists())
+        return {**base, **command, "ok": verified,
+                "state": "removed" if verified else "reconciliation_required",
+                "after_registration": still_registered,
+                "branch": str(registered.get("branch", "")).removeprefix("refs/heads/"),
+                "head": registered.get("HEAD"),
+                "mutation": still_registered is None or not target.exists()}
+    except _GitDeliveryError as exc:
+        return {**base, "error": _redact_git_delivery_text(str(exc)), "diagnostic": exc.result}
+    except (OSError, ValueError) as exc:
+        return {**base, "error": _redact_git_delivery_text(str(exc))}
+
+
 def git_ls_remote_result(repo: str, remote: str, ref: str) -> dict:
     """Read one configured remote branch ref from the normal host Git context."""
     operation = "git_ls_remote"
