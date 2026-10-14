@@ -209,6 +209,48 @@ class TestGitFetch(GitControlPlaneTests):
         self.assertNotIn("https://user:", rendered)
         self.assertNotIn("fetch", result.get("argv", []))
 
+    @pytest.mark.parametrize(
+        "unsafe_refspec",
+        [
+            "+refs/heads/*:refs/heads/*",
+            "+refs/heads/*:refs/tags/*",
+            "+refs/heads/*:refs/remotes/other/*",
+            "+refs/heads/*:refs/remotes/origin/../heads/*",
+            "+refs/heads/*:refs/remotes/origin//main",
+            "refs/heads/*",
+            "+refs/tags/*:refs/remotes/origin/*",
+            "+refs/heads/*:refs/remotes/origin/main",
+            "+refs/heads/main:refs/remotes/origin/*",
+            "+refs/heads/main:refs/remotes/origin/main.lock",
+            "+refs/heads/main:refs/remotes/origin/main;bad",
+        ],
+    )
+    def test_fetch_refuses_unsafe_configured_refspecs(self, unsafe_refspec: str) -> None:
+        self._git(self.repo, "remote", "add", "origin", "https://example.invalid/repo.git")
+        self._git(self.repo, "config", "remote.origin.fetch", unsafe_refspec)
+        result = control_plane.git_fetch_result(str(self.repo), "origin")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual("refused", result["state"])
+        self.assertNotIn("fetch", result.get("argv", []))
+
+    def test_fetch_refuses_when_no_fetch_refspec_configured(self) -> None:
+        self._git(self.repo, "remote", "add", "origin", "https://example.invalid/repo.git")
+        self._git(self.repo, "config", "--unset-all", "remote.origin.fetch")
+        result = control_plane.git_fetch_result(str(self.repo), "origin")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual("refused", result["state"])
+        self.assertNotIn("fetch", result.get("argv", []))
+
+    def test_fetch_refuses_when_any_one_of_multiple_refspecs_is_unsafe(self) -> None:
+        self._git(self.repo, "remote", "add", "origin", "https://example.invalid/repo.git")
+        # Git remote add sets +refs/heads/*:refs/remotes/origin/*
+        # Add an unsafe second refspec:
+        self._git(self.repo, "config", "--add", "remote.origin.fetch", "+refs/heads/*:refs/heads/*")
+        result = control_plane.git_fetch_result(str(self.repo), "origin")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual("refused", result["state"])
+        self.assertNotIn("fetch", result.get("argv", []))
+
 
 class TestGitWorktreeCreate(GitControlPlaneTests):
     def test_create_starts_exact_commit_in_one_new_linked_branch_without_upstream(self) -> None:

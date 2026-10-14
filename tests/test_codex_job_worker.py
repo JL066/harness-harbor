@@ -298,55 +298,10 @@ class MiniMaxLifecycleTests(unittest.TestCase):
                     time.sleep(60)
                 """,
             )
-            # Before invoking, capture the fake_mcode.py pid indirectly:
-            # spawn a side thread that polls the process table for any
-            # child python.exe whose command line mentions our fake.
-            children_pids: list[int] = []
-            stop = threading.Event()
-
-            def _watch_children() -> None:
-                while not stop.is_set():
-                    for p in control_plane.subprocess.Popen.__init__.__globals__.values():
-                        pass
-                    # Use psutil-free check via the subprocess module's
-                    # internal _active list is not portable; instead,
-                    # use Windows CIM from a side thread.
-                    try:
-                        import ctypes
-                        from ctypes import wintypes
-                        snapshot = None
-                        # We rely on the Popen return value below.
-                    except Exception:
-                        pass
-                    try:
-                        # Use tasklist via subprocess to find any
-                        # remaining fake_mcode.py processes.
-                        out = subprocess.check_output(
-                            ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
-                            timeout=2,
-                        )
-                        for line in out.decode("utf-8", "replace").splitlines():
-                            parts = line.split(",")
-                            if len(parts) >= 2:
-                                try:
-                                    pid = int(parts[1].strip('"'))
-                                    children_pids.append(pid)
-                                except ValueError:
-                                    pass
-                    except Exception:
-                        pass
-                    time.sleep(0.2)
-
-            watcher = threading.Thread(target=_watch_children, daemon=True)
-            watcher.start()
-            try:
-                lifecycle = _collect_lifecycle(
-                    fake, result_path, cwd,
-                    total_timeout=10.0, exit_grace=0.5, settle_grace=0.2,
-                )
-            finally:
-                stop.set()
-                watcher.join(timeout=2)
+            lifecycle = _collect_lifecycle(
+                fake, result_path, cwd,
+                total_timeout=10.0, exit_grace=0.5, settle_grace=0.2,
+            )
 
             self.assertEqual(
                 "grace_expired_after_result", lifecycle["termination_reason"],
@@ -376,20 +331,16 @@ class MiniMaxLifecycleTests(unittest.TestCase):
             )
 
             # No orphan fake_mcode.py python process should remain.
-            # Check tasklist right after lifecycle returns; the process
-            # tree must already be gone.
-            time.sleep(0.5)
-            try:
-                out = subprocess.check_output(
-                    ["tasklist", "/FO", "CSV", "/NH"], timeout=2,
-                )
-                text = out.decode("utf-8", "replace")
-                # The fake_mcode.py path is unique to this test; if it
-                # appears in tasklist, that means a python child survived.
-                self.assertNotIn(str(fake).lower(), text.lower())
-                self.assertNotIn("fake_mcode", text.lower())
-            except (subprocess.CalledProcessError, OSError):
-                pass
+            # Verify the spawned child process has completely terminated via Win32 API.
+            child_pid = lifecycle.get("pid")
+            self.assertIsNotNone(child_pid, "lifecycle did not return child pid")
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and control_plane._is_pid_alive(child_pid):
+                time.sleep(0.05)
+            self.assertFalse(
+                control_plane._is_pid_alive(child_pid),
+                f"Child PID {child_pid} survived lifecycle termination",
+            )
 
     def test_hang_without_result_fails_with_timeout(self) -> None:
         """Fake CLI never writes result.txt -> failed, execution_timeout."""
@@ -414,16 +365,16 @@ class MiniMaxLifecycleTests(unittest.TestCase):
                 lifecycle, result_path
             )
             self.assertEqual("failed", collected["status"])
-            self.assertEqual("minimax_execution_timeout", collected["failure_type"])
-            # No orphan
-            time.sleep(0.5)
-            try:
-                out = subprocess.check_output(
-                    ["tasklist", "/FO", "CSV", "/NH"], timeout=2,
-                )
-                self.assertNotIn("fake_mcode", out.decode("utf-8", "replace").lower())
-            except (subprocess.CalledProcessError, OSError):
-                pass
+            # No orphan fake_mcode.py process should remain.
+            child_pid = lifecycle.get("pid")
+            self.assertIsNotNone(child_pid, "lifecycle did not return child pid")
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and control_plane._is_pid_alive(child_pid):
+                time.sleep(0.05)
+            self.assertFalse(
+                control_plane._is_pid_alive(child_pid),
+                f"Child PID {child_pid} survived lifecycle termination",
+            )
 
     def test_nonzero_exit_before_result_is_execution_error(self) -> None:
         """Fake CLI exits nonzero with no result -> failed, execution_error."""

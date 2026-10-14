@@ -545,6 +545,7 @@ def run_minimax_with_lifecycle(
             "termination_reason": "failed_to_start",
             "forced_exit": True,
             "result_completed_at": None,
+            "pid": None,
         }
 
     stdout_reader = _BoundedStreamReader(proc.stdout)
@@ -691,6 +692,7 @@ def run_minimax_with_lifecycle(
         "forced_exit": forced_exit,
         "result_completed_at": result_completed_at,
         "result_text": first_stable_text,
+        "pid": getattr(proc, "pid", None),
     }
 
 
@@ -1246,6 +1248,7 @@ def run_agy_with_lifecycle(
             "forced_exit": True,
             "result_completed_at": None,
             "result_text": "",
+            "pid": None,
         }
 
     stdout_reader = _BoundedStreamReader(proc.stdout)
@@ -1360,6 +1363,7 @@ def run_agy_with_lifecycle(
         "forced_exit": forced_exit,
         "result_completed_at": result_completed_at,
         "result_text": first_stable_text or "",
+        "pid": getattr(proc, "pid", None),
     }
 
 

@@ -1263,6 +1263,59 @@ def _validate_git_delivery_https_url(value: str) -> str:
     return value
 
 
+def _validate_git_delivery_fetch_refspec(refspec: str, remote: str) -> None:
+    if not isinstance(refspec, str) or not refspec.strip():
+        raise ValueError("configured fetch refspec must not be empty")
+    entry = refspec.strip()
+    if entry.startswith("+"):
+        entry = entry[1:]
+    if ":" not in entry or entry.count(":") != 1:
+        raise ValueError("configured fetch refspec must contain exactly one colon separating source and destination")
+    src, dst = entry.split(":", 1)
+    if not src or not dst:
+        raise ValueError("configured fetch refspec source and destination must not be empty")
+    if (
+        ".." in src
+        or ".." in dst
+        or "//" in src
+        or "//" in dst
+        or "\\" in src
+        or "\\" in dst
+        or any(ord(ch) < 32 or ch.isspace() for ch in src + dst)
+    ):
+        raise ValueError("configured fetch refspec must not contain traversal, whitespace, or empty segments")
+    if any(segment.endswith(".lock") for segment in src.split("/") + dst.split("/")):
+        raise ValueError("configured fetch refspec must not target lock files")
+    expected_dst_prefix = f"refs/remotes/{remote}/"
+    if not dst.startswith(expected_dst_prefix):
+        raise ValueError(f"configured fetch refspec destination must be under {expected_dst_prefix}")
+    if not src.startswith("refs/heads/"):
+        raise ValueError("configured fetch refspec source must be under refs/heads/")
+    src_wildcard = src.endswith("/*")
+    dst_wildcard = dst.endswith("/*")
+    if src_wildcard != dst_wildcard:
+        raise ValueError("configured fetch refspec wildcard must align between source and destination")
+    if src.count("*") != (1 if src_wildcard else 0) or dst.count("*") != (1 if dst_wildcard else 0):
+        raise ValueError("configured fetch refspec may only contain a single trailing wildcard '/*'")
+    src_path = src[:-2] if src_wildcard else src
+    dst_path = dst[:-2] if dst_wildcard else dst
+    src_remainder = src_path[len("refs/heads"):]
+    if src_remainder:
+        if not src_remainder.startswith("/"):
+            raise ValueError("configured fetch refspec has invalid segment boundary in source")
+        for seg in src_remainder[1:].split("/"):
+            if not seg or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", seg):
+                raise ValueError("configured fetch refspec contains invalid ref characters in source")
+    dst_prefix_clean = expected_dst_prefix.rstrip("/")
+    dst_remainder = dst_path[len(dst_prefix_clean):]
+    if dst_remainder:
+        if not dst_remainder.startswith("/"):
+            raise ValueError("configured fetch refspec has invalid segment boundary in destination")
+        for seg in dst_remainder[1:].split("/"):
+            if not seg or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", seg):
+                raise ValueError("configured fetch refspec contains invalid ref characters in destination")
+
+
 def _git_delivery_command(args: list[str], root: Path) -> dict:
     """Run a fixed delivery Git command and redact its externally returned data."""
     raw = _run_git(args, root, timeout=GIT_DELIVERY_TIMEOUT_SECONDS)
@@ -1360,6 +1413,14 @@ def git_fetch_result(repo: str, remote: str = "origin") -> dict:
         if len(urls) != 1:
             raise ValueError("configured fetch remote must have exactly one URL")
         _validate_git_delivery_https_url(urls[0])
+        refspec_check = _git_delivery_command(["config", "--get-all", f"remote.{remote}.fetch"], root)
+        if not refspec_check["ok"]:
+            raise _GitDeliveryError("configured fetch remote has no fetch refspec configured", refspec_check)
+        refspecs = [line.strip() for line in refspec_check["stdout"].splitlines() if line.strip()]
+        if not refspecs:
+            raise ValueError("configured fetch remote has no fetch refspec configured")
+        for refspec in refspecs:
+            _validate_git_delivery_fetch_refspec(refspec, remote)
         before = _git_remote_tracking_refs(root, remote)
         base["before_remote_tracking"] = before
         command = _git_delivery_command(["fetch", "--no-recurse-submodules", "--no-prune", "--", remote], root)

@@ -1,3 +1,5 @@
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -47,6 +49,57 @@ class CodexPollTests(unittest.TestCase):
         self.assertIn("job_id", sig_codex_poll.parameters)
         self.assertIn("immediate", sig_codex_poll.parameters)
         self.assertIs(sig_codex_poll.parameters["immediate"].default, False)
+
+
+class McpStdioDisconnectTests(unittest.TestCase):
+    def test_mcp_disconnect_exits_cleanly_without_closed_file_error(self) -> None:
+        """Verify that when an MCP client disconnects by closing stdin,
+        the server exits cleanly with returncode 0 and does not raise
+        'ValueError: I/O operation on closed file.' on stdout flush.
+        """
+        proc = subprocess.Popen(
+            [sys.executable, str(PROJECT_ROOT / "server_legacy.py")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        try:
+            init_req = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test-client", "version": "1.0"},
+                },
+            }
+            proc.stdin.write(json.dumps(init_req) + "\n")
+            proc.stdin.flush()
+            init_resp = proc.stdout.readline()
+            self.assertTrue(init_resp, "server did not respond to initialize")
+            self.assertIn("protocolVersion", init_resp)
+
+            init_notif = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+            proc.stdin.write(json.dumps(init_notif) + "\n")
+            proc.stdin.flush()
+
+            tools_req = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+            proc.stdin.write(json.dumps(tools_req) + "\n")
+            proc.stdin.flush()
+            tools_resp = proc.stdout.readline()
+            self.assertTrue(tools_resp, "server did not respond to tools/list")
+            self.assertIn("tools", tools_resp)
+        finally:
+            proc.stdin.close()
+            exit_code = proc.wait(timeout=10)
+            stderr = proc.stderr.read()
+
+        self.assertEqual(0, exit_code, f"server exited with {exit_code}: {stderr}")
+        self.assertNotIn("closed file", stderr.lower())
+        self.assertNotIn("valueerror", stderr.lower())
 
 
 if __name__ == "__main__":
