@@ -16,7 +16,14 @@ RUNTIME_HIDDEN_IMPORTS = (
 )
 
 
-def generate_version_info_file(output_path: Path, display_version: str) -> Path:
+def generate_version_info_file(
+    output_path: Path,
+    display_version: str,
+    *,
+    description: str = "Harness Harbor Launcher",
+    internal_name: str = "harbor_launcher",
+    original_filename: str = "harbor_launcher.exe",
+) -> Path:
     from harbor_runtime import RUNTIME_VERSION
 
     numeric_parts = [int(part) for part in RUNTIME_VERSION.split(".")]
@@ -42,11 +49,11 @@ def generate_version_info_file(output_path: Path, display_version: str) -> Path:
           '040904B0',
           [
             StringStruct('CompanyName', 'Harness Harbor'),
-            StringStruct('FileDescription', 'Harness Harbor Launcher'),
+            StringStruct('FileDescription', '{description}'),
             StringStruct('FileVersion', '{windows_version_text}'),
-            StringStruct('InternalName', 'harbor_launcher'),
+            StringStruct('InternalName', '{internal_name}'),
             StringStruct('LegalCopyright', 'Copyright (c) 2026'),
-            StringStruct('OriginalFilename', 'harbor_launcher.exe'),
+            StringStruct('OriginalFilename', '{original_filename}'),
             StringStruct('ProductName', 'Harness Harbor'),
             StringStruct('ProductVersion', '{display_version}')
           ]
@@ -101,7 +108,21 @@ def build():
     if not icon.exists():
         icon = assets / "brand/generated/ico/harbor.ico"
     version_file = output / "spec" / "version_info.txt"
-    generate_version_info_file(version_file, build_meta["display_version"])
+    generate_version_info_file(
+        version_file,
+        build_meta["display_version"],
+        description="Harness Harbor Launcher",
+        internal_name="harbor_launcher",
+        original_filename="harbor_launcher.exe",
+    )
+    runtime_version_file = output / "spec" / "runtime_version_info.txt"
+    generate_version_info_file(
+        runtime_version_file,
+        build_meta["display_version"],
+        description="Harness Harbor Runtime",
+        internal_name="harbor-runtime",
+        original_filename="harbor-runtime.exe",
+    )
     common = [sys.executable, "-m", "PyInstaller", "--onedir",
               "--distpath", str(output / "components"), "--workpath", str(output / "work"),
               "--specpath", str(output / "spec"), "--paths", str(root)]
@@ -121,7 +142,7 @@ def build():
         gui += ["--icon", str(icon)]
     gui += [str(root / "run_launcher.py")]
     runtime = common + ["--console", "--name", "harbor-runtime", "--collect-submodules", "mcp.server",
-                        "--copy-metadata", "mcp"]
+                        "--copy-metadata", "mcp", "--version-file", str(runtime_version_file)]
     for module in ("server_legacy", "codex_job_daemon", "codex_job_worker"):
         runtime += ["--hidden-import", module]
     runtime += [str(root / "run_runtime.py")]

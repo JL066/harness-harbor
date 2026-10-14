@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.1.8] - 2026-10-13 (Windows release candidate)
+
+### Added
+
+- Carries forward the Git control plane features from the v1.1.7 candidate.
+- Displays the last four characters of running job IDs in the UI while retaining full IDs internally.
+
+### Fixed
+
+- Grants task workspace writes only while the matching Harbor worker has a verified live process identity and owned process tree.
+- Keeps queued, stale, terminal, malformed, and unverifiable task records from granting workspace writes.
+- Makes stale-job recovery tests deterministic across Windows process access policies.
+- Embeds Windows PE version resources in `harbor-runtime.exe` to match launcher metadata.
+- Prevents MCP stdio disconnect exceptions by avoiding transient stream wrappers that closed underlying process buffers on exit.
+- Hardens lifecycle worker tests against Windows process query permission policies.
+
 ## [1.1.4] - 2026-10-04
 
 ### Fixed

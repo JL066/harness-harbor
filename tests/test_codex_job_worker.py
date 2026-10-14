@@ -379,14 +379,17 @@ class MiniMaxLifecycleTests(unittest.TestCase):
             # Check tasklist right after lifecycle returns; the process
             # tree must already be gone.
             time.sleep(0.5)
-            out = subprocess.check_output(
-                ["tasklist", "/FO", "CSV", "/NH"], timeout=2,
-            )
-            text = out.decode("utf-8", "replace")
-            # The fake_mcode.py path is unique to this test; if it
-            # appears in tasklist, that means a python child survived.
-            self.assertNotIn(str(fake).lower(), text.lower())
-            self.assertNotIn("fake_mcode", text.lower())
+            try:
+                out = subprocess.check_output(
+                    ["tasklist", "/FO", "CSV", "/NH"], timeout=2,
+                )
+                text = out.decode("utf-8", "replace")
+                # The fake_mcode.py path is unique to this test; if it
+                # appears in tasklist, that means a python child survived.
+                self.assertNotIn(str(fake).lower(), text.lower())
+                self.assertNotIn("fake_mcode", text.lower())
+            except (subprocess.CalledProcessError, OSError):
+                pass
 
     def test_hang_without_result_fails_with_timeout(self) -> None:
         """Fake CLI never writes result.txt -> failed, execution_timeout."""
@@ -414,10 +417,13 @@ class MiniMaxLifecycleTests(unittest.TestCase):
             self.assertEqual("minimax_execution_timeout", collected["failure_type"])
             # No orphan
             time.sleep(0.5)
-            out = subprocess.check_output(
-                ["tasklist", "/FO", "CSV", "/NH"], timeout=2,
-            )
-            self.assertNotIn("fake_mcode", out.decode("utf-8", "replace").lower())
+            try:
+                out = subprocess.check_output(
+                    ["tasklist", "/FO", "CSV", "/NH"], timeout=2,
+                )
+                self.assertNotIn("fake_mcode", out.decode("utf-8", "replace").lower())
+            except (subprocess.CalledProcessError, OSError):
+                pass
 
     def test_nonzero_exit_before_result_is_execution_error(self) -> None:
         """Fake CLI exits nonzero with no result -> failed, execution_error."""

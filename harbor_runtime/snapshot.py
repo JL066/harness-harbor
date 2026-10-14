@@ -30,6 +30,7 @@ def harness_snapshot(jobs_dir, telemetry_rows=(), *, connected=True, now=None):
                    queue_fingerprint=queue_root_fingerprint(jobs_dir))
         summary = row.get("summary", row.get("detail", ""))
         row["summary"] = summary
-        row["detail"] = summary + " — " + (f"Running {len(ids)}: " + ", ".join(ids) if ids else state.title())
+        display_ids = [job_id[-4:] for job_id in ids]
+        row["detail"] = summary + " — " + (f"Running {len(ids)}: " + ", ".join(display_ids) if ids else state.title())
         rows.append(row)
     return rows

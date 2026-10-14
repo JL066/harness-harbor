@@ -20,7 +20,7 @@ from build_exe import generate_version_info_file
 
 
 def test_package_version_matches_runtime_version():
-    assert launcher_version == RUNTIME_VERSION == "1.1.7"
+    assert launcher_version == RUNTIME_VERSION == "1.1.8"
 
 
 def test_derive_build_identity_keeps_public_version_simple_and_builds_distinct():
@@ -124,3 +124,28 @@ def test_windows_version_info_uses_public_runtime_version(tmp_path):
     assert f"prodvers={numeric_version}" in content
     assert f"StringStruct('FileVersion', '{dotted_version}')" in content
     assert f"StringStruct('ProductVersion', '{RUNTIME_VERSION}')" in content
+    assert "StringStruct('FileDescription', 'Harness Harbor Launcher')" in content
+    assert "StringStruct('InternalName', 'harbor_launcher')" in content
+    assert "StringStruct('OriginalFilename', 'harbor_launcher.exe')" in content
+
+
+def test_windows_runtime_version_info(tmp_path):
+    version_file = generate_version_info_file(
+        tmp_path / "runtime_version_info.txt",
+        RUNTIME_VERSION,
+        description="Harness Harbor Runtime",
+        internal_name="harbor-runtime",
+        original_filename="harbor-runtime.exe",
+    )
+    content = version_file.read_text(encoding="utf-8")
+
+    numeric_version = tuple(int(part) for part in RUNTIME_VERSION.split(".")) + (0,)
+    dotted_version = ".".join(str(part) for part in numeric_version)
+    assert f"filevers={numeric_version}" in content
+    assert f"prodvers={numeric_version}" in content
+    assert f"StringStruct('FileVersion', '{dotted_version}')" in content
+    assert f"StringStruct('ProductVersion', '{RUNTIME_VERSION}')" in content
+    assert "StringStruct('FileDescription', 'Harness Harbor Runtime')" in content
+    assert "StringStruct('InternalName', 'harbor-runtime')" in content
+    assert "StringStruct('OriginalFilename', 'harbor-runtime.exe')" in content
+

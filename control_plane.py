@@ -127,6 +127,7 @@ BINARY_SNIFF_BYTES = 8_192
 JOB_ID_RE = re.compile(r"^[0-9a-zA-Z_\-]+$")
 POLL_THROTTLE_INTERVAL_SECONDS: float = 600.0
 TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+ACTIVE_TASK_WRITE_STATUSES: frozenset[str] = frozenset({"queued", "running", "cancelling"})
 AGY_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 AGY_MODELS_BLOCKER_RE = re.compile(
     r"(?:"
@@ -672,19 +673,120 @@ def list_projects() -> list[dict]:
     return [{"alias": alias, **entry} for alias, entry in sorted(load_projects().items())]
 
 
-def _task_cwd_roots() -> list[Path]:
+def _task_cwd_root_is_scoped(root: Path, explicit_roots: list[Path]) -> bool:
+    """Reject implicit task roots that are broad host roots or broaden other grants."""
+    root = root.resolve(strict=False)
+    if root.parent == root:
+        return False
+
+    # A task may use a narrow directory under a profile or the temporary
+    # directory, but the profile/temp directory itself (or an ancestor) must
+    # never become a write grant merely because it appears in job history.
+    profile_roots = [Path.home()]
+    user_profile = os.environ.get("USERPROFILE")
+    if user_profile:
+        profile_roots.append(Path(user_profile))
+    profile_roots.append(Path(tempfile.gettempdir()))
+    try:
+        for broad_root in profile_roots:
+            broad_root = broad_root.resolve(strict=False)
+            if root == broad_root or _is_under(broad_root, root):
+                return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    # Do not infer write access to Windows installation and shared system
+    # directories. Reject any overlap with these roots, including descendants.
+    system_roots: list[Path] = []
+    for variable in ("SystemRoot", "WINDIR", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"):
+        value = os.environ.get(variable)
+        if value:
+            candidate = Path(value).expanduser()
+            if candidate.is_absolute():
+                system_roots.append(candidate)
+    try:
+        for system_root in system_roots:
+            system_root = system_root.resolve(strict=False)
+            if _is_under(root, system_root) or _is_under(system_root, root):
+                return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    # A task cwd that contains a registered project, Harbor's source tree, or
+    # the dedicated control directory would silently widen those grants.
+    try:
+        for explicit_root in explicit_roots:
+            explicit_root = explicit_root.resolve(strict=False)
+            if root != explicit_root and _is_under(explicit_root, root):
+                return False
+        config_directory = CODEX_CONFIG.resolve(strict=False).parent
+        if config_directory == root or _is_under(config_directory, root):
+            return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def _task_cwd_roots(explicit_roots: list[Path]) -> list[Path]:
     roots: list[Path] = []
     if not JOBS_DIR.is_dir():
         return roots
+    jobs_root = JOBS_DIR.resolve(strict=False)
     for state_path in JOBS_DIR.glob("*/status.json"):
         try:
+            job_dir = state_path.parent
+            if not JOB_ID_RE.fullmatch(job_dir.name):
+                continue
+            resolved_job_dir = job_dir.resolve(strict=True)
+            resolved_state_path = state_path.resolve(strict=True)
+            if resolved_job_dir.parent != jobs_root or resolved_state_path.parent != resolved_job_dir:
+                continue
             state = read_json_object(state_path)
+            status = state.get("status")
+            harness = state.get("harness")
+            if (state.get("job_id") != job_dir.name or
+                    not isinstance(status, str) or status not in {"running", "cancelling"} or
+                    not isinstance(harness, str) or harness not in {"codex", "minimax", "agy"} or
+                    not queue_root_matches(state, JOBS_DIR)):
+                continue
+            # A status string is user-editable history, not proof that a task
+            # still owns its workspace. Require the worker claim record, the
+            # worker.lock PID, and the OS-owned worker process tree to agree.
+            owner = state.get("stop_ownership")
+            worker = owner.get("worker") if isinstance(owner, dict) else None
+            lock_path = job_dir / "worker.lock"
+            try:
+                lock_tokens = lock_path.read_text(encoding="utf-8").strip().split()
+                lock_pid = int(lock_tokens[0]) if lock_tokens else None
+            except (OSError, ValueError, IndexError):
+                continue
+            if (not isinstance(owner, dict) or owner.get("job_id") != job_dir.name or
+                    owner.get("harness") != harness or
+                    owner.get("queue_root") != str(jobs_root) or
+                    not isinstance(owner.get("generation"), str) or
+                    not re.fullmatch(r"[0-9a-f]{32}", owner["generation"]) or
+                    not isinstance(worker, dict) or type(worker.get("pid")) is not int or
+                    worker.get("pid") != lock_pid):
+                continue
+            try:
+                from harbor_platform import process
+                from runtime_liveness import ProcessLiveness, probe_pid_liveness
+
+                if (probe_pid_liveness(lock_pid) is not ProcessLiveness.ALIVE or
+                        not process.owner_identity_valid(worker)):
+                    continue
+                members = process.descendants(worker)
+                if members is None or lock_pid not in members:
+                    continue
+            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+                continue
             cwd = state.get("cwd")
-            if isinstance(cwd, str):
-                root = Path(cwd).resolve(strict=False)
-                if root.is_dir():
-                    roots.append(root)
-        except (OSError, ValueError, json.JSONDecodeError):
+            if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+                continue
+            root = _validate_user_path(cwd)
+            if root.is_dir() and _task_cwd_root_is_scoped(root, explicit_roots):
+                roots.append(root)
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
             continue
     return roots
 
@@ -695,7 +797,7 @@ def write_roots() -> list[Path]:
         path = Path(entry["path"])
         if path.is_dir():
             roots.append(path.resolve())
-    roots.extend(_task_cwd_roots())
+    roots.extend(_task_cwd_roots([*roots, PROJECT_ROOT, CODEX_CONFIG.resolve(strict=False).parent]))
     unique: list[Path] = []
     for root in roots:
         if root not in unique:
@@ -706,10 +808,11 @@ def write_roots() -> list[Path]:
 def authorize_write(path: Path) -> None:
     if path == CODEX_CONFIG.resolve(strict=False):
         return
-    if any(_is_under(path, root) for root in write_roots()):
+    roots = write_roots()
+    if any(_is_under(path, root) for root in roots):
         return
-    allowed = [str(root) for root in write_roots()] + [str(CODEX_CONFIG)]
-    raise ValueError("write denied; allowed roots are registered projects, task cwd roots, "
+    allowed = [str(root) for root in roots] + [str(CODEX_CONFIG)]
+    raise ValueError("write denied; allowed roots are registered projects, active task cwd roots, "
                      f"{CONTROL_DIR}, and {CODEX_CONFIG}. Requested: {path}. Allowed: {allowed}")
 
 

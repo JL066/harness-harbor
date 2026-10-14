@@ -75,6 +75,21 @@ def test_packaged_backend_uses_bridge_and_maps_without_pid_scan(monkeypatch):
     assert fake.calls[:2] == [("status.snapshot", {}), ("harness.telemetry", {})]
 
 
+def test_packaged_telemetry_adapter_preserves_display_detail_and_full_ids():
+    detail = "Ready — Running 2: cdef, 3210"
+    full_ids = ["0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"]
+    fake = FakeBridge(telemetry={"harnesses": [{
+        "name": "codex", "available": True, "summary": detail,
+        "running_jobs": 2, "running_job_ids": full_ids,
+    }]})
+
+    row = PackagedBackend(client=fake).telemetry()["rows"][0]
+
+    assert row["detail"] == detail
+    assert row["running_jobs"] == 2
+    assert row["running_job_ids"] == full_ids
+
+
 def test_running_unverified_mcp_maps_to_green_overall_without_claiming_protocol_health():
     snapshot = _snapshot(
         "running",

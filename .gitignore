@@ -57,6 +57,9 @@ _*.ps1
 *.bak
 *.index
 scratch/
+.pytest*
+_isolated*
+b118/
 
 # Package initializers are release source, not one-off underscore scripts
 !**/__init__.py

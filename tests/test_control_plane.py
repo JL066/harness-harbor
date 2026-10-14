@@ -13,6 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import codex_job_worker
 import control_plane
 import server_legacy
+from runtime_liveness import ProcessLiveness
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -37,6 +38,21 @@ class ControlPlaneTests(unittest.TestCase):
             json.dumps({"projects": {"fixture": {"path": str(project)}}}),
             encoding="utf-8",
         )
+
+    def write_job_state(self, directory_id: str, cwd: Path, **fields) -> Path:
+        control_plane.JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        job_dir = control_plane.JOBS_DIR / directory_id
+        job_dir.mkdir()
+        state = {
+            "job_id": directory_id,
+            "harness": "agy",
+            "cwd": str(cwd),
+            "queue_root_fingerprint": control_plane.queue_root_fingerprint(control_plane.JOBS_DIR),
+        }
+        state.update(fields)
+        state_path = job_dir / "status.json"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        return state_path
 
     def test_registry_file_and_project_alias_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -79,6 +95,307 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertTrue(result["backup_path"])
             self.assertEqual("model = 'before'\n", Path(result["backup_path"]).read_text(encoding="utf-8"))
             self.assertEqual("model = 'after'\n", config.read_text(encoding="utf-8"))
+
+    def test_task_cwd_grants_only_known_active_scoped_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            profile = root / "profiles" / "user"
+            temp_root = root / "temp-root"
+            system_root = root / "windows"
+            program_files = root / "program-files"
+            program_data = root / "program-data"
+            narrow = temp_root / "workspace"
+            for path in (profile, temp_root, system_root / "System32", program_files, program_data, narrow):
+                path.mkdir(parents=True, exist_ok=True)
+
+            environment = {
+                "USERPROFILE": str(profile),
+                "SystemRoot": str(system_root),
+                "WINDIR": str(system_root),
+                "ProgramFiles": str(program_files),
+                "ProgramData": str(program_data),
+            }
+            with mock.patch.object(control_plane.Path, "home", return_value=profile), \
+                 mock.patch.object(control_plane.tempfile, "gettempdir", return_value=temp_root), \
+                 mock.patch.dict(control_plane.os.environ, environment):
+                broad_roots = [
+                    profile,
+                    profile.parent,
+                    temp_root,
+                    system_root,
+                    system_root / "System32",
+                    program_files,
+                    program_data,
+                    Path(profile.anchor),
+                ]
+                for index, broad_root in enumerate(broad_roots):
+                    if not broad_root.is_dir():
+                        continue
+                    job_id = f"broad{index:026d}"
+                    with self.subTest(broad_root=broad_root):
+                        self.write_job_state(job_id, broad_root, status="running")
+                        self.assertNotIn(broad_root.resolve(), control_plane.write_roots())
+                        denied = control_plane.file_write_result(str(broad_root / "denied.txt"), "no")
+                        self.assertFalse(denied["ok"], denied)
+
+                for index, status in enumerate(("queued", "running", "cancelling")):
+                    job_id = f"narrow{index:026d}"
+                    self.write_job_state(job_id, narrow, status=status)
+                    self.assertNotIn(narrow.resolve(), control_plane.write_roots())
+                denied = control_plane.file_write_result(str(narrow / "active.txt"), "no")
+                self.assertFalse(denied["ok"], denied)
+
+    def test_live_owned_worker_grants_only_its_narrow_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            workdir = root / "active-workdir"
+            workdir.mkdir()
+            state_path = self.write_job_state("live-owned-worker", workdir, status="running")
+            from harbor_platform import process
+
+            owned = process.spawn_owned([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                identity = process.process_identity(owned.pid)
+                self.assertIsNotNone(identity)
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["stop_ownership"] = {
+                    "job_id": "live-owned-worker", "harness": "agy",
+                    "queue_root": str(control_plane.JOBS_DIR.resolve()),
+                    "generation": "a" * 32, "worker": identity, "native": None,
+                }
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                (state_path.parent / "worker.lock").write_text(f"{owned.pid} fixture\n", encoding="utf-8")
+
+                self.assertTrue(process.owner_identity_valid(identity))
+                self.assertIn(owned.pid, process.descendants(identity))
+                self.assertIn(workdir.resolve(), control_plane.write_roots())
+                allowed = control_plane.file_write_result(str(workdir / "active.txt"), "yes")
+                self.assertTrue(allowed["ok"], allowed)
+            finally:
+                self.assertTrue(process.terminate_tree(owned, grace=0.2))
+
+    def test_running_cwd_requires_present_dead_unknown_and_matching_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            for index, case in enumerate(("missing", "dead", "unknown", "identity-mismatch")):
+                workdir = root / case
+                workdir.mkdir()
+                state_path = self.write_job_state(f"owner-{case}", workdir, status="running")
+                if case != "missing":
+                    pid = 44000 + index
+                    identity = {"pid": pid, "started_at": str(pid), "job_name": f"Local\\HarnessHarbor-{pid}-{pid}"}
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    state["stop_ownership"] = {
+                        "job_id": f"owner-{case}", "harness": "agy",
+                        "queue_root": str(control_plane.JOBS_DIR.resolve()),
+                        "generation": "b" * 32, "worker": identity,
+                    }
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
+                    (state_path.parent / "worker.lock").write_text(f"{pid} test\n", encoding="utf-8")
+
+            cases = {
+                "missing": (None, None),
+                "dead": (ProcessLiveness.DEAD, True),
+                "unknown": (ProcessLiveness.UNKNOWN, True),
+                "identity-mismatch": (ProcessLiveness.ALIVE, False),
+            }
+            for case, (liveness, identity_matches) in cases.items():
+                with self.subTest(case=case):
+                    patches = [
+                        mock.patch("runtime_liveness.probe_pid_liveness", return_value=liveness),
+                        mock.patch("harbor_platform.process.owner_identity_valid", return_value=identity_matches),
+                        mock.patch("harbor_platform.process.descendants", side_effect=lambda identity: [identity["pid"]]),
+                    ]
+                    for patcher in patches:
+                        patcher.start()
+                    try:
+                        target = root / case / "denied.txt"
+                        self.assertNotIn((root / case).resolve(), control_plane.write_roots())
+                        self.assertFalse(control_plane.file_write_result(str(target), "no")["ok"])
+                    finally:
+                        for patcher in reversed(patches):
+                            patcher.stop()
+
+    def test_terminal_and_malformed_job_metadata_never_grants_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            profile = root / "profile"
+            completed_workdir = root / "completed-workspace"
+            profile.mkdir()
+            completed_workdir.mkdir()
+            with mock.patch.object(control_plane.Path, "home", return_value=profile):
+                terminal_statuses = ("completed", "failed", "cancelled", "canceled", "succeeded", "stopped")
+                for index, status in enumerate(terminal_statuses):
+                    with self.subTest(status=status):
+                        self.write_job_state(f"terminal{index:024d}", profile, status=status)
+                        self.assertNotIn(profile.resolve(), control_plane.write_roots())
+
+                self.write_job_state("completed-narrow", completed_workdir, status="completed")
+                self.assertNotIn(completed_workdir.resolve(), control_plane.write_roots())
+                denied = control_plane.file_write_result(str(completed_workdir / "denied.txt"), "no")
+                self.assertFalse(denied["ok"], denied)
+                self.assertFalse((completed_workdir / "denied.txt").exists())
+
+                invalid_jobs = (
+                    ("missingstatus", {}),
+                    ("unknownstatus", {"status": "waiting"}),
+                    ("malformedstatus", {"status": ["running"]}),
+                    ("malformedharness", {"status": "running", "harness": ["agy"]}),
+                    ("wrongjobid", {"status": "running", "job_id": "another-job"}),
+                    ("foreignqueue", {"status": "running", "queue_root_fingerprint": "foreign"}),
+                )
+                for name, fields in invalid_jobs:
+                    with self.subTest(metadata=name):
+                        job_id = f"invalid-{name}"
+                        self.write_job_state(job_id, profile, **fields)
+                        self.assertNotIn(profile.resolve(), control_plane.write_roots())
+
+                malformed_id = "malformed-json"
+                control_plane.JOBS_DIR.mkdir(parents=True, exist_ok=True)
+                malformed_job_dir = control_plane.JOBS_DIR / malformed_id
+                malformed_job_dir.mkdir()
+                (malformed_job_dir / "status.json").write_text("{", encoding="utf-8")
+                self.assertNotIn(profile.resolve(), control_plane.write_roots())
+
+                missing_id = "missing-status-file"
+                (control_plane.JOBS_DIR / missing_id).mkdir()
+                self.assertNotIn(profile.resolve(), control_plane.write_roots())
+
+    def test_registered_project_and_control_roots_survive_historical_task_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            profile = root / "profile"
+            profile.mkdir()
+            project = root / "project"
+            project.mkdir()
+            self.write_projects(project)
+            state_path = self.write_job_state("active-profile-root", profile, status="running")
+            identity = {"pid": 45000, "started_at": "45000", "job_name": "Local\\HarnessHarbor-45000-45000"}
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["stop_ownership"] = {
+                "job_id": "active-profile-root", "harness": "agy",
+                "queue_root": str(control_plane.JOBS_DIR.resolve()), "generation": "c" * 32,
+                "worker": identity,
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            (state_path.parent / "worker.lock").write_text("45000 test\n", encoding="utf-8")
+            with mock.patch.object(control_plane.Path, "home", return_value=profile), \
+                 mock.patch("runtime_liveness.probe_pid_liveness", return_value=ProcessLiveness.ALIVE), \
+                 mock.patch("harbor_platform.process.owner_identity_valid", return_value=True), \
+                 mock.patch("harbor_platform.process.descendants", return_value=[45000]):
+                self.write_job_state("completed-history", profile, status="completed")
+                roots = control_plane.write_roots()
+                self.assertIn(project.resolve(), roots)
+                self.assertIn(control_plane.CONTROL_DIR.resolve(), roots)
+                self.assertNotIn(profile.resolve(), roots)
+                self.assertTrue(control_plane.file_write_result(str(project / "project.txt"), "ok")["ok"])
+                self.assertTrue(control_plane.file_write_result(str(control_plane.CONTROL_DIR / "control.txt"), "ok")["ok"])
+
+    def test_real_queued_task_cwd_is_scoped_until_terminal_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            workdir = root / "active-workdir"
+            workdir.mkdir()
+            fake_codex = root / "codex.exe"
+            fake_codex.write_text("placeholder", encoding="utf-8")
+
+            with mock.patch.object(control_plane, "CODEX_EXE", fake_codex), \
+                 mock.patch.object(control_plane, "is_stale_harbor_managed_codex_config", return_value=(False, None)):
+                started = control_plane.start_task(
+                    harness="codex", prompt="active cwd authorization", project=None, cwd=str(workdir),
+                    model=None, sandbox="workspace-write", reasoning_effort=None,
+                )
+                self.assertTrue(started["ok"], started)
+                self.assertNotIn(workdir.resolve(), control_plane.write_roots())
+                self.assertFalse(control_plane.file_write_result(str(workdir / "active.txt"), "active")["ok"])
+
+                cancelled = control_plane.cancel_task(started["job_id"])
+                self.assertTrue(cancelled["ok"], cancelled)
+                self.assertNotIn(workdir.resolve(), control_plane.write_roots())
+
+    def test_historical_profile_root_does_not_authorize_file_or_git_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            profile = root / "profile"
+            temp_root = profile / "AppData" / "Local" / "Temp"
+            target = temp_root / "Harbor-UAT-v117-unauthorized"
+            repo = profile / "repo"
+            init_target = target / "init-target"
+            target.mkdir(parents=True)
+            repo.mkdir(parents=True)
+            init_target.mkdir()
+            subprocess.run(["git", "init", "--initial-branch=main", str(repo)], check=True, capture_output=True)
+
+            with mock.patch.object(control_plane.Path, "home", return_value=profile):
+                self.write_job_state("completed-agy-history", profile, status="completed")
+                readable = target / "readable.txt"
+                readable.write_text("read only", encoding="utf-8")
+                self.assertTrue(control_plane.file_read_result(str(readable))["ok"])
+                self.assertTrue(control_plane.git_status_result(str(repo))["ok"])
+
+                delivery_calls: list[list[str]] = []
+                original_delivery = control_plane._git_delivery_command
+
+                def capture_delivery(args, root_path, timeout=30):
+                    delivery_calls.append(list(args))
+                    return original_delivery(args, root_path, timeout=timeout)
+
+                with mock.patch.object(control_plane, "_git_delivery_command", side_effect=capture_delivery):
+                    file_result = control_plane.file_write_result(str(target / "write.txt"), "no")
+                    init_result = control_plane.git_init_result(str(init_target))
+                    fetch_result = control_plane.git_fetch_result(str(repo), "origin")
+                    create_result = control_plane.git_worktree_create_result(
+                        str(repo), str(profile / "new-worktree"), "feature/denied", "0" * 40
+                    )
+                    remove_result = control_plane.git_worktree_remove_result(str(repo), str(profile / "linked"))
+
+                self.assertFalse(file_result["ok"], file_result)
+                for result in (init_result, fetch_result, create_result, remove_result):
+                    self.assertFalse(result["ok"], result)
+                    self.assertEqual("refused", result["state"])
+                self.assertEqual([], delivery_calls)
+                self.assertFalse((init_target / ".git").exists())
+                self.assertFalse((target / "write.txt").exists())
+
+    def test_task_cwd_path_traversal_cannot_escape_active_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            allowed = root / "allowed"
+            outside = root / "outside"
+            allowed.mkdir()
+            outside.mkdir()
+            self.write_job_state("traversal-job", allowed, status="running")
+
+            result = control_plane.file_write_result(str(allowed / ".." / "outside" / "escape.txt"), "no")
+            self.assertFalse(result["ok"], result)
+            self.assertFalse((outside / "escape.txt").exists())
+
+    def test_task_cwd_symlink_cannot_escape_active_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.configure_temp_control(root)
+            allowed = root / "allowed"
+            outside = root / "outside"
+            allowed.mkdir()
+            outside.mkdir()
+            self.write_job_state("symlink-job", allowed, status="running")
+            link = allowed / "redirect"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"directory symlink unavailable: {type(exc).__name__}")
+
+            result = control_plane.file_write_result(str(link / "escape.txt"), "no")
+            self.assertFalse(result["ok"], result)
+            self.assertFalse((outside / "escape.txt").exists())
 
     def test_generic_task_lifecycle_and_queued_cancel(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

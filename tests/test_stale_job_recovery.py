@@ -70,9 +70,22 @@ def _setup_job(
     return job_dir
 
 
-def test_recover_dead_pid_abandoned_job(tmp_path):
-    """Exact reproduction: status=running, worker.lock PID 41520 (dead process)."""
+def _mock_dead_owner(monkeypatch, dead_pid: int = 41520) -> None:
+    """Make the fixture PID deterministically dead without host PID assumptions."""
+    monkeypatch.setattr(
+        "codex_job_daemon._probe_pid_liveness",
+        lambda pid: ProcessLiveness.DEAD if pid == dead_pid else ProcessLiveness.ALIVE,
+    )
+    monkeypatch.setattr(
+        "codex_job_daemon._job_tree_liveness",
+        lambda job_dir, owners: ProcessLiveness.DEAD if dead_pid in owners else ProcessLiveness.UNKNOWN,
+    )
+
+
+def test_recover_dead_pid_abandoned_job(tmp_path, monkeypatch):
+    """Exact reproduction with a mocked dead owner, independent of host PID state."""
     dead_pid = 41520
+    _mock_dead_owner(monkeypatch, dead_pid)
     job_dir = _setup_job(tmp_path, "f3ac2f289aa2463d908fa95b2c650c54", worker_pid=dead_pid, lock_pid=dead_pid)
     ws = get_canonical_workspace(job_dir / "workspace")
 
@@ -105,9 +118,10 @@ def test_recover_dead_pid_abandoned_job(tmp_path):
     assert is_workspace_leased(tmp_path, ws) is False
 
 
-def test_recover_canonical_success_reconstruction(tmp_path):
+def test_recover_canonical_success_reconstruction(tmp_path, monkeypatch):
     """When result.txt exists and process_exit_code == 0, reconstruct completed terminal state."""
     dead_pid = 41520
+    _mock_dead_owner(monkeypatch, dead_pid)
     job_dir = _setup_job(
         tmp_path,
         "completed_recon",
@@ -181,9 +195,11 @@ def test_unknown_tree_liveness_fails_closed(tmp_path, monkeypatch):
     assert not (job_dir / "status.before-recovery.json").exists()
 
 
-def test_concurrency_slot_release_and_get_disk_active(tmp_path):
+def test_concurrency_slot_release_and_get_disk_active(tmp_path, monkeypatch):
     """Dead PID running jobs must not consume concurrency slots in get_disk_active_job_ids."""
     dead_pid = 41520
+    # Keep the current pytest PID independently live while the fixture owner is mocked dead.
+    _mock_dead_owner(monkeypatch, dead_pid)
     _setup_job(tmp_path, "stale_1", worker_pid=dead_pid, lock_pid=dead_pid)
     _setup_job(tmp_path, "live_1", worker_pid=os.getpid(), lock_pid=os.getpid())
 
@@ -205,9 +221,10 @@ def test_unknown_liveness_keeps_concurrency_slot_occupied(tmp_path, monkeypatch)
     assert "uncertain_1" in active["codex"]
 
 
-def test_idempotence_and_scheduler_lifecycle(tmp_path):
+def test_idempotence_and_scheduler_lifecycle(tmp_path, monkeypatch):
     """Recovery on scheduler init and repeated tick calls is idempotent."""
     dead_pid = 41520
+    _mock_dead_owner(monkeypatch, dead_pid)
     job_dir = _setup_job(tmp_path, "stale_idem", worker_pid=dead_pid, lock_pid=dead_pid)
 
     # 1. HarborScheduler init recovers abandoned jobs on startup

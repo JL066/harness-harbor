@@ -3,6 +3,7 @@ import os
 import shutil
 import re
 import subprocess
+import sys
 import tempfile
 import json
 import time
@@ -1032,5 +1033,45 @@ async def dns_resolve(hostname: str) -> dict:
     return await asyncio.to_thread(diag_dns_resolve, hostname)
 
 
+async def run_mcp_stdio_async() -> None:
+    """Run the MCP server over stdio without transient TextIOWrappers.
+
+    FastMCP's default run_stdio_async invokes stdio_server() without arguments,
+    wrapping sys.stdin.buffer and sys.stdout.buffer in new TextIOWrapper objects.
+    When a client disconnects by closing stdin, those temporary wrappers are
+    garbage-collected, and their C-level deallocator closes the underlying OS buffer.
+    On Windows (especially under PyInstaller's exit routine), the subsequent interpreter
+    flush of sys.stdout / sys.__stdout__ then raises 'ValueError: I/O operation on closed file.'.
+    Passing sys.stdin and sys.stdout directly keeps standard process handles intact.
+    """
+    import anyio
+    from mcp.server.stdio import stdio_server
+
+    if hasattr(sys.stdin, "reconfigure"):
+        try:
+            sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+    async with stdio_server(
+        stdin=anyio.wrap_file(sys.stdin),
+        stdout=anyio.wrap_file(sys.stdout),
+    ) as (read_stream, write_stream):
+        await mcp._mcp_server.run(
+            read_stream,
+            write_stream,
+            mcp._mcp_server.create_initialization_options(),
+        )
+
+
+mcp.run_stdio_async = run_mcp_stdio_async
+
+
 if __name__ == "__main__":
     mcp.run()
+
